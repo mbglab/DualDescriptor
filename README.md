@@ -1,2 +1,2 @@
 # Dual Descriptor
-The Dual Descriptor method
+This is about the Dual Descriptor method and Big Number Models (BNM).
