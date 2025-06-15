@@ -16,7 +16,7 @@ class NumDualDescriptor:
       - Learnable basis matrix Bbasis ∈ R^{L×m}
       - Learnable transformation matrix M ∈ R^{m×n} (maps n-dim inputs to m-dim space)
     """
-    def __init__(self, vec_dim=4, input_dim=4, rank=1, mode='linear', user_step=None):
+    def __init__(self, model_dim=4, input_dim=4, rank=1, rank_mode='drop', rank_op='avg', mode='linear', user_step=None):
         """
         Initialize the Dual Descriptor for vector sequences.
         
@@ -28,7 +28,9 @@ class NumDualDescriptor:
             user_step (int): Custom step size for nonlinear mode
         """
         self.rank = rank
-        self.m = vec_dim  # Internal dimension
+        self.rank_mode = rank_mode
+        self.rank_op = rank_op
+        self.m = model_dim  # Internal dimension
         self.n = input_dim  # Input dimension
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
@@ -86,18 +88,95 @@ class NumDualDescriptor:
     # ---- sequence processing ----
     def extract_vectors(self, seq):
         """
-        Extract vectors from sequence based on processing mode.
+        Extract vectors from sequence based on processing mode and rank operation.
+        
+        For linear mode:
+        - Slide window by 1 step, extracting contiguous vectors of length = rank
+        - Apply rank operation (avg/sum/pick/user_func) to each window
+        
+        For nonlinear mode:
+        - Slide window by custom step (or rank length if step not specified)
+        - Handle incomplete windows using rank_mode:
+            • 'pad': Pad with zero vectors to maintain rank length
+            • 'drop': Discard incomplete windows
+        - Apply rank operation to each complete window
+        
+        Rank operations:
+        - 'avg': Average vectors in window (default)
+        - 'sum': Sum vectors in window
+        - 'pick': Randomly select one vector in window
+        - 'user_func': Apply custom function to window
+            • Default behavior: Apply sigmoid to average vector
         
         Args:
-            seq: List of n-dimensional vectors
+            seq: List of m-dimensional vectors
             
         Returns:
-            list: Selected vectors based on processing mode
+            list: Processed vectors based on mode and operations
         """
+
+        
+        # Helper function to apply vector operations
+        def apply_op(vectors):
+            """Apply rank operation to a list of vectors"""
+            # Get vector dimension from first vector
+            d = len(vectors[0]) if vectors else 0
+            
+            if self.rank_op == 'sum':
+                return [sum(v[j] for v in vectors) for j in range(d)]
+                
+            elif self.rank_op == 'pick':
+                return random.choice(vectors)
+                
+            elif self.rank_op == 'user_func':
+                # Use custom function if provided, else default behavior
+                if hasattr(self, 'user_func') and callable(self.user_func):
+                    return self.user_func(vectors)
+                else:
+                    # Default: average + sigmoid
+                    avg = [sum(v[j] for v in vectors) / len(vectors) for j in range(d)]
+                    return [1 / (1 + math.exp(-x)) for x in avg]
+                    
+            else:  # 'avg' is default
+                return [sum(v[j] for v in vectors) / len(vectors) for j in range(d)]
+        
+        # Handle empty sequence case
+        if not seq:
+            return []
+        
+        # Linear mode: sliding window with step=1
         if self.mode == 'linear':
-            return seq
+            L = len(seq)
+            # Only process if sequence is long enough
+            if L < self.rank:
+                return []
+                
+            return [
+                apply_op(seq[i:i + self.rank])
+                for i in range(L - self.rank + 1)
+            ]
+        
+        # Nonlinear mode: stepping with custom step size
         step = self.step or self.rank
-        return seq[::step]
+        results = []
+        vector_dim = len(seq[0])  # Dimension of vectors
+        
+        for i in range(0, len(seq), step):
+            frag = seq[i:i + self.rank]
+            
+            if self.rank_mode == 'pad':
+                # Pad fragment with zero vectors if shorter than rank
+                if len(frag) < self.rank:
+                    padding = [[0] * vector_dim] * (self.rank - len(frag))
+                    frag += padding
+                results.append(apply_op(frag))
+                
+            elif self.rank_mode == 'drop':
+                # Only process fragments that match full rank length
+                if len(frag) == self.rank:
+                    results.append(apply_op(frag))
+                    
+        return results
 
     # ---- initialization ----
     def initialize(self, seqs):
@@ -748,7 +827,7 @@ if __name__ == "__main__":
         t_list.append([random.uniform(-1,1) for _ in range(model_dim)])
     
     # Create model with input_dim and model_dim
-    dd = NumDualDescriptor(vec_dim=model_dim, input_dim=input_dim, 
+    dd = NumDualDescriptor(model_dim=model_dim, input_dim=input_dim, 
                            rank=3, mode='nonlinear', user_step=2)
     
     # Train with ALS
@@ -775,7 +854,7 @@ if __name__ == "__main__":
     
     # Train with Gradient Descent
     print("\nTraining with Gradient Descent:")
-    dd_grad = NumDualDescriptor(vec_dim=model_dim, input_dim=input_dim,
+    dd_grad = NumDualDescriptor(model_dim=model_dim, input_dim=input_dim,
                                rank=3, mode='nonlinear', user_step=2)
     grad_history = dd_grad.grad_train(
         seqs, 
