@@ -35,23 +35,27 @@ class DualDescriptorScalar:
     After training, you can predict the target value t for a sequence via predict_t(),
     extract features per sequence via dd_features(), and inspect current model via show().
     """
-    def __init__(self, charset, rank=1, num_basis=5, user_bases=None, mode='linear', user_step=None):
+    def __init__(self, charset, num_basis=5, user_bases=None, rank=1, rank_mode='pad', mode='linear', user_step=None):
         self.charset = list(charset)
         self.rank = rank
+        self.rank_mode = rank_mode
         self.o = num_basis        
         assert mode in ('linear','nonlinear')
         self.mode = mode
         self.step = user_step
         self.trained = False
         # 1) Generate all possible tokens (k-mers + right-padded with '_')
-        tokens = []
-        for r in range(1, rank+1):
-            for prefix in itertools.product(self.charset, repeat=r):
-                tok = ''.join(prefix).ljust(rank, '_')
-                tokens.append(tok)
-        self.tokens = list(set(tokens))
+        toks = []
+        if self.rank_mode=='pad':
+            for r in range(1, self.rank+1):
+                for prefix in itertools.product(self.charset, repeat=r):
+                    tok = ''.join(prefix).ljust(self.rank, '_')
+                    toks.append(tok)
+        else:
+            toks = [''.join(p) for p in itertools.product(self.charset, repeat=self.rank)]
+        self.tokens = sorted(set(toks))
         
-        # 2) Initialize Composition Weight Map (CWF): token → scalar weight
+        # 2) Initialize Composition Weight Map (CWF): token → scalar weight        
         self.x = {tok: i for i, tok in enumerate(self.tokens)}
         
         # 3) Set basis functions; default basis functions: cosines of periods 2..2+o-1
@@ -66,20 +70,43 @@ class DualDescriptorScalar:
 
     def extract_tokens(self, seq):
         """
-        Extract k-mer tokens from sequence.
-        'linear': slide window by 1
-        'nonlinear': slide by rank or user step, pad right with '_'        
+        Extract k-mer tokens from a character sequence based on tokenization mode.
+        
+        - 'linear': Slide window by 1 step, extracting contiguous kmers of length = rank
+        - 'nonlinear': Slide window by custom step (or rank length if step not specified)
+        
+        For nonlinear mode, handles incomplete trailing fragments using:
+        - 'pad': Pads with '_' to maintain kmer length
+        - 'drop': Discards incomplete fragments
+        
+        Args:
+            seq (str): Input character sequence to tokenize
+            
+        Returns:
+            list: List of extracted kmer tokens
         """
         L = len(seq)
+        # Linear mode: sliding window with step=1
         if self.mode == 'linear':
             return [seq[i:i+self.rank] for i in range(L - self.rank + 1)]
-        else:
-            toks = []
-            step = self.step or self.rank
-            for i in range(0, L, step):
-                frag = seq[i:i+self.rank]
-                toks.append(frag.ljust(self.rank, '_'))
-            return toks
+        
+        # Nonlinear mode: stepping with custom step size
+        toks = []
+        step = self.step or self.rank  # Use custom step if defined, else use rank length
+        
+        for i in range(0, L, step):
+            frag = seq[i:i+self.rank]
+            frag_len = len(frag)
+            
+            # Pad or drop based on rank_mode setting
+            if self.rank_mode == 'pad':
+                # Pad fragment with '_' if shorter than rank
+                toks.append(frag if frag_len == self.rank else frag.ljust(self.rank, '_'))
+            elif self.rank_mode == 'drop':
+                # Only add fragments that match full rank length
+                if frag_len == self.rank:
+                    toks.append(frag)
+        return toks
 
     def P(self, k):
         """
@@ -219,9 +246,10 @@ class DualDescriptorScalar:
         self.trained = True
         return history
 
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, continued=False):
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+               continued=False, decay_rate=1.0):
         """
-        Train using gradient descent optimization instead of closed-form solutions.
+        Train using gradient descent optimization with learning rate decay.
         Alternates between updating PWC (a) and CWM (x) using gradients.
         
         Args:
@@ -229,7 +257,9 @@ class DualDescriptorScalar:
             t_list: List of target values corresponding to sequences
             max_iters: Maximum number of training iterations
             tol: Tolerance for convergence detection
-            learning_rate: Step size for gradient updates
+            learning_rate: Initial step size for gradient updates
+            continued: Whether to continue from existing parameters
+            decay_rate: Learning rate decay factor per iteration (1.0 = no decay)
             
         Returns:
             history: List of D values during training
@@ -238,7 +268,8 @@ class DualDescriptorScalar:
             # Use small random values to initialize CWM and PWC.
             self.x = {tok: random.uniform(-0.1, 0.1) for tok in self.tokens}
             self.a = [random.uniform(-0.1, 0.1) for _ in range(self.o)]
-            
+        
+        current_lr = learning_rate  # Track current learning rate
         D_prev = float('inf')
         history = []
         
@@ -278,16 +309,19 @@ class DualDescriptorScalar:
             # Update parameters using gradient descent
             # Update PWC coefficients (a)
             for i in range(self.o):
-                self.a[i] -= learning_rate * grad_a[i]
+                self.a[i] -= current_lr * grad_a[i]
                 
             # Update CWM weights (x)
             for tok in self.tokens:
-                self.x[tok] -= learning_rate * grad_x[tok]
+                self.x[tok] -= current_lr * grad_x[tok]
             
             # Compute current loss
             D_current = self.D(seqs, t_list)
             history.append(D_current)
-            print(f"Iter {it:2d}: D = {D_current:.6e}")
+            print(f"Iter {it:2d}: D = {D_current:.6e}, LR = {current_lr:.4e}")
+            
+            # Apply learning rate decay
+            current_lr *= decay_rate
             
             # Check convergence
             if D_prev - D_current < tol:
@@ -303,9 +337,10 @@ class DualDescriptorScalar:
         return history
 
     def auto_train(self, seqs, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-                   continued=False, auto_mode='reg'):
+                   continued=False, auto_mode='reg', decay_rate=1.0):
         """
-        Self-training method using gradient descent with two modes:
+        Self-training method using gradient descent with learning rate decay.
+        Two modes:
         1. 'gap' mode: Predicts current token's value (self-supervised gap filling)
         2. 'reg' mode: Predicts next token's value (autoregressive prediction)
         
@@ -313,9 +348,10 @@ class DualDescriptorScalar:
             seqs: List of training sequences
             max_iters: Maximum number of training iterations
             tol: Tolerance for convergence detection
-            learning_rate: Step size for gradient updates
+            learning_rate: Initial step size for gradient updates
             continued: Whether to continue from existing parameters
             auto_mode: 'gap' or 'reg' (default 'reg')
+            decay_rate: Learning rate decay factor per iteration (1.0 = no decay)
             
         Returns:
             history: List of loss values during training
@@ -327,7 +363,8 @@ class DualDescriptorScalar:
             # Initialize CWM and PWC with small random values
             self.x = {tok: random.uniform(-0.1, 0.1) for tok in self.tokens}
             self.a = [random.uniform(-0.1, 0.1) for _ in range(self.o)]
-            
+        
+        current_lr = learning_rate  # Track current learning rate
         prev_loss = float('inf')
         history = []
         
@@ -393,6 +430,8 @@ class DualDescriptorScalar:
             if total_positions == 0:
                 print(f"Iter {it:3d}: No valid positions - skipping")
                 history.append(prev_loss)
+                # Still apply learning rate decay
+                current_lr *= decay_rate
                 continue
                 
             # Calculate average loss
@@ -406,14 +445,17 @@ class DualDescriptorScalar:
             
             # Update parameters
             for i in range(self.o):
-                self.a[i] -= learning_rate * grad_a[i]
+                self.a[i] -= current_lr * grad_a[i]
             for token in self.tokens:
                 if token in grad_x:  # Only update tokens that appeared
-                    self.x[token] -= learning_rate * grad_x[token]
+                    self.x[token] -= current_lr * grad_x[token]
             
             # Record and print progress
             history.append(total_loss)
-            print(f"Iter {it:3d}: Loss = {total_loss:.6e}")
+            print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
+            
+            # Apply learning rate decay
+            current_lr *= decay_rate
             
             # Check convergence
             if prev_loss - total_loss < tol:
@@ -437,60 +479,7 @@ class DualDescriptorScalar:
         self.trained = True
         return history
 
-    def show(self):
-        """
-        Display current DualDescriptor status:
-        rank, mode, number of tokens, PWC and sample CWF.
-        """
-        print("DualDescriptorcalar Status:")
-        print(f"  rank = {self.rank}, mode = {self.mode}, bases = {self.o}")
-        print(f"  # tokens = {len(self.tokens)}")
-        print("  PWC a coefficients:")
-        print("   ", self.a)
-        print("  Sample CWM (first 5 tokens):")
-        for tok in sorted(self.tokens)[:5]:
-            print(f"    {tok}: {self.x[tok]:.4f}")       
-
-    def dd_features(self, seq):
-        """
-        Extract feature dict for one sequence:
-        {'pwc': [PWC coefficients], 
-         'cwf': [CWF values for all tokens sorted],
-         'frq': [Position-weighted frequency for each token],
-         'pdv': [Partial Dual Variable for each token],
-         'all': [concatenate the above]}
-        """
-        feats = {}
-        # PWC
-        feats['pwc'] = list(self.a)
-        # CWF sorted by token
-        cwfs = []
-        for tok in sorted(self.tokens):
-            cwfs.append(self.x[tok])
-        feats['cwf'] = cwfs    
-        # Position-weighted frequencies and partial dual variables
-        frqd = {}; pdvd = {}
-        for tok in sorted(self.tokens):
-            frqd[tok] = 0.0
-            pdvd[tok] = 0.0
-        toks = self.extract_tokens(seq)
-        L = len(toks)
-        for k, tok in enumerate(toks):            
-            for i in range(self.o):
-                Pki = self.a[i] * self.basis[i](k)            
-                frqd[tok] += Pki
-                pdvd[tok] += Pki * self.x[tok]
-        frqs = []; pdvs = []
-        for tok in sorted(self.tokens):
-            frqd[tok] = frqd[tok] / L if L>0 else 0.0
-            frqs.append(frqd[tok])
-            pdvd[tok] = pdvd[tok] / L if L>0 else 0.0
-            pdvs.append(pdvd[tok])        
-        feats['frq'] = frqs[:-1] #remove the last one because of dependency
-        feats['pdv'] = pdvs[:-1] #remove the last one because of dependency
-        feats['all'] = feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
-        return feats
-
+    
     def predict_t(self, seq):
         """
         Predict the target value t for a given sequence.
@@ -586,12 +575,73 @@ class DualDescriptorScalar:
         full_seq = ''.join(generated_sequence)
         return full_seq[:L]
 
-    def part_train(self, num_seqs, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-               continued=False, auto_mode='reg'):
+    def show(self):
         """
-        Train position weight coefficients (a) on real-valued sequences.
-        This method learns a position weighting function I(k) = Σ a_i * basis_i(k)
-        without token mapping (x weights). Two training modes are supported:
+        Display current DualDescriptor status:
+        rank, mode, number of tokens, PWC and sample CWF.
+        """
+        print("DualDescriptorcalar Status:")
+        print(f"  rank = {self.rank}, mode = {self.mode}, bases = {self.o}")
+        print(f"  # tokens = {len(self.tokens)}")
+        print("  PWC a coefficients:")
+        print("   ", self.a)
+        print("  Sample CWM (first 5 tokens):")
+        for tok in sorted(self.tokens)[:5]:
+            print(f"    {tok}: {self.x[tok]:.4f}")       
+
+    def dd_features(self, seq, t=None):
+        """
+        Extract feature dict for one sequence:
+        {'pwc': [PWC coefficients], 
+         'cwf': [CWF values for all tokens sorted],
+         'frq': [Position-weighted frequency for each token],
+         'pdv': [Partial Dual Variable for each token],
+         'all': [concatenate the above]}
+        """
+        feats = {}
+        # Position-weighted frequencies and partial dual variables
+        frqd = {}; pdvd = {}
+        for tok in sorted(self.tokens):
+            frqd[tok] = 0.0
+            pdvd[tok] = 0.0
+        toks = self.extract_tokens(seq)
+        L = len(toks)
+        for k, tok in enumerate(toks):            
+            for i in range(self.o):
+                Pki = self.a[i] * self.basis[i](k)            
+                frqd[tok] += Pki
+                pdvd[tok] += Pki * self.x[tok]
+        frqs = []; pdvs = []
+        for tok in sorted(self.tokens):
+            frqd[tok] = frqd[tok] / L if L>0 else 0.0
+            frqs.append(frqd[tok])
+            pdvd[tok] = pdvd[tok] / L if L>0 else 0.0
+            pdvs.append(pdvd[tok])        
+        feats['frq'] = frqs[:-1] #remove the last one because of dependency
+        feats['pdv'] = pdvs[:-1] #remove the last one because of dependency
+        
+        tg = t or self.predict_t(seq)        
+        # PWC
+        a_backup = self.a.copy()
+        self.update_PWC([seq], [tg])
+        feats['pwc'] = list(self.a)
+        self.a = a_backup
+        # CWF sorted by token
+        self.update_CWM([seq], [tg])
+        cwfs = []
+        for tok in sorted(self.tokens):
+            cwfs.append(self.x[tok])
+        feats['cwf'] = cwfs   
+        
+        feats['all'] = feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
+        return feats
+
+    def part_train(self, num_seqs, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+               continued=False, auto_mode='reg', decay_rate=1.0):
+        """
+        Train position weight coefficients (a) on real-valued sequences with learning rate decay.
+        Learns position weighting function I(k) = Σ a_i * basis_i(k) without token mapping.
+        Two modes:
         1. 'gap': Predict current value at position k
         2. 'reg': Predict next value at position k+1
         
@@ -599,9 +649,10 @@ class DualDescriptorScalar:
             num_seqs: List of real-valued sequences (each sequence is a list of floats)
             max_iters: Maximum number of training iterations
             tol: Tolerance for convergence detection
-            learning_rate: Step size for gradient updates
+            learning_rate: Initial step size for gradient updates
             continued: Whether to continue training from current coefficients
             auto_mode: 'gap' (predict current value) or 'reg' (predict next value)
+            decay_rate: Learning rate decay factor per iteration (1.0 = no decay)
             
         Returns:
             history: List of loss values during training
@@ -613,6 +664,7 @@ class DualDescriptorScalar:
             # Initialize PWC coefficients with small random values
             self.a = [random.uniform(-0.1, 0.1) for _ in range(self.o)]
         
+        current_lr = learning_rate  # Track current learning rate
         prev_loss = float('inf')
         history = []
         
@@ -662,6 +714,8 @@ class DualDescriptorScalar:
             if total_positions == 0:
                 print(f"Iter {it:3d}: No valid positions - skipping")
                 history.append(prev_loss)
+                # Still apply learning rate decay
+                current_lr *= decay_rate
                 continue
                 
             # Calculate average loss
@@ -672,11 +726,14 @@ class DualDescriptorScalar:
             
             # Update parameters
             for i in range(self.o):
-                self.a[i] -= learning_rate * grad_a[i]
+                self.a[i] -= current_lr * grad_a[i]
             
             # Record and print progress
             history.append(total_loss)
-            print(f"Iter {it:3d}: Loss = {total_loss:.6e}")
+            print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
+            
+            # Apply learning rate decay
+            current_lr *= decay_rate
             
             # Check convergence
             if prev_loss - total_loss < tol:
@@ -686,7 +743,7 @@ class DualDescriptorScalar:
             prev_loss = total_loss
         
         self.trained = True
-        return history    
+        return history   
 
     def part_generate(self, L, mode='gap', initial_value=0.0, tau=0.0):
         """
@@ -1160,6 +1217,7 @@ if __name__ == "__main__":
         ideal_s = [dd.I(k) for k in range(len(actual_s))]
         
         # Calculate correlation
+        from statistics import correlation
         corr = correlation(actual_s, ideal_s) if len(actual_s) > 1 else 0
         
         print(f"\nGenerated sequence: {seq}")
