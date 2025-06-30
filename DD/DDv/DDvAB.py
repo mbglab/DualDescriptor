@@ -50,7 +50,7 @@ class DualDescriptorAB:
         # build fixed basis Bbasis: L×m
         self.Bbasis = [[math.cos(2*math.pi*(k+1)/(i+1))
                         for i in range(self.m)]
-                       for k in range(self.L)]
+                       for k in range(self.L)]        
         # cache its transpose: m×L
         self.B_t = self._transpose(self.Bbasis)
 
@@ -136,13 +136,11 @@ class DualDescriptorAB:
         toks = self.extract_tokens(seq)
         N = []
         for k, tok in enumerate(toks):
-            x = self.x_map[tok]                 # m-vector
-            # z = Bbasis * x  => length L
-            z = [sum(self.Bbasis[j][i]*x[i] for i in range(self.m))
-                 for j in range(self.L)]
-            # Nk = Acoeff * z => m-vector
-            Nk = [sum(self.Acoeff[i][j]*z[j] for j in range(self.L))
-                  for i in range(self.m)]
+            A = [[self.Acoeff[i][k%self.L]] for i in range(self.m)]
+            B = [[self.Bbasis[k%self.L][i] for i in range(self.m)]]
+            P = self._mat_mul(A, B)
+            x = self.x_map[tok]  # m-vector
+            Nk = self._mat_vec(P, x)
             N.append(Nk)
         return N
 
@@ -172,78 +170,105 @@ class DualDescriptorAB:
 
     # ---- update Acoeff ----
     def update_Acoeff(self, seqs, t_list):
-        L, m = self.L, self.m
-        U = [[0.0]*L for _ in range(L)]
-        V = [[0.0]*L for _ in range(m)]
+        """
+        Update coefficient matrix Acoeff using position-specific projections.
+        Matches the computation method used in describe().
+        
+        For each token at position k:
+          idx = k % L  (basis index)
+          scalar = dot(Bbasis[idx], x)  (projection)
+          Nk = scalar * Acoeff[:, idx]  (m-dimensional vector)
+        
+        We minimize ||scalar * Acoeff[:, idx] - t||^2 for each position.
+        """
+        m, L = self.m, self.L
+        # Initialize accumulators
+        numerator = [[0.0] * L for _ in range(m)]  # m x L
+        denominator = [0.0] * L                    # L-dimensional
+        
         for seq, t in zip(seqs, t_list):
             toks = self.extract_tokens(seq)
-            for tok in toks: 
+            for k, tok in enumerate(toks):
+                idx = k % L  # Basis index for this position
                 x = self.x_map[tok]
-                # z = Bbasis * x
-                z = [sum(self.Bbasis[j][i]*x[i] for i in range(m)) for j in range(L)]
-                # accumulate U, V
-                for i in range(L):
-                    for j in range(L):
-                        U[i][j] += z[i]*z[j]
+                
+                # Compute projection scalar: Bbasis[idx] • x
+                scalar = sum(self.Bbasis[idx][i] * x[i] for i in range(m))
+                
+                # Update accumulators
                 for i in range(m):
-                    for j in range(L):
-                        V[i][j] += t[i]*z[j]
-        U_inv = self._invert(U)
-        self.Acoeff = self._mat_mul(V, U_inv)
+                    numerator[i][idx] += scalar * t[i]
+                denominator[idx] += scalar * scalar  # scalar²
+        
+        # Update Acoeff column-wise
+        for j in range(L):
+            if abs(denominator[j]) > 1e-12:  # Avoid division by zero
+                inv_denom = 1.0 / denominator[j]
+                for i in range(m):
+                    self.Acoeff[i][j] = numerator[i][j] * inv_denom
 
     # ---- update x_map ----
     def update_x(self, seqs, t_list):
         """
-        Update token embeddings (x_map) using the closed-form solution.
-        Corrected mathematical formulation:
-          Let C = Acoeff * Bbasis (m x m matrix)
-          Solve: (C^T * C) * x = C^T * t
-          => x = (C^T * C)^{-1} * (C^T * t)
+        Update token embeddings (x_map) using position-specific projections.
+        Matches the computation method used in describe().
+        
+        For each token at position k:
+          idx = k % L  (basis index)
+          scalar = dot(Bbasis[idx], x)  (projection)
+          Nk = scalar * Acoeff[:, idx]  (m-dimensional vector)
+        
+        Solve linear system: Mx = b for each token using correct formulation:
+          M = Σ [ (A_col ⊗ basis_vec)^T (A_col ⊗ basis_vec) ]
+          b = Σ [ <A_col, t> * basis_vec ]
         """
-        L, m = self.L, self.m
+        m, L = self.m, self.L
+        # Precompute token occurrence data: {token: [(idx, target)]}
+        token_data = {tok: [] for tok in self.tokens}
         
-        # Compute C = Acoeff * Bbasis (m x m)
-        AB = self._mat_mul(self.Acoeff, self.Bbasis)   # m×m matrix: C
-        AB_t = self._transpose(AB)                      # Transpose of C (m x m)
-        
-        # Compute M = C^T * C (m x m) for normal equations
-        M = self._mat_mul(AB_t, AB)                     # C^T * C (m x m)
-        M_inv = self._invert(M)                         # (C^T * C)^{-1}
-
-        # Precompute Acoeff transpose (L x m)
-        At = self._transpose(self.Acoeff)  # L×m
-
-        # Accumulate R_c = sum (C^T * t) for each token occurrence
-        R = {tok: [0.0] * m for tok in self.tokens}
-        cnt = {tok: 0 for tok in self.tokens}
-        
+        # Collect position data for each token
         for seq, t in zip(seqs, t_list):
             toks = self.extract_tokens(seq)
-            for tok in toks: 
-                # Compute v = C^T * t = (Acoeff * Bbasis)^T * t
-                # Step 1: Compute Acoeff^T * t (L-dim vector)
-                At_t = self._mat_vec(At, t)             # A^T * t (length L)
+            for k, tok in enumerate(toks):
+                idx = k % L  # Basis index
+                token_data[tok].append((idx, t))
+        
+        # Update each token embedding
+        for tok, occurrences in token_data.items():
+            if not occurrences:
+                continue
                 
-                # Step 2: Compute Bbasis^T * (A^T * t) = C^T * t
-                v = self._mat_vec(self.B_t, At_t)       # C^T * t (length m)
+            # Build linear system: M (m x m) and b (m-dimensional)
+            M = [[0.0] * m for _ in range(m)]
+            b = [0.0] * m
+            
+            for (idx, t) in occurrences:
+                # Get basis vector and Acoeff column
+                basis_vec = self.Bbasis[idx]
+                A_col = [self.Acoeff[i][idx] for i in range(m)]
                 
-                # Accumulate results
+                # Compute ||A_col||² = A_col · A_col
+                a_norm_sq = sum(a*a for a in A_col)
+                
+                # Correctly compute M = Σ(||A_col||² * (basis_vec ⊗ basis_vec))
                 for i in range(m):
-                    R[tok][i] += v[i]
-                cnt[tok] += 1
-
-        # Update token embeddings using closed-form solution
-        for tok in self.tokens:
-            c = cnt[tok]
-            if c > 0:
-                # Compute average (C^T * t) vector
-                avg_v = [ri / c for ri in R[tok]]
+                    for j in range(m):
+                        M[i][j] += a_norm_sq * basis_vec[i] * basis_vec[j]
                 
-                # Solve: x = (C^T * C)^{-1} * avg_v
-                self.x_map[tok] = self._mat_vec(M_inv, avg_v)
+                # Compute b contribution: <A_col, t> * basis_vec
+                a_dot_t = sum(A_col[i] * t[i] for i in range(m))
+                for j in range(m):
+                    b[j] += a_dot_t * basis_vec[j]
+            
+            # Solve linear system: Mx = b
+            try:
+                M_inv = self._invert(M)
+                self.x_map[tok] = self._mat_vec(M_inv, b)
+            except:  # Fallback to identity on singular matrix
+                pass
 
     # ---- training loop ----
-    def train(self, seqs, t_list, max_iters=10, tol=1e-8):        
+    def train(self, seqs, t_list, max_iters=10, tol=1e-8, print_every=10):        
         D_prev = float('inf')
         history = []
         for it in range(max_iters):
@@ -251,8 +276,9 @@ class DualDescriptorAB:
             self.update_x(seqs, t_list)
             D = self.deviation(seqs, t_list)
             history.append(D)
-            print(f"Iter {it:2d}: D = {D:.6e}")
-            if abs(D -D_prev) <=  tol:
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:2d}: D = {D:.6e}")
+            if D >= D_prev - tol:
                 print("Converged.")
                 break
             D_prev = D
@@ -265,321 +291,21 @@ class DualDescriptorAB:
         self.trained = True
         return history
 
-    def grad_train(self, seqs, t_list, learning_rate=0.01, decay_rate=1.0, max_iters=100, tol=1e-6, print_every=10):
-        """
-        Train the model using gradient descent optimization with learning rate decay.
-        
-        Steps:
-        1. Initialize model parameters
-        2. For each iteration:
-            a. Compute gradients for Acoeff and token embeddings
-            b. Update parameters using gradient descent
-            c. Calculate current loss
-            d. Check convergence
-        
-        Args:
-            seqs: List of training sequences
-            t_list: List of target vectors corresponding to sequences
-            learning_rate: Initial step size for gradient updates (default=0.01)
-            decay_rate: Learning rate decay multiplier per iteration (default=1.0)
-            max_iters: Maximum number of iterations (default=100)
-            tol: Convergence tolerance (default=1e-6)
-            print_every: Print progress every n iterations (default=10)
-        
-        Returns:
-            list: Loss history during training
-        """        
-        history = []
-        prev_loss = float('inf')
-        current_lr = learning_rate  # Track current learning rate
-        
-        for it in range(max_iters):
-            # Initialize gradients
-            grad_A = [[0.0] * self.L for _ in range(self.m)]  # Gradient for Acoeff (m x L)
-            grad_x = {tok: [0.0] * self.m for tok in self.tokens}  # Gradient for token embeddings
-            
-            total_loss = 0.0
-            total_positions = 0
-            
-            # Process all sequences
-            for seq, t in zip(seqs, t_list):
-                toks = self.extract_tokens(seq)
-                total_positions += len(toks)
-                
-                for k, tok in enumerate(toks):
-                    x = self.x_map[tok]
-                    
-                    # Forward pass: Compute z = Bbasis @ x (L-dimensional)
-                    z = [0.0] * self.L
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            z[j] += self.Bbasis[j][i] * x[i]
-                    
-                    # Forward pass: Compute N = Acoeff @ z (m-dimensional)
-                    N = [0.0] * self.m
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            N[i] += self.Acoeff[i][j] * z[j]
-                    
-                    # Compute error = N - t
-                    error = [N_i - t_i for N_i, t_i in zip(N, t)]
-                    
-                    # Accumulate loss (MSE)
-                    total_loss += sum(e*e for e in error)
-                    
-                    # --- Backpropagation ---
-                    # Gradient for Acoeff: dL/dAcoeff = error * z^T
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            grad_A[i][j] += 2 * error[i] * z[j]  # 2 comes from dL/dN
-                    
-                    # Gradient for token embedding:
-                    # dL/dx = Bbasis^T @ (Acoeff^T @ error)
-                    
-                    # Step 1: Compute v = Acoeff^T @ error (L-dimensional)
-                    v = [0.0] * self.L
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            v[j] += self.Acoeff[i][j] * error[i]
-                    
-                    # Step 2: Compute w = Bbasis^T @ v (m-dimensional)
-                    w = [0.0] * self.m
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            w[i] += self.B_t[i][j] * v[j]
-                    
-                    # Accumulate gradient (multiply by 2 from dL/dN)
-                    for i in range(self.m):
-                        grad_x[tok][i] += 2 * w[i]
-            
-            # Calculate average loss
-            avg_loss = total_loss / total_positions if total_positions else 0
-            history.append(avg_loss)
-            
-            # Update parameters using gradients
-            # Update Acoeff: Acoeff -= lr * grad_A / num_positions
-            for i in range(self.m):
-                for j in range(self.L):
-                    self.Acoeff[i][j] -= current_lr * grad_A[i][j] / total_positions
-            
-            # Update token embeddings
-            for tok in self.tokens:
-                for i in range(self.m):
-                    self.x_map[tok][i] -= current_lr * grad_x[tok][i] / total_positions
-            
-            # Print progress
-            if it % print_every == 0 or it == max_iters - 1:
-                print(f"Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-            
-            # Apply learning rate decay
-            current_lr *= decay_rate
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it} iterations")
-                break
-                
-            prev_loss = avg_loss
-        
-        # Final setup after training
-        self.mean_L = int(sum(len(self.extract_tokens(seq)) for seq in seqs) / len(seqs))
-        self.mean_t = [0.0] * self.m
-        for t in t_list:
-            for i in range(self.m):
-                self.mean_t[i] += t[i]
-        self.mean_t = [x / len(t_list) for x in self.mean_t]
-        self.trained = True
-        
-        return history
-
-    def auto_train(self, seqs, learning_rate=0.01, decay_rate=1.0, max_iters=100, tol=1e-6, 
-                   print_every=10, auto_mode='reg'):
-        """
-        Self-supervised training with learning rate decay and two modes:
-        - 'gap': Predict current token's embedding (autoencoder)
-        - 'reg': Predict next token's embedding (sequential prediction)
-        
-        Args:
-            seqs: List of training sequences
-            learning_rate: Initial step size for gradient updates (default=0.01)
-            decay_rate: Learning rate decay multiplier per iteration (default=1.0)
-            max_iters: Maximum number of iterations (default=100)
-            tol: Convergence tolerance (default=1e-6)
-            print_every: Print progress every n iterations (default=10)
-            auto_mode: Training objective ('gap' or 'reg', default='reg')
-            
-        Returns:
-            list: Loss history during training
-        """
-        assert auto_mode in ('gap', 'reg'), "auto_mode must be 'gap' or 'reg'"        
-        
-        history = []
-        prev_loss = float('inf')
-        current_lr = learning_rate  # Track current learning rate
-        
-        # Precompute total token count for mean_L calculation
-        total_tokens = 0
-        for seq in seqs:
-            total_tokens += len(self.extract_tokens(seq))
-        
-        for it in range(max_iters):
-            # Initialize gradients
-            grad_A = [[0.0] * self.L for _ in range(self.m)]  # Gradient for Acoeff (m x L)
-            grad_x = {tok: [0.0] * self.m for tok in self.tokens}  # Gradient for token embeddings
-            
-            total_loss = 0.0
-            total_instances = 0  # Count of training instances
-            
-            # Process all sequences
-            for seq in seqs:
-                toks = self.extract_tokens(seq)
-                
-                # Skip sequences with less than 2 tokens in 'reg' mode
-                if auto_mode == 'reg' and len(toks) < 2:
-                    continue
-                
-                # Determine token range based on mode
-                token_range = range(len(toks))
-                if auto_mode == 'reg':
-                    token_range = range(len(toks) - 1)  # Skip last token
-                
-                for k in token_range:
-                    current_tok = toks[k]
-                    
-                    # Determine target based on mode
-                    if auto_mode == 'gap':
-                        target_tok = current_tok
-                    else:  # 'reg'
-                        target_tok = toks[k+1]
-                    
-                    # Get embeddings
-                    x_current = self.x_map[current_tok]
-                    x_target = self.x_map[target_tok]
-                    
-                    # Forward pass: Compute z = Bbasis @ x_current (L-dimensional)
-                    z = [0.0] * self.L
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            z[j] += self.Bbasis[j][i] * x_current[i]
-                    
-                    # Forward pass: Compute N = Acoeff @ z (m-dimensional)
-                    N = [0.0] * self.m
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            N[i] += self.Acoeff[i][j] * z[j]
-                    
-                    # Compute error = N - x_target
-                    error = [N_i - x_target_i for N_i, x_target_i in zip(N, x_target)]
-                    
-                    # Accumulate loss (MSE)
-                    total_loss += sum(e*e for e in error)
-                    total_instances += 1
-                    
-                    # --- Backpropagation ---
-                    # Gradient for Acoeff: dL/dAcoeff = error * z^T
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            grad_A[i][j] += 2 * error[i] * z[j]  # 2 comes from dL/dN
-                    
-                    # Gradient for current token embedding:
-                    # dL/dx_current = Bbasis^T @ (Acoeff^T @ error)
-                    
-                    # Step 1: Compute v = Acoeff^T @ error (L-dimensional)
-                    v = [0.0] * self.L
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            v[j] += self.Acoeff[i][j] * error[i]
-                    
-                    # Step 2: Compute w = Bbasis^T @ v (m-dimensional)
-                    w = [0.0] * self.m
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            w[i] += self.B_t[i][j] * v[j]
-                    
-                    # Accumulate gradient for current token
-                    for i in range(self.m):
-                        grad_x[current_tok][i] += 2 * w[i]
-            
-            # Calculate average loss
-            avg_loss = total_loss / total_instances if total_instances else 0
-            history.append(avg_loss)
-            
-            # Update parameters using gradients
-            if total_instances > 0:
-                # Update Acoeff: Acoeff -= lr * grad_A / num_instances
-                for i in range(self.m):
-                    for j in range(self.L):
-                        self.Acoeff[i][j] -= current_lr * grad_A[i][j] / total_instances
-                
-                # Update token embeddings
-                for tok in self.tokens:
-                    for i in range(self.m):
-                        self.x_map[tok][i] -= current_lr * grad_x[tok][i] / total_instances
-            
-            # Print progress
-            if it % print_every == 0 or it == max_iters - 1:
-                mode_str = "autoencoder" if auto_mode == 'gap' else "next-token prediction"
-                print(f"Iter {it:3d} ({mode_str}): Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-            
-            # Apply learning rate decay
-            current_lr *= decay_rate
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it} iterations")
-                break
-                
-            prev_loss = avg_loss
-        
-        # Calculate and store mean target and average sequence length
-        self.mean_L = total_tokens // len(seqs)  # Average tokens per sequence
-        
-        # Calculate mean_t: average descriptor vector across all tokens
-        total_vec = [0.0] * self.m
-        token_count = 0
-        
-        for tok in self.tokens:
-            # Compute descriptor vector for each token
-            vec = self._compute_token_descriptor(tok)
-            for i in range(self.m):
-                total_vec[i] += vec[i]
-            token_count += 1
-        
-        self.mean_t = [x / token_count for x in total_vec]
-        self.trained = True
-        
-        return history
-
     def predict_t(self, seq):
         """
-        Predict the target vector t for an input sequence.        
-        Steps:
-        1. Compute position-wise descriptor vectors using describe()
-        2. Average these vectors across all positions in the sequence
-        3. Return the averaged vector as the predicted t-value        
-        Args:
-            seq: Input sequence string        
-        Returns:
-            list: Predicted t-value (m-dimensional vector)
+        Predict target vector for a sequence
+        Returns the average of all N(k) vectors in the sequence
         """
-        # Get position-wise descriptor vectors
         N_list = self.describe(seq)
-        
-        # Handle empty sequence case
         if not N_list:
-            return [0.0] * self.m
-        
-        # Initialize accumulator for m-dimensional vector
-        t_pred = [0.0] * self.m
-        
-        # Sum all position vectors
+            return [0.0] * self.m            
+        # Average all N(k) vectors component-wise
+        sum_t = [0.0] * self.m
         for Nk in N_list:
-            for i in range(self.m):
-                t_pred[i] += Nk[i]
-        
-        # Compute average
-        n_positions = len(N_list)
-        return [x / n_positions for x in t_pred]
+            for d in range(self.m):
+                sum_t[d] += Nk[d]
+        N = len(N_list)
+        return [ti / N for ti in sum_t]
 
     def _compute_token_descriptor(self, tok):
         """
@@ -705,15 +431,15 @@ class DualDescriptorAB:
         # flatten x_map
         for tok in self.tokens:
             feats.extend(self.x_map[tok])
-##        # basis-weighted frequencies
-##        toks = self.extract_tokens(seq)
-##        for tok in self.tokens:
-##            for i in range(self.m):
-##                s = 0.0
-##                for j, tk in enumerate(toks):
-##                    if tk == tok:
-##                        s += self.Bbasis[j][i]
-##                feats.append(s)  
+        # basis-weighted frequencies
+        toks = self.extract_tokens(seq)
+        for tok in self.tokens:
+            for i in range(self.m):
+                s = 0.0
+                for j, tk in enumerate(toks):
+                    if tk == tok:
+                        s += self.Bbasis[j%self.L][i]
+                feats.append(s)  
         return feats
 
     # ---- show state ----
@@ -724,329 +450,6 @@ class DualDescriptorAB:
         print(" Sample Bbasis[0][:5]:", self.Bbasis[0][:5])
         tok0 = self.tokens[0]
         print(" Sample x_map first token:", tok0, self.x_map[tok0][:5])
-
-    def part_train(self, vec_seqs, learning_rate=0.01, decay_rate=1.0, max_iters=100, tol=1e-6, 
-               print_every=10, auto_mode='reg'):
-        """
-        Train on sequences of real-valued vectors with learning rate decay.
-        Creates and updates only AcoeffI (m×L), while BbasisI (L×m) is fixed using sine basis.
-        
-        Args:
-            vec_seqs: List of sequences, each sequence is a list of m-dimensional vectors
-            learning_rate: Initial step size for gradient updates
-            decay_rate: Learning rate decay multiplier per iteration (default=1.0)
-            max_iters: Maximum number of iterations
-            tol: Convergence tolerance
-            print_every: Print progress every n iterations
-            auto_mode: Training objective ('gap' or 'reg')
-                - 'gap': Autoencoder (reconstruct current vector)
-                - 'reg': Predict next vector in sequence
-        """
-        assert auto_mode in ('gap', 'reg'), "auto_mode must be 'gap' or 'reg'"
-        
-        # Determine maximum sequence length (LI)
-        self.LI = max(len(seq) for seq in vec_seqs) if vec_seqs else 10
-        
-        # Initialize AcoeffI (m×L)
-        self.AcoeffI = [[random.uniform(-0.1, 0.1) for _ in range(self.LI)] 
-                        for _ in range(self.m)]
-        
-        # Create fixed BbasisI using sine functions: BbasisI[j][i] = sin(2π*(j+1)/(i+1))
-        self.BbasisI = [[math.sin(2 * math.pi * (j+1) / (i+1)) 
-                         for i in range(self.m)] 
-                        for j in range(self.LI)]
-        
-        # Precompute transpose of BbasisI for efficient calculations
-        self.BbasisI_t = self._transpose(self.BbasisI)
-        
-        # Calculate mean vector across all training vectors
-        self.mean_vec = [0.0] * self.m
-        total_vectors = 0
-        for seq in vec_seqs:
-            for vec in seq:
-                for i in range(self.m):
-                    self.mean_vec[i] += vec[i]
-                total_vectors += 1
-        if total_vectors > 0:
-            self.mean_vec = [x / total_vectors for x in self.mean_vec]
-        
-        history = []
-        prev_loss = float('inf')
-        current_lr = learning_rate  # Track current learning rate
-        
-        for it in range(max_iters):
-            # Initialize gradient only for AcoeffI
-            grad_AcoeffI = [[0.0] * self.LI for _ in range(self.m)]
-            
-            total_loss = 0.0
-            total_instances = 0
-            
-            # Process all vector sequences
-            for seq in vec_seqs:
-                # Skip sequences with less than 2 vectors in 'reg' mode
-                if auto_mode == 'reg' and len(seq) < 2:
-                    continue
-                
-                # Determine vector range based on mode
-                vec_range = range(len(seq))
-                if auto_mode == 'reg':
-                    vec_range = range(len(seq) - 1)  # Skip last vector
-                
-                for k in vec_range:
-                    current_vec = seq[k]
-                    
-                    # Determine target based on mode
-                    if auto_mode == 'gap':
-                        target_vec = current_vec
-                    else:  # 'reg'
-                        target_vec = seq[k+1]
-                    
-                    # --- Forward pass ---
-                    # Compute z = BbasisI @ current_vec (LI-dimensional)
-                    z = [0.0] * self.LI
-                    for j in range(self.LI):
-                        for i in range(self.m):
-                            z[j] += self.BbasisI[j][i] * current_vec[i]
-                    
-                    # Compute N = AcoeffI @ z (m-dimensional)
-                    N = [0.0] * self.m
-                    for i in range(self.m):
-                        for j in range(self.LI):
-                            N[i] += self.AcoeffI[i][j] * z[j]
-                    
-                    # Compute error = N - target_vec
-                    error = [N_i - target_vec_i for N_i, target_vec_i in zip(N, target_vec)]
-                    
-                    # Accumulate loss (MSE)
-                    total_loss += sum(e*e for e in error)
-                    total_instances += 1
-                    
-                    # --- Backpropagation ---
-                    # Gradient for AcoeffI: dL/dAcoeffI = error * z^T
-                    for i in range(self.m):
-                        for j in range(self.LI):
-                            grad_AcoeffI[i][j] += 2 * error[i] * z[j]
-            
-            # Calculate average loss
-            avg_loss = total_loss / total_instances if total_instances else 0
-            history.append(avg_loss)
-            
-            # Update AcoeffI using gradient
-            if total_instances > 0:
-                for i in range(self.m):
-                    for j in range(self.LI):
-                        self.AcoeffI[i][j] -= current_lr * grad_AcoeffI[i][j] / total_instances
-            
-            # Print progress
-            if it % print_every == 0 or it == max_iters - 1:
-                mode_str = "autoencoder" if auto_mode == 'gap' else "next-vector prediction"
-                print(f"Iter {it:3d} ({mode_str}): Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-            
-            # Apply learning rate decay
-            current_lr *= decay_rate
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it} iterations")
-                break
-                
-            prev_loss = avg_loss
-        
-        return history
-
-    def part_generate(self, length, tau=0.0):
-        """
-        Generate a sequence of vectors using the trained AcoeffI and fixed BbasisI.
-        
-        Args:
-            length: Number of vectors to generate
-            tau: Temperature parameter (≥0)
-                0.0 = deterministic generation
-                >0.0 = stochastic generation (standard deviation of Gaussian noise)
-        
-        Returns:
-            list: Generated sequence of m-dimensional vectors
-        """
-        if not hasattr(self, 'AcoeffI') or not hasattr(self, 'BbasisI'):
-            raise RuntimeError("Model not trained for vector generation. Call part_train first.")
-        
-        generated_seq = []
-        
-        # Start with the mean vector
-        current_vec = self.mean_vec[:]  # Make a copy
-        
-        for _ in range(length):
-            # Compute z = BbasisI @ current_vec
-            z = [0.0] * self.LI
-            for j in range(self.LI):
-                for i in range(self.m):
-                    z[j] += self.BbasisI[j][i] * current_vec[i]
-            
-            # Compute next_vec = AcoeffI @ z
-            next_vec = [0.0] * self.m
-            for i in range(self.m):
-                for j in range(self.LI):
-                    next_vec[i] += self.AcoeffI[i][j] * z[j]
-            
-            # Apply stochasticity if tau > 0
-            if tau > 0:
-                next_vec = [val + random.gauss(0, tau) for val in next_vec]
-            
-            generated_seq.append(next_vec)
-            current_vec = next_vec  # Set current to generated for next iteration
-        
-        return generated_seq
-
-    def double_train(self, seqs, 
-                     auto_mode='reg', auto_learning_rate=0.01, auto_max_iters=100, 
-                     part_mode='reg', part_learning_rate=0.01, part_max_iters=100,
-                     tol=1e-6, print_every=10):
-        """
-        Two-stage training process:
-        1. First stage: Train on character sequences using auto_train (self-supervised)
-        2. Second stage: 
-            a. Convert sequences to vector representations using trained model
-            b. Train on vector sequences using part_train (self-supervised)
-        
-        Args:
-            seqs: List of training sequences (strings)
-            auto_mode: Training objective for first stage ('gap' or 'reg')
-            auto_learning_rate: Learning rate for first stage
-            auto_max_iters: Max iterations for first stage
-            part_mode: Training objective for second stage ('gap' or 'reg')
-            part_learning_rate: Learning rate for second stage
-            part_max_iters: Max iterations for second stage
-            tol: Convergence tolerance
-            print_every: Print progress every n iterations
-            
-        Returns:
-            tuple: (auto_history, part_history) - loss histories from both stages
-        """
-        # Stage 1: Train on character sequences
-        print("=== Starting Stage 1: Character sequence training ===")
-        auto_history = self.auto_train(
-            seqs,
-            learning_rate=auto_learning_rate,
-            max_iters=auto_max_iters,
-            tol=tol,
-            print_every=print_every,
-            auto_mode=auto_mode
-        )
-        
-        # Stage 2: Convert sequences to vectors and train
-        print("\n=== Starting Stage 2: Vector sequence training ===")
-        print("Converting character sequences to vector representations...")
-        vec_seqs = []
-        for seq in seqs:
-            # Get position-wise descriptor vectors
-            N_list = self.describe(seq)
-            vec_seqs.append(N_list)
-        
-        # Train on vector sequences
-        part_history = self.part_train(
-            vec_seqs,
-            learning_rate=part_learning_rate,
-            max_iters=part_max_iters,
-            tol=tol,
-            print_every=print_every,
-            auto_mode=part_mode
-        )
-        
-        print("\nDouble training complete!")
-        return auto_history, part_history
-
-    def double_generate(self, L, tau=0.0):
-        """
-        Generate a character sequence using both stages of the trained model.
-        
-        Steps:
-        1. Generate an initial character sequence using stage 1 parameters
-        2. Convert it to descriptor vectors using stage 1 model
-        3. Extend the vector sequence using stage 2 parameters
-        4. Convert new vectors back to characters using stage 1 token descriptors
-        5. Repeat until target length is reached
-        
-        Args:
-            L (int): Target character sequence length
-            tau (float): Temperature for stochastic selection (0=deterministic)
-            
-        Returns:
-            str: Generated character sequence
-        """
-        assert self.trained, "Model must be trained before generation"
-        assert hasattr(self, 'AcoeffI'), "Stage 2 parameters missing - run double_train first"
-        
-        # Step 1: Generate initial character sequence using stage 1
-        init_chars = min(L, max(10, L//2))  # Initial character length
-        char_seq = self.generate(init_chars, tau)
-        
-        # Continue generating until we reach target length
-        while len(char_seq) < L:
-            # Step 2: Convert current chars to descriptor vectors
-            vec_seq = self.describe(char_seq)
-            
-            # Step 3: Extend vector sequence using stage 2 parameters
-            next_vec = self._predict_next_vector(vec_seq)
-            
-            # Step 4: Find best matching token for the new vector
-            next_token = self._vector_to_token(next_vec, tau)
-            
-            # Step 5: Append token (remove padding underscores)
-            clean_token = next_token.rstrip('_')
-            char_seq += clean_token
-        
-        return char_seq[:L]  # Trim to exact length
-
-    def _predict_next_vector(self, vec_seq):
-        """Predict next vector using stage 2 parameters"""
-        # Use last vector in sequence as current state
-        current_vec = vec_seq[-1] if vec_seq else self.mean_vec
-        
-        # Compute z = BbasisI @ current_vec
-        z = [0.0] * self.LI
-        for j in range(self.LI):
-            for i in range(self.m):
-                z[j] += self.BbasisI[j][i] * current_vec[i]
-        
-        # Compute next_vec = AcoeffI @ z
-        next_vec = [0.0] * self.m
-        for i in range(self.m):
-            for j in range(self.LI):
-                next_vec[i] += self.AcoeffI[i][j] * z[j]
-        
-        return next_vec
-
-    def _vector_to_token(self, target_vec, tau):
-        """Find token whose descriptor best matches target vector"""
-        best_tok, best_score = None, -float('inf')
-        scores = []
-        
-        # Calculate matching score for each token
-        for tok in self.tokens:
-            # Get token's descriptor vector from stage 1
-            tok_vec = self._get_token_descriptor(tok)
-            
-            # Calculate similarity (negative squared error)
-            score = -sum((t - v)**2 for t, v in zip(target_vec, tok_vec))
-            
-            # For deterministic selection
-            if tau == 0 and score > best_score:
-                best_score = score
-                best_tok = tok
-            
-            # For stochastic selection
-            scores.append((tok, score))
-        
-        # Deterministic return
-        if tau == 0:
-            return best_tok
-        
-        # Stochastic selection
-        tokens, raw_scores = zip(*scores)
-        exp_scores = [math.exp(s/tau) for s in raw_scores]
-        total = sum(exp_scores)
-        probs = [s/total for s in exp_scores]
-        return random.choices(tokens, weights=probs, k=1)[0]
 
     def save(self, filename):
         """
@@ -1076,9 +479,9 @@ if __name__ == "__main__":
 
     from statistics import correlation
     
-    #random.seed(0)
+    #random.seed(11)
     charset = ['A','C','G','T']
-    dd = DualDescriptorAB(charset, rank=3, vec_dim=2, bas_dim=20, mode='nonlinear', user_step=2)
+    dd = DualDescriptorAB(charset, rank=2, vec_dim=3, bas_dim=150, mode='linear', user_step=None)
 
     # generate 10 sequences of length 100–200 and random targets
     seqs, t_list = [], []
@@ -1088,7 +491,7 @@ if __name__ == "__main__":
         seqs.append(seq)
         t_list.append([random.uniform(-1,1) for _ in range(dd.m)])
 
-    dd.train(seqs, t_list, max_iters=10)
+    dd.train(seqs, t_list, max_iters=500)
     dd.show()
 
     # Predict target vector for first sequence
@@ -1138,205 +541,4 @@ if __name__ == "__main__":
     seq_det = dd.generate(L=100, tau=0.0)
     print(f"Deterministic (tau=0): {seq_det[:50]}...")
 
-    # Create model with smaller parameters for faster demonstration
-    dd_grad = DualDescriptorAB(charset, rank=3, vec_dim=2, bas_dim=20, mode='nonlinear', user_step=2)
-    
-    print("Training with gradient descent...")
-    grad_history = dd_grad.grad_train(
-        seqs,
-        t_list,
-        learning_rate=0.5,  # Higher learning rate for demonstration
-        max_iters=900,
-        tol=1e-9,
-        print_every=5
-    )
-    
-    # Test on a new sequence
-    test_seq = "ACGTACGTACGT"
-    pred_t = dd_grad.predict_t(test_seq)
-    print(f"\nTest sequence: {test_seq}")
-    print(f"Predicted t: {[f'{x:.4f}' for x in pred_t]}")
-
-    # Predict target vector for first sequence
-    aseq = seqs[0]
-    t_pred = dd_grad.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x, 4) for x in t_pred]}")    
-    
-    # Calculate flattened correlation between predicted and actual targets
-    pred_t_list = [dd_grad.predict_t(seq) for seq in seqs]
-    
-    # Predictions and actuals for correlation calculation
-    corr_sum = 0.0
-    for i in range(dd.m):
-        actu_t = [t_vec[i] for t_vec in t_list]
-        pred_t = [t_vec[i] for t_vec in pred_t_list]
-        corr = correlation(actu_t, pred_t)
-        print(f"Prediction correlation: {corr:.4f}")
-        corr_sum += corr
-    corr_avg = corr_sum / dd.m
-    print(f"Average correlation: {corr_avg:.4f}")   
-    
-    # Generate a new sequence
-    generated = dd_grad.generate(L=20, tau=0.3)
-    print(f"\nGenerated sequence: {generated}")
-
-    # Create models
-    dd_gap = DualDescriptorAB(charset, rank=2, vec_dim=3, bas_dim=20, mode='linear')
-    dd_reg = DualDescriptorAB(charset, rank=2, vec_dim=3, bas_dim=20, mode='linear')
-    
-    # Generate training data
-    train_seqs = []
-    for _ in range(20):  # 20 sequences
-        L = random.randint(50, 80)
-        seq = ''.join(random.choices(charset, k=L))
-        train_seqs.append(seq)
-    
-    # Autoencoder training (gap mode)
-    print("Training with autoencoder objective (gap mode)...")
-    gap_history = dd_gap.auto_train(
-        train_seqs,
-        learning_rate=0.1,
-        max_iters=50,
-        tol=1e-5,
-        print_every=5,
-        auto_mode='gap'
-    )
-    
-    # Next-token prediction training (reg mode)
-    print("\nTraining with next-token prediction objective (reg mode)...")
-    reg_history = dd_reg.auto_train(
-        train_seqs,
-        learning_rate=0.1,
-        max_iters=50,
-        tol=1e-5,
-        print_every=5,
-        auto_mode='reg'
-    )
-    
-    # Generate sequences from both models
-    print("\n=== Generated Sequences ===")
-    print("Autoencoder (gap) deterministic:")
-    print(dd_gap.generate(L=30, tau=0.0))
-    
-    print("\nNext-token (reg) deterministic:")
-    print(dd_reg.generate(L=30, tau=0.0))
-    
-    print("\nNext-token (reg) stochastic:")
-    print(dd_reg.generate(L=30, tau=0.3))
-
-    # Create a DualDescriptorAB instance
-    dd = DualDescriptorAB(charset="ACGT", rank=3, vec_dim=3, bas_dim=20)
-
-    # Create synthetic vector sequences (3-dimensional vectors)
-    vector_sequences = [
-        [[0.1, -0.2, 0.3], [0.4, -0.5, 0.6], [0.7, -0.8, 0.9]],
-        [[-0.3, 0.2, -0.1], [-0.6, 0.5, -0.4]],
-        [[0.9, -0.8, 0.7], [0.6, -0.5, 0.4], [0.3, -0.2, 0.1]]
-    ]
-
-    # Train using autoencoder (gap) mode with fixed sine basis
-    print("Training in autoencoder mode with fixed sine basis...")
-    gap_history = dd.part_train(
-        vector_sequences,
-        learning_rate=0.1,
-        max_iters=50,
-        auto_mode='gap',
-        print_every=5
-    )
-
-    # Train using next-vector prediction (reg) mode with fixed sine basis
-    print("\nTraining in next-vector prediction mode with fixed sine basis...")
-    reg_history = dd.part_train(
-        vector_sequences,
-        learning_rate=0.1,
-        max_iters=50,
-        auto_mode='reg',
-        print_every=5
-    )
-
-    # Generate new sequences
-    print("\nGenerating deterministic sequence...")
-    det_seq = dd.part_generate(length=5, tau=0.0)
-    print("Deterministic sequence:")
-    for i, vec in enumerate(det_seq):
-        print(f"Vector {i+1}: {[round(v, 4) for v in vec]}")
-
-    print("\nGenerating stochastic sequence...")
-    stoch_seq = dd.part_generate(length=5, tau=0.1)
-    print("Stochastic sequence:")
-    for i, vec in enumerate(stoch_seq):
-        print(f"Vector {i+1}: {[round(v, 4) for v in vec]}")
-
-    # Show the fixed sine basis matrix
-    print("\nFixed sine basis matrix (first 3 rows):")
-    for j in range(3):
-        print(f"Row {j+1}: {[round(dd.BbasisI[j][i], 4) for i in range(dd.m)]}")
-
-     # Generate training sequences
-    train_seqs = []
-    for _ in range(15):
-        length = random.randint(50, 100)
-        train_seqs.append(''.join(random.choices(charset, k=length)))
-    
-    print("Starting double training...")
-    auto_hist, part_hist = dd.double_train(
-        train_seqs,
-        auto_mode='reg',          # Next-token prediction for characters
-        auto_learning_rate=0.1,
-        auto_max_iters=50,
-        part_mode='reg',         # Next-vector prediction for descriptors
-        part_learning_rate=0.05,
-        part_max_iters=30,
-        tol=1e-5,
-        print_every=5
-    )
-    
-    # Generate new character sequence
-    print("\nGenerating new character sequence:")
-    char_seq = dd.generate(L=40, tau=0.2)
-    print(char_seq)
-    
-    # Generate new vector sequence
-    print("\nGenerating new vector sequence:")
-    vec_seq = dd.part_generate(length=5, tau=0.1)
-    for i, vec in enumerate(vec_seq):
-        print(f"Vector {i+1}: {[round(v, 4) for v in vec]}")
-
-    # After double_train as shown in the original example
-    print("\n=== Double Generation Demo ===")
-    print("Generating sequence with double_generate (tau=0):")
-    seq_double_det = dd.double_generate(L=100, tau=0.0)
-    print(seq_double_det[:100])
-
-    print("\nGenerating sequence with double_generate (tau=0.2):")
-    seq_double_stoch = dd.double_generate(L=100, tau=0.2)
-    print(seq_double_stoch[:100])
-
-    # Compare with basic generation
-    print("\nBasic generate (tau=0):")
-    seq_basic = dd.generate(L=100, tau=0.0)
-    print(seq_basic[:100])
-
-    # Save trained model
-    dd_grad.save("trained_model.pkl")
-    
-    # Load saved model
-    dd_loaded = DualDescriptorAB.load("trained_model.pkl")
-    
-    # Verify predictions work
-    t_pred = dd_loaded.predict_t(seqs[0])
-    print("Predicted t using loaded model: ", t_pred)
-    
-    # Continue training
-    dd_loaded.grad_train(seqs, t_list, max_iters=50)
-    
-    # Test other functionality
-    features = dd_loaded.dd_features(seqs[0])
-    print("Feature vector length:", len(features))
-    
-    repr_seq = dd_loaded.reconstruct()
-    print(f"Representative sequence: {repr_seq}")
-    
-    gen_seq = dd_loaded.generate(L=100, tau=0.5)
-    print(f"Generated sequence: {gen_seq}")
 

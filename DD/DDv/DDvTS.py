@@ -143,21 +143,7 @@ class DualDescriptorTS:
             for i in range(self.m):
                 S[i] += Nk_list[l][i]
             S_list.append(list(S))
-        return S_list       
-    
-    def d(self, seq, t):
-        """
-        Compute mean squared deviation d for a single sequence:
-        d = average over positions of (N(k)-t)^2
-        """
-        total = 0.0
-        Nk_list = self.describe(seq)
-        L = len(Nk_list)
-        for Nk in Nk_list:
-            for i in range(self.m):
-                d = Nk[i] - t[i]
-                total += d*d
-        return total / L if L > 0 else 0.0
+        return S_list 
 
     def D(self, seqs, t_list):
         """
@@ -301,7 +287,7 @@ class DualDescriptorTS:
                 except Exception as e:
                     print(f"Warning: x_map update failed for token '{c}', keeping previous value. Error: {str(e)}") 
 
-    def train(self, seqs, t_list, max_iters=10, tol=1e-8):
+    def train(self, seqs, t_list, max_iters=10, tol=1e-8, print_every=1):
         """Alternate closed-form updates with convergence tracking"""        
         D_prev = float('inf')
         history = []
@@ -310,8 +296,9 @@ class DualDescriptorTS:
             self.update_x(seqs, t_list)
             D = self.D(seqs, t_list)
             history.append(D)
-            print(f"Iter {it:2d}: D = {D:.6e}")
-            if abs(D - D_prev) <= tol:
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:2d}: D = {D:.6e}")
+            if D >= D_prev - tol:
                 print("Converged.")
                 break
             D_prev = D            
@@ -328,7 +315,7 @@ class DualDescriptorTS:
         self.trained = True        
         return history
 
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, continued=False, decay_rate=1.0):
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10):
         """
         Train the model using gradient descent with alternating updates for P and x_map.
         
@@ -408,10 +395,11 @@ class DualDescriptorTS:
                 for j in range(self.m):
                     self.x_map[token][j] -= learning_rate * grad_x[token][j]
             
-            # Calculate current loss
+            # Calculate current loss and print progress
             current_D = self.D(seqs, t_list)
             history.append(current_D)
-            print(f"GD Iter {it:2d}: D = {current_D:.6e}, LR = {learning_rate}")
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"GD Iter {it:2d}: D = {current_D:.6e}, LR = {learning_rate}")
             
             # Check convergence
             if D_prev - current_D < tol:
@@ -435,7 +423,7 @@ class DualDescriptorTS:
         self.trained = True
         return history
 
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, continued=False, auto_mode='reg', decay_rate=1.0):
+    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
         """
         Self-training method using gradient descent with two modes:
           - 'gap': Predicts current token's embedding (self-consistency)
@@ -565,8 +553,9 @@ class DualDescriptorTS:
             # Record and print progress
             avg_loss = total_loss / total_samples
             history.append(avg_loss)
-            mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-            print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {learning_rate}")
+            if it % print_every == 0 or it == max_iters - 1:
+                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {learning_rate}")
             
             # Check convergence
             if prev_loss - avg_loss < tol:
@@ -661,40 +650,61 @@ class DualDescriptorTS:
         full_seq = ''.join(generated_tokens)
         return full_seq[:L]    
 
-    def dd_features(self, seq):
-        """Extract feature vector for a sequence"""
-        # Flatten P tensor
+    def dd_features(self, seq, t=None):
+        """
+        Extract feature vector for a sequence:
+        { 'd' : [deviation value],
+         'pwc': [PWC coefficients], 
+         'cwf': [CWF values for all tokens sorted],
+         'frq': [Position-weighted frequency for each token],
+         'pdv': [Partial Dual Variable for each token],         
+         'all': [concatenate the above]}
+        """
+        tg = t or self.predict_t(seq)
+        feats = {}
+        # Deviation value 
+        feats['d'] = [self.D([seq], [tg])]
+        # Flatten P tensor (PWC)
+        P_backup = self.P.copy()
+        self.update_P([seq], [tg])        
         p_flat = []
         for i in range(self.m):
             for j in range(self.m):
                 p_flat.extend(self.P[i][j])
-                
-        # Flatten x_map
+        feats['pwc'] = p_flat
+        self.P = P_backup                
+        # Flatten x_map (CWF)
+        x_backup = self.x_map.copy()        
+        self.update_x([seq], [tg])  
         x_flat = []
         for tok in self.tokens:
             x_flat.extend(self.x_map[tok])
-            
-        # Basis-weighted token counts
-        weighted_counts = []
+        feats['cwf'] = x_flat
+        self.x_map = x_backup              
+        # Basis-weighted frequencies and partial dual variables
+        frqs = []; pdvs = []
         toks = self.extract_tokens(seq)
+        L = len(toks)
         for tok in self.tokens:
             for i in range(self.m):
                 for j in range(self.m):
                     for g in range(self.o):
-                        s = 0.0
+                        s = 0.0; v =0.0
                         for k, ch in enumerate(toks):
                             if ch == tok:
                                 period = self.periods[i][j][g]
                                 phi = math.cos(2 * math.pi * k / period)
                                 s += phi
-                        weighted_counts.append(s)
-                        
-        # Final feature vector combines all components
-        features = p_flat + x_flat + weighted_counts
-        return features
+                                v += phi*self.x_map[tok][i]
+                        frqs.append(s/L if L>0 else 0.0) 
+                        pdvs.append(v/L if L>0 else 0.0)
+        feats['frq'] = frqs[:-1] #remove the last one because of dependency
+        feats['pdv'] = pdvs[:-1] #remove the last one because of dependency
+        feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
+        return feats
 
     def show(self):
-        print("DualDescriptorTensor status:")
+        print("DualDescriptorTS status:")
         print(f" m={self.m}, o={self.o}, rank={self.rank}, mode={self.mode}")
         print(" Sample period[0][0] = ", self.periods[0][0])
         print(" Sample P[0][0][:] = ", self.P[0][0])
@@ -716,7 +726,7 @@ class DualDescriptorTS:
         return Nk
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-               continued=False, auto_mode='reg', decay_rate=1.0):
+               continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
         """
         Train the I tensor on vector sequences using gradient descent.
         Supports two modes:
@@ -816,8 +826,9 @@ class DualDescriptorTS:
             # Record and print progress
             avg_loss = total_loss / total_samples
             history.append(avg_loss)
-            mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-            print(f"PartTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {learning_rate}")
+            if it % print_every == 0 or it == max_iters - 1:
+                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
+                print(f"PartTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {learning_rate}")
             
             # Check convergence
             if prev_loss - avg_loss < tol:
@@ -1135,7 +1146,7 @@ if __name__=="__main__":
     print("Stochastic generation (tau=0.5):", seq_rand[:50] + "...")
     
     # Extract features for first sequence
-    features = dd.dd_features(seqs[0])
+    features = dd.dd_features(seqs[0])['all']
     print(f"\nFeature vector length: {len(features)}")
     print(f"First 10 features: {[round(x, 4) for x in features[:10]]}")
 
@@ -1359,8 +1370,8 @@ if __name__=="__main__":
     print(double_seq)
 
     # Extract features from different generation methods
-    char_features = dd_double.dd_features(char_seq)[:5]
-    double_features = dd_double.dd_features(double_seq)[:5]
+    char_features = dd_double.dd_features(char_seq)['all'][:5]
+    double_features = dd_double.dd_features(double_seq)['all'][:5]
     print("\nFeature comparison (first 5 values):")
     print(f"Char-only: {[round(f, 4) for f in char_features]}")
     print(f"Double:    {[round(f, 4) for f in double_features]}")
