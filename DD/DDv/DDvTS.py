@@ -711,20 +711,6 @@ class DualDescriptorTS:
         tok0=self.tokens[0]
         print(" Sample x_map for token", tok0, self.x_map[tok0])
 
-    def compute_Nk_for_vector(self, k, vector):
-        """
-        Compute N(k) vector for a single position and input vector
-        (without token lookup)
-        """
-        Nk = [0.0] * self.m
-        for i in range(self.m):
-            for j in range(self.m):
-                for g in range(self.o):
-                    period = self.periods[i][j][g]
-                    phi = math.cos(2 * math.pi * k / period)
-                    Nk[i] += self.I[i][j][g] * vector[j] * phi
-        return Nk
-
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
         """
@@ -1273,64 +1259,6 @@ if __name__=="__main__":
     for i, vec in enumerate(gen_seq):
         print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
 
-    print("\n" + "="*50)
-    print("Double Train/Generate Example")
-    print("="*50)
-    
-    # Create new model
-    dd_double = DualDescriptorTS(charset=['A','C','G','T'], 
-                                     rank=3, 
-                                     vec_dim=2, 
-                                     num_basis=5,
-                                     mode='nonlinear',
-                                     user_step=2)
-    
-    # Generate sample DNA sequences
-    dna_seqs = []
-    for _ in range(5):  # 5 sequences
-        seq_len = random.randint(100, 150)
-        dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
-    
-    # Configure training parameters
-    auto_config = {
-        'max_iters': 50,
-        'tol': 1e-6,
-        'learning_rate': 0.1
-    }
-    
-    part_config = {
-        'max_iters': 50,
-        'tol': 1e-5,
-        'learning_rate': 0.05
-    }
-    
-    # Perform double training
-    auto_hist, part_hist = dd_double.double_train(
-        dna_seqs,
-        auto_mode='reg',       # Auto-regressive character training
-        part_mode='reg',       # Auto-regressive vector training
-        auto_params=auto_config,
-        part_params=part_config
-    )
-    
-    # Generate new DNA sequence using character model
-    print("\nGenerated DNA sequence from character model:")
-    dna_seq = dd_double.generate(100, tau=0.2)
-    print(dna_seq)
-    
-    # Generate vector sequence using I tensor
-    print("\nGenerated vector sequence from I tensor:")
-    vec_seq = dd_double.part_generate(10, mode='reg', tau=0.0)
-    for i, vec in enumerate(vec_seq):
-        print(f"Vec {i+1}: [{vec[0]:.4f}, {vec[1]:.4f}]")
-    
-    # Show final model status
-    print("\nTrained model components:")
-    print("Sample P[0][0]:", [round(x, 4) for x in dd_double.P[0][0][:3]])
-    print("Sample I[0][0]:", [round(x, 4) for x in dd_double.I[0][0][:3]])
-    print("Token 'ACG' embedding:", 
-          [round(x, 4) for x in dd_double.x_map['ACG']])
-
     # === Double Generation Example ===
     print("\n" + "="*50)
     print("Double Generation Example")
@@ -1346,13 +1274,32 @@ if __name__=="__main__":
         user_step=2
     )
 
+    # Generate sample DNA sequences
+    dna_seqs = []
+    for _ in range(10):  # 5 sequences
+        seq_len = random.randint(100, 200)
+        dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
+
+    # Configure training parameters
+    auto_config = {
+        'max_iters': 50,
+        'tol': 1e-6,
+        'learning_rate': 0.1
+    }
+    
+    part_config = {
+        'max_iters': 50,
+        'tol': 1e-6,
+        'learning_rate': 0.1
+    }
+
     # Train with double_train (as in previous example)
     auto_hist, part_hist = dd_double.double_train(
         dna_seqs,  # Sample DNA sequences
         auto_mode='reg',
         part_mode='reg',
-        auto_params={'max_iters': 50, 'tol': 1e-6, 'learning_rate': 0.1},
-        part_params={'max_iters': 30, 'tol': 1e-6, 'learning_rate': 0.05}
+        auto_params=auto_config,
+        part_params=part_config
     )
 
     # Generate sequences using different methods for comparison

@@ -1,5 +1,5 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Dual Descriptor Vector class (AB Matrix form)
+# The Dual Descriptor Vector class (AB matrix form)
 # Author: Bin-Guang Ma; Date: 2025-6-5
 
 # The program is provided as it is and without warranty of any kind,
@@ -291,6 +291,275 @@ class DualDescriptorAB:
         self.trained = True
         return history
 
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10):
+        """
+        Train the DualDescriptorAB model using gradient descent optimization with position-level normalization.
+        
+        This implementation uses the total number of tokens across all sequences for normalization,
+        which provides more stable gradients and better handling of variable-length sequences.
+        
+        Steps:
+        1. Compute total number of tokens (positions) in the dataset
+        2. For each iteration:
+            a. Initialize gradients for Acoeff and x_map
+            b. For each sequence and each position:
+                - Compute predicted Nk vector
+                - Compute loss and gradients using total_positions normalization
+            c. Update parameters using learning rate
+            d. Apply learning rate decay
+            e. Track convergence using mean squared deviation
+        
+        Args:
+            seqs: List of input sequences
+            t_list: List of target vectors (each is m-dimensional)
+            max_iters: Maximum number of training iterations
+            tol: Tolerance for convergence detection
+            learning_rate: Initial learning rate for gradient descent
+            continued: Whether to continue training from current parameters
+            decay_rate: Learning rate decay factor per iteration
+            print_every: Print progress every N iterations
+            
+        Returns:
+            list: Training loss history
+        """
+        # Reinitialize parameters if not continuing training
+        if not continued:
+            # Initialize token embeddings
+            self.x_map = {
+                tok: [random.uniform(-0.5, 0.5) for _ in range(self.m)]
+                for tok in self.tokens
+            }
+            # Initialize coefficient matrix
+            self.Acoeff = [[random.uniform(-0.1, 0.1) for _ in range(self.L)]
+                           for _ in range(self.m)]
+        
+        # Compute total number of tokens (positions) in the dataset
+        total_positions = sum(len(self.extract_tokens(seq)) for seq in seqs)
+        if total_positions == 0:
+            raise ValueError("No tokens found in sequences")
+        
+        n_seqs = len(seqs)
+        history = []
+        D_prev = float('inf')
+        
+        for it in range(max_iters):
+            # Initialize gradients
+            grad_A = [[0.0] * self.L for _ in range(self.m)]  # Gradient for Acoeff
+            grad_x = {tok: [0.0] * self.m for tok in self.tokens}  # Gradient for x_map
+            
+            total_loss = 0.0  # Track average loss per token
+            
+            # Process each sequence and each position
+            for seq, t in zip(seqs, t_list):
+                toks = self.extract_tokens(seq)
+                T = len(toks)
+                if T == 0:  # Skip empty sequences
+                    continue
+                    
+                # Compute position-wise descriptor vectors
+                for k, tok in enumerate(toks):
+                    j = k % self.L
+                    # Compute projection scalar: Bbasis[j] • x
+                    scalar = sum(self.Bbasis[j][i] * self.x_map[tok][i] for i in range(self.m))
+                    # Compute Nk = scalar * Acoeff[:, j]
+                    Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                    
+                    # Compute position loss (using position-level targets)
+                    pos_loss = 0.0
+                    for i in range(self.m):
+                        diff = Nk[i] - t[i]
+                        pos_loss += diff * diff
+                    
+                    # Add to total loss (normalized by dimensions)
+                    total_loss += pos_loss / self.m
+                    
+                    # Compute gradients for this position
+                    for i in range(self.m):
+                        # Normalize by total positions (like grad_train.py)
+                        error_i = 2 * (Nk[i] - t[i]) / (self.m * total_positions)
+                        
+                        # Gradient for Acoeff[i][j]
+                        grad_A[i][j] += error_i * scalar
+                        
+                        # Gradient for x_map[tok]
+                        for l in range(self.m):
+                            grad_x[tok][l] += error_i * self.Acoeff[i][j] * self.Bbasis[j][l]
+            
+            # Average loss per token (for tracking)
+            avg_loss = total_loss / total_positions
+            history.append(avg_loss)
+            
+            # Update parameters using gradients
+            for i in range(self.m):
+                for j in range(self.L):
+                    self.Acoeff[i][j] -= learning_rate * grad_A[i][j]
+                    
+            for tok in self.tokens:
+                for l in range(self.m):
+                    self.x_map[tok][l] -= learning_rate * grad_x[tok][l]
+            
+            # Apply learning rate decay
+            learning_rate *= decay_rate
+            
+            # Print progress and check convergence
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:3d}: D = {avg_loss:.6e}, LR = {learning_rate:.6f}")
+                
+            # Check convergence based on loss improvement
+            if D_prev - avg_loss < tol:
+                print(f"Converged after {it+1} iterations.")
+                break
+            D_prev = avg_loss
+        
+        # Final setup after training
+        self.mean_L = int(sum(len(self.extract_tokens(seq)) for seq in seqs) / len(seqs))
+        self.mean_t = [0.0] * self.m
+        for t in t_list:
+            for i in range(self.m):
+                self.mean_t[i] += t[i]
+        self.mean_t = [x / len(t_list) for x in self.mean_t]
+        self.trained = True
+        
+        return history
+
+    def auto_train(self, seqs, auto_mode='gap', max_iters=1000, tol=1e-8, 
+                   learning_rate=0.01, continued=False, decay_rate=1.0, 
+                   print_every=10):
+        """
+        Train the model using self-supervised learning with two modes:
+          - 'gap': Gap filling (mask current token and predict it from context)
+          - 'reg': Auto-regressive (predict next token from previous tokens)
+        
+        Args:
+            seqs: List of input sequences
+            auto_mode: Training mode ('gap' or 'reg')
+            max_iters: Maximum training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate
+            continued: Continue training from current parameters
+            decay_rate: Learning rate decay factor
+            print_every: Print frequency            
+            
+        Returns:
+            list: Training loss history
+        """
+        # Reinitialize if not continuing
+        if not continued:
+            self.x_map = {
+                tok: [random.uniform(-0.5, 0.5) for _ in range(self.m)]
+                for tok in self.tokens
+            }
+            self.Acoeff = [[random.uniform(-0.1, 0.1) for _ in range(self.L)] 
+                           for _ in range(self.m)]
+        
+        # Prepare training samples
+        samples = []  # (sequence, position, target_token)
+        for seq in seqs:
+            toks = self.extract_tokens(seq)
+            if not toks:
+                continue
+                
+            if auto_mode == 'gap':
+                # Gap filling: predict current token from context
+                for k in range(len(toks)):
+                    samples.append((seq, k, toks[k]))
+                    
+            elif auto_mode == 'reg':
+                # Auto-regressive: predict next token from previous
+                for k in range(len(toks) - 1):
+                    samples.append((seq, k, toks[k + 1]))
+        
+        if not samples:
+            print("Warning: No training samples generated")
+            return []
+            
+        # Initialize training variables
+        history = []
+        prev_loss = float('inf')
+        current_lr = learning_rate
+        
+        # Main training loop
+        for it in range(max_iters):
+            total_loss = 0.0
+            grad_A = [[0.0] * self.L for _ in range(self.m)]
+            grad_x = {tok: [0.0] * self.m for tok in self.tokens}
+            
+            # Process each sample
+            for seq, k, target_tok in samples:
+                # Get input token (for 'reg' this is current token at position k)
+                context_toks = self.extract_tokens(seq)
+                if k >= len(context_toks):
+                    continue
+                input_tok = context_toks[k]
+                
+                # Compute Nk descriptor at position k
+                j = k % self.L
+                scalar = sum(self.Bbasis[j][i] * self.x_map[input_tok][i] 
+                          for i in range(self.m))
+                Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                
+                # Get target vector
+                target_vec = self.x_map[target_tok]
+                
+                # Compute loss and gradients
+                loss_val = 0.0
+                dNk = [0.0] * self.m
+                for i in range(self.m):
+                    error = Nk[i] - target_vec[i]
+                    loss_val += error * error
+                    dNk[i] = 2 * error / self.m  # Gradient of loss w.r.t Nk[i]
+                total_loss += loss_val / self.m
+                
+                # Compute gradients for Acoeff and input token embedding
+                for i in range(self.m):
+                    grad_A[i][j] += dNk[i] * scalar
+                    for l in range(self.m):
+                        grad_x[input_tok][l] += (
+                            dNk[i] * self.Acoeff[i][j] * self.Bbasis[j][l]
+                        )
+                
+                # Compute gradient for target token embedding
+                for i in range(self.m):
+                    grad_x[target_tok][i] -= dNk[i]  # Negative gradient
+            
+            # Update parameters            
+            for i in range(self.m):
+                for j in range(self.L):
+                    self.Acoeff[i][j] -= current_lr * grad_A[i][j]
+            for tok in self.tokens:
+                for i in range(self.m):
+                    self.x_map[tok][i] -= current_lr * grad_x[tok][i]
+            
+            # Record and print progress
+            avg_loss = total_loss / len(samples)
+            history.append(avg_loss)
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:4d}: loss = {avg_loss:.6e}, lr = {current_lr:.4f}")
+            
+            # Check convergence
+            if prev_loss - avg_loss < tol:
+                print(f"Converged after {it+1} iterations")
+                break
+            prev_loss = avg_loss
+            
+            # Update learning rate
+            current_lr *= decay_rate
+        
+        # Finalize training
+        self.trained = True
+        self.mean_L = sum(len(self.extract_tokens(seq)) for seq in seqs) / len(seqs)
+        self.mean_t = [0.0] * self.m
+        count = 0
+        for tok in self.tokens:
+            vec = self.x_map[tok]
+            for i in range(self.m):
+                self.mean_t[i] += vec[i]
+            count += 1
+        if count > 0:
+            self.mean_t = [x / count for x in self.mean_t]
+            
+        return history
+
     def predict_t(self, seq):
         """
         Predict target vector for a sequence
@@ -307,139 +576,168 @@ class DualDescriptorAB:
         N = len(N_list)
         return [ti / N for ti in sum_t]
 
-    def _compute_token_descriptor(self, tok):
-        """
-        Compute the descriptor vector for a token.
-        Args:
-            tok: Token string
-        Returns:
-            list: m-dimensional descriptor vector
-        """
-        x = self.x_map[tok]
-        # Compute z = Bbasis * x (L-dimensional vector)
-        z = [0.0] * self.L
-        for j in range(self.L):
-            for i in range(self.m):
-                z[j] += self.Bbasis[j][i] * x[i]
-        # Compute Nk_vec = Acoeff * z (m-dimensional vector)
-        Nk_vec = [0.0] * self.m
-        for i in range(self.m):
-            for j in range(self.L):
-                Nk_vec[i] += self.Acoeff[i][j] * z[j]
-        return Nk_vec
-
-    def _get_token_descriptor(self, tok):
-        """
-        Retrieve cached descriptor vector for a token (compute if not cached).
-        Args:
-            tok: Token string
-        Returns:
-            list: m-dimensional descriptor vector
-        """
-        if not hasattr(self, '_tok_vec_cache'):
-            self._tok_vec_cache = {}
-        if tok not in self._tok_vec_cache:
-            self._tok_vec_cache[tok] = self._compute_token_descriptor(tok)
-        return self._tok_vec_cache[tok]
-    
     def reconstruct(self):
         """
-        Reconstruct a representative sequence by selecting tokens that minimize 
-        the squared error between their descriptor vector and the mean target vector.
-        Returns:
-            str: Reconstructed sequence truncated to average token count length
-        """
-        assert self.trained, "Model must be trained before reconstruction."
-        # Precompute descriptor vectors for all tokens
-        tok_vecs = {}
-        for tok in self.tokens:
-            tok_vecs[tok] = self._get_token_descriptor(tok)
+        Reconstructs a representative sequence by selecting tokens that minimize 
+        the deviation from the mean target vector at each position.
         
-        tokens = []
-        for k in range(self.mean_L):  # For each token position
+        Steps:
+        1. Uses the average token count (mean_L) rounded to nearest integer
+        2. For each position k, evaluates all possible tokens
+        3. Computes Nk vector for token at position k
+        4. Selects token minimizing MSE between Nk and mean_t
+        5. Returns concatenated token sequence
+        
+        Requires prior training (sets mean_L and mean_t)
+        """
+        assert self.trained, "Model must be trained first"
+        n_tokens = round(self.mean_L)
+        seq_tokens = []
+        
+        for k in range(n_tokens):
             best_tok = None
             min_error = float('inf')
-            # Find token minimizing error to mean target
+            j = k % self.L  # Basis matrix index
+            
             for tok in self.tokens:
-                vec = tok_vecs[tok]
-                error = sum((vec[i] - self.mean_t[i]) ** 2 for i in range(self.m))
+                # Compute Nk = (A[:,j] * scalar) where scalar = B[j]·x
+                scalar = sum(self.Bbasis[j][i] * self.x_map[tok][i] for i in range(self.m))
+                Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                
+                # Calculate MSE between Nk and mean target
+                error = 0.0
+                for d in range(self.m):
+                    diff = Nk[d] - self.mean_t[d]
+                    error += diff * diff
+                
+                # Track minimum error token
                 if error < min_error:
                     min_error = error
                     best_tok = tok
-            # Remove padding underscores
-            clean_tok = best_tok.rstrip('_')
-            tokens.append(clean_tok)
+            
+            seq_tokens.append(best_tok)
         
-        full_seq = ''.join(tokens)
-        return full_seq[:self.mean_L]  # Truncate to average token count
+        return ''.join(seq_tokens)
 
     def generate(self, L, tau=0.0):
         """
-        Generate a sequence of length L using descriptor vectors.
+        Generates a sequence of length L using temperature-controlled sampling.
+        
         Args:
-            L (int): Target sequence length
-            tau (float): Temperature (≥0); 0=deterministic, >0=stochastic
-        Returns:
-            str: Generated sequence truncated to length L
+            L: Desired sequence length
+            tau: Temperature parameter (0=deterministic, >0=stochastic)
+            
+        Process:
+        1. Calculates required token count based on rank
+        2. For each position k:
+            a. Computes Nk for all tokens
+            b. Converts deviation to selection score
+            c. Samples token (deterministic if tau=0)
+        3. Truncates to exact length L
+        
+        Requires prior training (uses mean_t)
         """
-        assert self.trained, "Model must be trained before generation."
+        assert self.trained, "Model must be trained first"
         if tau < 0:
-            raise ValueError("Temperature must be non-negative.")
+            raise ValueError("Temperature must be non-negative")
         
-        # Filter valid full-length tokens
-        valid_tokens = [tok for tok in self.tokens 
-                       if len(tok) == self.rank and '_' not in tok]
-        if not valid_tokens:
-            raise ValueError("No valid full-length tokens found.")
-        
-        # Precompute descriptor vectors for valid tokens
-        tok_vecs = {}
-        for tok in valid_tokens:
-            tok_vecs[tok] = self._get_token_descriptor(tok)
-        
-        num_blocks = (L + self.rank - 1) // self.rank  # Blocks needed
+        num_blocks = (L + self.rank - 1) // self.rank
         generated_tokens = []
-        
+
+        # Generate tokens block by block
         for k in range(num_blocks):
             scores = {}
-            # Calculate score = -error for each token
-            for tok in valid_tokens:
-                vec = tok_vecs[tok]
-                error = sum((vec[i] - self.mean_t[i]) ** 2 for i in range(self.m))
-                scores[tok] = -error
+            j = k % self.L  # Basis matrix index
+
+            # Compute scores for all tokens            
+            for tok in self.tokens:
+                # Compute Nk vector for token
+                scalar = sum(self.Bbasis[j][i] * self.x_map[tok][i] for i in range(self.m))
+                Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                
+                # Calculate deviation score (negative MSE)
+                error = 0.0
+                for d in range(self.m):
+                    diff = Nk[d] - self.mean_t[d]
+                    error += diff * diff
+                scores[tok] = -error  # Higher score = better match
             
-            if tau == 0.0:  # Deterministic selection
+            # Token selection logic
+            if tau == 0:  # Deterministic
                 best_tok = max(scores.keys(), key=lambda t: scores[t])
                 generated_tokens.append(best_tok)
-            else:  # Stochastic selection
-                token_list = list(scores.keys())
-                exp_scores = [math.exp(scores[t] / tau) for t in token_list]
+            else:  # Stochastic
+                tokens = list(scores.keys())
+                exp_scores = [math.exp(scores[t] / tau) for t in tokens]
                 sum_exp = sum(exp_scores)
-                probs = [es / sum_exp for es in exp_scores]
-                chosen_tok = random.choices(token_list, weights=probs, k=1)[0]
+                # Handle near-zero sum case
+                if sum_exp < 1e-18:
+                    probs = [1.0 / len(tokens)] * len(tokens)
+                else:
+                    probs = [es / sum_exp for es in exp_scores]
+                chosen_tok = random.choices(tokens, weights=probs, k=1)[0]
                 generated_tokens.append(chosen_tok)
         
+        # Trim to exact requested length
         full_seq = ''.join(generated_tokens)
-        return full_seq[:L]  # Truncate to target length
+        return full_seq[:L]
 
     # ---- feature extraction ----
-    def dd_features(self, seq): 
-        feats = []
-        # flatten Acoeff
-        for row in self.Acoeff:
-            feats.extend(row)
-        # flatten x_map
-        for tok in self.tokens:
-            feats.extend(self.x_map[tok])
-        # basis-weighted frequencies
+    def dd_features(self, seq, t=None):
+        """
+        Extract feature vector for a sequence in DualDescriptorAB format.
+        Features include:
+          'd' : Deviation value (scalar)
+          'pwc': Flattened PWC coefficients (Acoeff ⊗ Bbasis)
+          'cwf': Flattened token embeddings (x_map values)
+          'frq': Position-weighted token frequencies
+          'pdv': Partial dual variables
+          'all': Concatenation of all features
+        """
+        # Predict target vector if not provided
+        tg = t or self.predict_t(seq)
+        feats = {}
+        # 1. Deviation value (d)
+        feats['d'] = [self.deviation([seq], [tg])]
+        # 2. PWC coefficients (pwc): Flattened Acoeff
+        A_backup = self.Acoeff.copy()        
+        self.update_Acoeff([seq], [tg])        
+        p_flat = []        
+        for i in range(self.m):
+            p_flat.extend(self.Acoeff[i])                
+        feats['pwc'] = p_flat
+        self.Acoeff = A_backup
+        # 3. Token embeddings (cwf): Flattened x_map values
+        x_backup = self.x_map.copy()        
+        self.update_x([seq], [tg])  
+        x_flat = []
+        for tok in sorted(self.tokens):  # Consistent ordering
+            x_flat.extend(self.x_map[tok])
+        feats['cwf'] = x_flat
+        self.x_map = x_backup
+        # 4. Position-weighted frequencies (frq) and partial dual variables (pdv)
+        frqs = []; pdvs = []
         toks = self.extract_tokens(seq)
-        for tok in self.tokens:
-            for i in range(self.m):
-                s = 0.0
-                for j, tk in enumerate(toks):
-                    if tk == tok:
-                        s += self.Bbasis[j%self.L][i]
-                feats.append(s)  
+        L = len(toks)
+        for tok in sorted(self.tokens):  # Consistent ordering
+            for g in range(self.L):      # Basis index
+                for i in range(self.m):  # Vector dimension
+                    s_frq = 0.0  # Frequency accumulator
+                    s_pdv = 0.0  # Dual variable accumulator
+                    # Scan all positions in sequence
+                    for k, token in enumerate(toks):
+                        if token == tok and (k % self.L) == g:
+                            basis_val = self.Bbasis[g][i]
+                            s_frq += basis_val
+                            s_pdv += basis_val * self.x_map[tok][i]
+                    # Normalize by sequence length
+                    frqs.append(s_frq / L if L > 0 else 0.0)
+                    pdvs.append(s_pdv / L if L > 0 else 0.0)        
+        # Remove last element (legacy compatibility)
+        feats['frq'] = frqs[:-1]
+        feats['pdv'] = pdvs[:-1]
+        # 5. Concatenate all features
+        feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
         return feats
 
     # ---- show state ----
@@ -450,6 +748,348 @@ class DualDescriptorAB:
         print(" Sample Bbasis[0][:5]:", self.Bbasis[0][:5])
         tok0 = self.tokens[0]
         print(" Sample x_map first token:", tok0, self.x_map[tok0][:5])
+
+    def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
+        """
+        Trains the interaction matrix I on vector sequences using gradient descent.
+        Supports two training modes:
+          - 'gap': Predicts current vector (self-consistency)
+          - 'reg': Predicts next vector (auto-regressive)
+        
+        Parameters:
+            vec_seqs (list): List of vector sequences (each sequence is a list of m-dimensional vectors)
+            learning_rate (float): Step size for gradient updates
+            max_iters (int): Maximum training iterations
+            tol (float): Convergence tolerance
+            auto_mode (str): Training mode - 'gap' or 'reg'
+            continued (bool): Continue training existing I matrix
+            decay_rate (float): Learning rate decay factor (1.0 = no decay)
+            
+        Returns:
+            list: Training history (loss values per iteration)
+        """
+        if auto_mode not in ('gap', 'reg'):
+            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+
+        # Initialize I matrix if needed
+        if not continued or not hasattr(self, 'I'):
+            self.I = [[random.uniform(-0.1, 0.1) for _ in range(self.m)] 
+                      for _ in range(self.m)]
+        
+        # Calculate total training samples
+        total_samples = 0
+        for seq in vec_seqs:
+            if auto_mode == 'gap':
+                total_samples += len(seq)  # All vectors are samples
+            else:  # 'reg' mode
+                total_samples += max(0, len(seq) - 1)  # Vectors except last
+                
+        if total_samples == 0:
+            raise ValueError("No training samples found")
+            
+        history = []  # Store loss per iteration
+        prev_loss = float('inf')
+        
+        for it in range(max_iters):
+            # Initialize gradient matrix for I
+            grad_I = [[0.0] * self.m for _ in range(self.m)]  # m x m matrix
+            total_loss = 0.0
+            
+            # Process all vector sequences
+            for seq in vec_seqs:
+                if not seq:
+                    continue
+                    
+                # Process vectors based on mode
+                for k in range(len(seq)):
+                    # Skip last vector in 'reg' mode (no next vector)
+                    if auto_mode == 'reg' and k == len(seq) - 1:
+                        continue
+                        
+                    current_vec = seq[k]
+                    j = k % self.L  # Basis index
+                    basis_vec = self.Bbasis[j]  # Get basis vector for position k
+                    
+                    # Compute N(k) for current vector at position k
+                    Nk = [0.0] * self.m
+                    for i in range(self.m):
+                        for j_dim in range(self.m):
+                            # Basis modulation: I[i][j_dim] * current_vec[j_dim] * basis_vec[j_dim]
+                            Nk[i] += self.I[i][j_dim] * current_vec[j_dim] * basis_vec[j_dim]
+                    
+                    # Determine target based on mode
+                    if auto_mode == 'gap':
+                        target = current_vec  # Self-consistency
+                    else:  # 'reg' mode
+                        target = seq[k + 1]  # Next vector prediction
+                    
+                    # Compute loss and gradients
+                    for i in range(self.m):
+                        error = Nk[i] - target[i]
+                        total_loss += error * error
+                        
+                        # Compute gradients (2 * error from derivative of squared loss)
+                        grad_coeff = 2 * error / total_samples
+                        
+                        # Gradient for I[i][j_dim]
+                        for j_dim in range(self.m):
+                            grad_I[i][j_dim] += grad_coeff * current_vec[j_dim] * basis_vec[j_dim]
+            
+            # Update I matrix
+            for i in range(self.m):
+                for j in range(self.m):
+                    self.I[i][j] -= learning_rate * grad_I[i][j]
+            
+            # Record and print progress
+            avg_loss = total_loss / total_samples
+            history.append(avg_loss)
+            if it % print_every == 0 or it == max_iters - 1:
+                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
+                print(f"PartTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6e}, LR = {learning_rate}")
+            
+            # Check convergence
+            if prev_loss - avg_loss < tol:
+                print(f"Converged after {it+1} iterations")
+                break
+            prev_loss = avg_loss
+            
+            # Apply learning rate decay
+            learning_rate *= decay_rate
+        
+        # Compute and store mean vector for generation
+        total_vectors = 0
+        total_vec_sum = [0.0] * self.m
+        for seq in vec_seqs:
+            for vec in seq:
+                total_vectors += 1
+                for d in range(self.m):
+                    total_vec_sum[d] += vec[d]
+        
+        self.mean_vector = [v_sum / total_vectors for v_sum in total_vec_sum]
+        
+        return history
+
+    def part_generate(self, L, tau=0.0, mode='reg'):
+        """
+        Generates a sequence of vectors using the trained I matrix
+        
+        Parameters:
+            L (int): Length of sequence to generate
+            tau (float): Temperature for randomness (0 = deterministic)
+            mode (str): Generation mode - 'gap' or 'reg' (must match training)
+                
+        Returns:
+            list: Generated sequence of m-dimensional vectors
+        """
+        if not hasattr(self, 'I'):
+            raise RuntimeError("I matrix not initialized - train first")
+            
+        if tau < 0:
+            raise ValueError("Temperature must be non-negative")
+            
+        sequence = []
+        
+        if mode == 'gap':
+            # Gap mode: Generate independent reconstructions
+            for k in range(L):
+                j = k % self.L  # Basis index
+                basis_vec = self.Bbasis[j]  # Basis vector for position
+                
+                # Start with mean vector
+                current_vec = self.mean_vector[:]
+                
+                # Compute reconstruction at position k
+                reconstructed_vec = [0.0] * self.m
+                for i in range(self.m):
+                    for j_dim in range(self.m):
+                        reconstructed_vec[i] += self.I[i][j_dim] * current_vec[j_dim] * basis_vec[j_dim]
+                
+                # Add temperature-controlled noise
+                if tau > 0:
+                    reconstructed_vec = [reconstructed_vec[i] + random.gauss(0, tau) 
+                                        for i in range(self.m)]
+                    
+                sequence.append(reconstructed_vec)
+                
+        else:  # 'reg' mode
+            # Reg mode: Auto-regressive generation
+            current_vec = self.mean_vector[:]  # Start with mean vector
+            
+            for k in range(L):
+                j = k % self.L  # Basis index
+                basis_vec = self.Bbasis[j]  # Basis vector for position
+                
+                # Compute prediction for next vector
+                next_vec_pred = [0.0] * self.m
+                for i in range(self.m):
+                    for j_dim in range(self.m):
+                        next_vec_pred[i] += self.I[i][j_dim] * current_vec[j_dim] * basis_vec[j_dim]
+                
+                # Add temperature-controlled noise
+                if tau > 0:
+                    next_vec = [next_vec_pred[i] + random.gauss(0, tau) 
+                                for i in range(self.m)]
+                else:
+                    next_vec = next_vec_pred
+                    
+                sequence.append(next_vec)
+                current_vec = next_vec  # Use prediction as next input
+                
+        return sequence
+
+    def double_train(self, seqs, auto_mode='reg', part_mode='reg', 
+                    auto_params=None, part_params=None):
+        """
+        Two-stage training method: 
+          1. First train on character sequences using auto_train (unsupervised)
+          2. Then convert sequences to vector sequences using S(l) and train I matrix
+        
+        Parameters:
+            seqs (list): Input character sequences
+            auto_mode (str): Training mode for auto_train - 'gap' or 'reg'
+            part_mode (str): Training mode for part_train - 'gap' or 'reg'
+            auto_params (dict): Parameters for auto_train (max_iters, tol, learning_rate)
+            part_params (dict): Parameters for part_train (max_iters, tol, learning_rate)
+            
+        Returns:
+            tuple: (auto_history, part_history) training histories
+        """
+        # Set default parameters if not provided
+        auto_params = auto_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
+        part_params = part_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
+        
+        # Stage 1: Train character model with auto_train
+        print("="*50)
+        print("Stage 1: Auto-training on character sequences")
+        print("="*50)
+        auto_history = self.auto_train(
+            seqs, 
+            auto_mode=auto_mode,
+            max_iters=auto_params['max_iters'],
+            tol=auto_params['tol'],
+            learning_rate=auto_params['learning_rate']
+        )
+        
+        # Stage 2: Convert sequences to vector sequences using S(l)
+        print("\n" + "="*50)
+        print("Stage 2: Converting sequences to vector representations")
+        print("="*50)
+        vec_seqs = []
+        for i, seq in enumerate(seqs):
+            # Get cumulative S(l) vectors for the sequence
+            s_vectors = self.S(seq)
+            vec_seqs.append(s_vectors)
+            if i < 3:  # Show sample conversion for first 3 sequences
+                print(f"Sequence {i+1} (len={len(seq)}) -> {len(s_vectors)} vectors")
+                print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
+                print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
+        
+        # Train I matrix on vector sequences
+        print("\n" + "="*50)
+        print("Stage 3: Training I matrix on vector sequences")
+        print("="*50)
+        part_history = self.part_train(
+            vec_seqs,
+            max_iters=part_params['max_iters'],
+            tol=part_params['tol'],
+            learning_rate=part_params['learning_rate'],
+            auto_mode=part_mode
+        )
+        
+        return auto_history, part_history
+
+    def double_generate(self, L, tau=0.0):
+        """
+        Generate character sequences using a two-stage approach that combines:
+          1. Character-level model (auto-trained) for token probabilities
+          2. Vector-sequence model (part-trained) for structural coherence
+        
+        Steps:
+          a. Generate initial sequence with character model
+          b. Compute cumulative vectors S(l) for initial sequence
+          c. Use I-matrix to refine vector sequence
+          d. Select tokens that best match the refined vectors
+        
+        Parameters:
+            L (int): Length of sequence to generate
+            tau (float): Temperature for stochastic sampling (0=deterministic)
+        
+        Returns:
+            str: Generated character sequence
+        """
+        # Helper function to compute Nk for a token at position k
+        def compute_Nk(k, token):
+            j = k % self.L
+            scalar = sum(self.Bbasis[j][i] * self.x_map[token][i] for i in range(self.m))
+            return [self.Acoeff[i][j] * scalar for i in range(self.m)]
+        
+        # Stage 1: Generate initial sequence with character model
+        init_seq = self.generate(L, tau=tau)
+        
+        # Stage 2: Compute S(l) vectors for initial sequence
+        s_vectors = self.S(init_seq)
+        
+        # Stage 3: Refine vectors using I-matrix (part_generate in 'reg' mode)
+        refined_vectors = self.part_generate(len(s_vectors), mode='reg', tau=tau)
+        
+        # Stage 4: Reconstruct character sequence using both models
+        generated_tokens = []
+        current_s = [0.0] * self.m  # Initialize cumulative vector
+        
+        for k in range(L):
+            # Get target vector for current position
+            if k < len(refined_vectors):
+                target_vec = refined_vectors[k]
+            else:
+                # If beyond refined vectors, use character model prediction
+                target_vec = self.mean_t
+            
+            # Calculate required N(k) vector: ΔS = S(k) - S(k-1)
+            required_nk = [target_vec[i] - current_s[i] for i in range(self.m)]
+            
+            # Find best matching token
+            best_token = None
+            min_error = float('inf')
+            token_scores = []
+            
+            for token in self.tokens:
+                # Predict N(k) for this token at position k
+                predicted_nk = compute_Nk(k, token)
+                
+                # Calculate matching error
+                error = 0.0
+                for d in range(self.m):
+                    diff = predicted_nk[d] - required_nk[d]
+                    error += diff * diff
+                
+                token_scores.append((token, error))
+                
+                # Track best token
+                if error < min_error:
+                    min_error = error
+                    best_token = token
+            
+            # Select token (deterministic or stochastic)
+            if tau == 0:
+                chosen_token = best_token
+            else:
+                # Convert errors to probabilities
+                tokens, errors = zip(*token_scores)
+                weights = [math.exp(-err/tau) for err in errors]
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    probs = [w/total_weight for w in weights]
+                    chosen_token = random.choices(tokens, weights=probs, k=1)[0]
+                else:
+                    chosen_token = random.choice(tokens)
+            
+            # Update sequence and cumulative vector
+            generated_tokens.append(chosen_token)
+            actual_nk = compute_Nk(k, chosen_token)
+            current_s = [current_s[i] + actual_nk[i] for i in range(self.m)]
+        
+        return ''.join(generated_tokens)
 
     def save(self, filename):
         """
@@ -479,13 +1119,13 @@ if __name__ == "__main__":
 
     from statistics import correlation
     
-    #random.seed(11)
+    random.seed(55)
     charset = ['A','C','G','T']
-    dd = DualDescriptorAB(charset, rank=2, vec_dim=3, bas_dim=150, mode='linear', user_step=None)
+    dd = DualDescriptorAB(charset, rank=1, vec_dim=2, bas_dim=150, mode='linear', user_step=None)
 
     # generate 10 sequences of length 100–200 and random targets
     seqs, t_list = [], []
-    for _ in range(10):
+    for _ in range(30):
         L = random.randint(100, 200)
         seq = ''.join(random.choices(charset, k=L))
         seqs.append(seq)
@@ -515,22 +1155,7 @@ if __name__ == "__main__":
 
     feats = dd.dd_features(seqs[0])
     print("\nFeature vector length:", len(feats))
-    print("First 10 features:", feats[:10])
-
-    # Demonstrate prediction
-    print("\n=== Prediction Demo ===")
-    test_seq = "ACGTACGT"  # Sample test sequence
-    true_t = [0.42, -0.17, 0.89]  # Example true value
-    
-    # Make prediction
-    pred_t = dd.predict_t(test_seq)
-    print(f"Test Sequence: {test_seq}")
-    print(f"Predicted t: {[f'{x:.4f}' for x in pred_t]}")
-    print(f"True t: {true_t}")    
-
-    # Show prediction error
-    error = sum((p - t)**2 for p, t in zip(pred_t, true_t))
-    print(f"Prediction MSE: {error:.6f}")
+    print("First 10 features:", feats['all'][:10])
 
     # Reconstruct representative sequence
     repr_seq = dd.reconstruct()
@@ -541,4 +1166,230 @@ if __name__ == "__main__":
     seq_det = dd.generate(L=100, tau=0.0)
     print(f"Deterministic (tau=0): {seq_det[:50]}...")
 
+    # === Gradient Descent Training Example ===
+    print("\n" + "="*50)
+    print("Testing Gradient Descent Training")
+    print("="*50)
 
+    # Create new model instance
+    dd_grad = DualDescriptorAB(charset, rank=1, vec_dim=2, bas_dim=150, mode='linear', user_step=None)
+
+    # Train using gradient descent
+    print("\nStarting gradient descent training...")
+    grad_history = dd_grad.grad_train(
+        seqs, 
+        t_list,
+        learning_rate=1.0,
+        max_iters=200,
+        tol=1e-6,
+        print_every=5
+    )
+
+    # Evaluate predictions
+    pred_t_list_grad = [dd_grad.predict_t(seq) for seq in seqs]
+
+    # Calculate prediction correlations
+    corr_sum = 0.0
+    for i in range(dd_grad.m):
+        actu_t = [t_vec[i] for t_vec in t_list]
+        pred_t = [t_vec[i] for t_vec in pred_t_list_grad]
+        corr = correlation(actu_t, pred_t)
+        print(f"GD Prediction correlation dim-{i}: {corr:.4f}")
+        corr_sum += corr
+    corr_avg = corr_sum / dd_grad.m
+    print(f"GD Average correlation: {corr_avg:.4f}")
+
+    # Generate sequence using trained model
+    print("\nGenerated sequence with gradient-trained model:")
+    seq_grad = dd_grad.generate(L=50, tau=0.1)
+    print(seq_grad)
+
+    # === Auto-Training Example ===
+    # Set random seed for reproducible results
+    random.seed(42)
+    
+    # Define character set and model parameters
+    charset = ['A','C','G','T']
+    vec_dim = 3   # Vector dimension
+    bas_dim = 100 # Base matrix dimension
+
+    # Generate training sequences
+    print("\n=== Generating Training Sequences ===")
+    seqs = []
+    for _ in range(30):  # Generate 30 sequences
+        L = random.randint(100, 200)
+        seq = ''.join(random.choices(charset, k=L))
+        seqs.append(seq)
+        print(f"Generated sequence {_+1}: length={L}, first 10 chars: {seq[:10]}...")
+    
+    print("=== Creating Dual Descriptor Model ===")
+    dd_auto_gap = DualDescriptorAB(
+        charset, 
+        rank=1,           # Use 2-mers
+        vec_dim=vec_dim,
+        bas_dim=bas_dim,
+        mode='linear',    # Linear sliding window
+        user_step=None
+    )    
+    
+    # Run self-supervised training (Gap Filling mode)
+    print("\n=== Starting Gap Filling Training ===")
+    gap_history = dd_auto_gap.auto_train(
+        seqs,
+        auto_mode='gap',     # Gap filling mode
+        max_iters=300,       # Maximum iterations
+        learning_rate=0.001, # Learning rate
+        decay_rate=0.995,    # Learning rate decay
+        print_every=1       # Print progress every 20 iterations
+    )
+
+    print("=== Creating Dual Descriptor Model ===")
+    dd_auto_reg = DualDescriptorAB(
+        charset, 
+        rank=1,           # Use 2-mers
+        vec_dim=vec_dim,
+        bas_dim=bas_dim,
+        mode='linear',    # Linear sliding window
+        user_step=None
+    )
+    
+    # Run self-supervised training (Auto-Regressive mode)
+    print("\n=== Starting Auto-Regressive Training ===")
+    reg_history = dd_auto_reg.auto_train(
+        seqs,
+        auto_mode='reg',     # Auto-regressive mode
+        max_iters=300,       # Maximum iterations
+        learning_rate=0.001, # Learning rate
+        decay_rate=0.99,    # Learning rate decay
+        print_every=1,      # Print progress every 20 iterations
+        continued=True       # Continue training (don't reset parameters)
+    )
+    
+    # Generate new sequences
+    print("\n=== Generating New Sequences ===")
+    
+    # Temperature=0 (deterministic generation)
+    seq_det = dd_auto_gap.generate(L=40, tau=0.0)
+    print(f"Deterministic Generation (tau=0.0):\n{seq_det}")
+    
+    # Temperature=0.5 (moderate randomness)
+    seq_sto = dd_auto_reg.generate(L=40, tau=0.0)
+    print(f"\nStochastic Generation (tau=0.5):\n{seq_sto}")
+    
+    # 4. Save and load model
+    print("\n=== Model Persistence Test ===")
+    dd_auto_reg.save("auto_trained_model.pkl")
+    
+    # Load model
+    dd_loaded = DualDescriptorAB.load("auto_trained_model.pkl")
+    print("Model loaded successfully. Generating with loaded model:")
+    print(dd_loaded.generate(L=20, tau=0.0))
+    
+    print("\n=== Auto-Training Demo Completed ===")
+
+    print("\n" + "="*50)
+    print("Part Train/Generate Example")
+    print("="*50)
+    
+    # Create new model
+    dd_part = DualDescriptorAB(charset="", rank=1, vec_dim=2)
+    
+    # Generate sample vector sequences (2D vectors)
+    vec_seqs = []
+    for _ in range(5):  # 5 sequences
+        seq_len = random.randint(100, 150)
+        seq = []
+        for _ in range(seq_len):
+            # Generate random 2D vector
+            vec = [random.uniform(-1, 1), random.uniform(-1, 1)]
+            seq.append(vec)
+        vec_seqs.append(seq)
+    
+    # Train in self-consistency (gap) mode
+    print("\nTraining in 'gap' mode (self-consistency):")
+    gap_history = dd_part.part_train(vec_seqs, max_iters=100, 
+                                     learning_rate=0.1, auto_mode='gap')
+    
+    # Generate new vector sequence
+    print("\nGenerated vector sequence (gap mode):")
+    gen_seq = dd_part.part_generate(10, mode='gap', tau=0.0)
+    for i, vec in enumerate(gen_seq):
+        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
+    
+    # Train in auto-regressive (reg) mode
+    print("\nTraining in 'reg' mode (next-vector prediction):")
+    reg_history = dd_part.part_train(vec_seqs, max_iters=100, 
+                                     learning_rate=0.1, auto_mode='reg')
+    
+    # Generate new vector sequence with randomness
+    print("\nGenerated vector sequence with temperature (reg mode):")
+    gen_seq = dd_part.part_generate(10, mode='reg', tau=0.1)
+    for i, vec in enumerate(gen_seq):
+        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
+
+    print("\n" + "="*50)
+    print("Double Train/Generate Example")
+    print("="*50)
+    
+    # === Double Generation Example ===
+    print("\n" + "="*50)
+    print("Double Generation Example")
+    print("="*50)    
+
+    # Create and train model using double_train
+    dd_double = DualDescriptorAB(
+        charset=['A','C','G','T'], 
+        rank=1, 
+        vec_dim=2,
+        mode='nonlinear',
+        user_step=1
+    )
+
+    # Generate sample DNA sequences
+    dna_seqs = []
+    for _ in range(10):  # 10 sequences
+        seq_len = random.randint(100, 200)
+        dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
+    
+    # Configure training parameters
+    auto_config = {
+        'max_iters': 50,
+        'tol': 1e-6,
+        'learning_rate': 0.001
+    }
+    
+    part_config = {
+        'max_iters': 50,
+        'tol': 1e-20,
+        'learning_rate': 0.1
+    }
+
+    # Train with double_train (as in previous example)
+    auto_hist, part_hist = dd_double.double_train(
+        dna_seqs,  # Sample DNA sequences
+        auto_mode='reg',
+        part_mode='reg',
+        auto_params=auto_config,
+        part_params=part_config
+    )
+
+    # Generate sequences using different methods for comparison
+    print("\n1. Character-only generation:")
+    char_seq = dd_double.generate(100, tau=0.3)
+    print(char_seq)
+
+    print("\n2. Vector-only generation:")
+    vec_seq = dd_double.part_generate(10, mode='reg', tau=0.1)
+    for i, vec in enumerate(vec_seq):
+        print(f"Position {i}: [{vec[0]:.4f}, {vec[1]:.4f}]")
+
+    print("\n3. Double-generation (combined models):")
+    double_seq = dd_double.double_generate(100, tau=0.2)
+    print(double_seq)
+
+    # Extract features from different generation methods
+    char_features = dd_double.dd_features(char_seq)['all'][:5]
+    double_features = dd_double.dd_features(double_seq)['all'][:5]
+    print("\nFeature comparison (first 5 values):")
+    print(f"Char-only: {[round(f, 4) for f in char_features]}")
+    print(f"Double:    {[round(f, 4) for f in double_features]}")

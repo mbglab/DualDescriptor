@@ -1,5 +1,5 @@
 # Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# Simplified Dual Descriptor Vector class (Matrix form)
+# Simplified Dual Descriptor Vector class (P Matrix form)
 # Author: Bin-Guang Ma; Date: 2025-6-4
 
 import math
@@ -7,7 +7,7 @@ import random
 import itertools
 import pickle
 
-class DualDescriptorTS:
+class DualDescriptorPM:
     """
     Vector Dual Descriptor with:
       - matrix P ∈ R^{m×m} of basis coefficients
@@ -678,25 +678,12 @@ class DualDescriptorTS:
         return feats
 
     def show(self):
-        print("DualDescriptorTS status:")
+        print("DualDescriptorPM status:")
         print(f" m={self.m}, rank={self.rank}, mode={self.mode}")
         print(" Sample period[0][0] = ", self.periods[0][0])
         print(" Sample P[0][:] = ", self.P[0])
         tok0=self.tokens[0]
         print(" Sample M for token", tok0, self.M[tok0])
-
-    def compute_Nk_for_vector(self, k, vector):
-        """
-        Compute N(k) vector for a single position and input vector
-        (without token lookup)
-        """
-        Nk = [0.0] * self.m
-        for i in range(self.m):
-            for j in range(self.m):
-                period = self.periods[i][j]
-                phi = math.cos(2 * math.pi * k / period)
-                Nk[i] += self.I[i][j] * vector[j] * phi
-        return Nk
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
@@ -1066,7 +1053,7 @@ if __name__=="__main__":
     #random.seed(0)
     charset = ['A','C','G','T']
     # Create matrix descriptor for vector targets
-    dd = DualDescriptorTS(charset, rank=4, vec_dim=2, mode='nonlinear', user_step=4)
+    dd = DualDescriptorPM(charset, rank=4, vec_dim=2, mode='nonlinear', user_step=4)
 
     # Generate 10 sequences with random vector targets
     seqs, t_list = [], []
@@ -1118,13 +1105,13 @@ if __name__=="__main__":
     print(f"First 10 features: {[round(x, 4) for x in features[:10]]}")
 
     # Initialize model
-    dd_grad = DualDescriptorTS(charset, rank=4, vec_dim=2, mode='nonlinear', user_step=4)
+    dd_grad = DualDescriptorPM(charset, rank=4, vec_dim=2, mode='nonlinear', user_step=4)
     
     # Gradient Descent Training
     print("\n" + "="*50)
     print("Training with Gradient Descent")
     print("="*50)
-    grad_history = dd_grad.grad_train(seqs, t_list, max_iters=1000, tol=1e-6, learning_rate=0.5, continued=False)
+    grad_history = dd_grad.grad_train(seqs, t_list, max_iters=500, tol=1e-6, learning_rate=0.5, continued=False)
 
     # Evaluation
     pred_t_list = [dd_grad.predict_t(seq) for seq in seqs]
@@ -1148,8 +1135,8 @@ if __name__=="__main__":
     print("="*50)
     
     # Create new models
-    dd_gap = DualDescriptorTS(charset, rank=3, vec_dim=2, mode='nonlinear', user_step=2)
-    dd_reg = DualDescriptorTS(charset, rank=3, vec_dim=2, mode='nonlinear', user_step=2)
+    dd_gap = DualDescriptorPM(charset, rank=3, vec_dim=2, mode='nonlinear', user_step=2)
+    dd_reg = DualDescriptorPM(charset, rank=3, vec_dim=2, mode='nonlinear', user_step=2)
     
     # Generate sample sequences
     auto_seqs = []
@@ -1180,7 +1167,7 @@ if __name__=="__main__":
     dd.save("trained_model.pkl")
     
     # Load saved model
-    dd_loaded = DualDescriptorTS.load("trained_model.pkl")
+    dd_loaded = DualDescriptorPM.load("trained_model.pkl")
     
     # Verify predictions work
     t_pred = dd_loaded.predict_t(seqs[0])
@@ -1199,13 +1186,12 @@ if __name__=="__main__":
     gen_seq = dd_loaded.generate(L=100, tau=0.5)
     print(f"Generated sequence: {gen_seq}")
 
-
     print("\n" + "="*50)
     print("Part Train/Generate Example")
     print("="*50)
     
     # Create new model
-    dd_part = DualDescriptorTS(charset="", rank=3, vec_dim=2)
+    dd_part = DualDescriptorPM(charset="", rank=3, vec_dim=2)
     
     # Generate sample vector sequences (2D vectors)
     vec_seqs = []
@@ -1240,21 +1226,24 @@ if __name__=="__main__":
     for i, vec in enumerate(gen_seq):
         print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
 
+    # === Double Generation Example ===
     print("\n" + "="*50)
-    print("Double Train/Generate Example")
+    print("Double Generation Example")
     print("="*50)
-    
-    # Create new model
-    dd_double = DualDescriptorTS(charset=['A','C','G','T'], 
-                                     rank=3, 
-                                     vec_dim=2,
-                                     mode='nonlinear',
-                                     user_step=2)
-    
+
+    # Create and train model using double_train
+    dd_double = DualDescriptorPM(
+        charset=['A','C','G','T'], 
+        rank=3, 
+        vec_dim=2,
+        mode='nonlinear',
+        user_step=2
+    )
+
     # Generate sample DNA sequences
     dna_seqs = []
-    for _ in range(5):  # 5 sequences
-        seq_len = random.randint(100, 150)
+    for _ in range(10):  # 10 sequences
+        seq_len = random.randint(100, 200)
         dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
     
     # Configure training parameters
@@ -1266,58 +1255,17 @@ if __name__=="__main__":
     
     part_config = {
         'max_iters': 50,
-        'tol': 1e-5,
-        'learning_rate': 0.05
+        'tol': 1e-10,
+        'learning_rate': 0.1
     }
-    
-    # Perform double training
-    auto_hist, part_hist = dd_double.double_train(
-        dna_seqs,
-        auto_mode='reg',       # Auto-regressive character training
-        part_mode='reg',       # Auto-regressive vector training
-        auto_params=auto_config,
-        part_params=part_config
-    )
-    
-    # Generate new DNA sequence using character model
-    print("\nGenerated DNA sequence from character model:")
-    dna_seq = dd_double.generate(100, tau=0.2)
-    print(dna_seq)
-    
-    # Generate vector sequence using I matrix
-    print("\nGenerated vector sequence from I matrix:")
-    vec_seq = dd_double.part_generate(10, mode='reg', tau=0.0)
-    for i, vec in enumerate(vec_seq):
-        print(f"Vec {i+1}: [{vec[0]:.4f}, {vec[1]:.4f}]")
-    
-    # Show final model status
-    print("\nTrained model components:")
-    print("Sample P[0]:", [round(x, 4) for x in dd_double.P[0]])
-    print("Sample I[0]:", [round(x, 4) for x in dd_double.I[0]])
-    print("Token 'ACG' embedding:", 
-          [round(x, 4) for x in dd_double.M['ACG']])
-
-    # === Double Generation Example ===
-    print("\n" + "="*50)
-    print("Double Generation Example")
-    print("="*50)
-
-    # Create and train model using double_train
-    dd_double = DualDescriptorTS(
-        charset=['A','C','G','T'], 
-        rank=3, 
-        vec_dim=2,
-        mode='nonlinear',
-        user_step=2
-    )
 
     # Train with double_train (as in previous example)
     auto_hist, part_hist = dd_double.double_train(
         dna_seqs,  # Sample DNA sequences
         auto_mode='reg',
         part_mode='reg',
-        auto_params={'max_iters': 50, 'tol': 1e-6, 'learning_rate': 0.1},
-        part_params={'max_iters': 30, 'tol': 1e-6, 'learning_rate': 0.05}
+        auto_params=auto_config,
+        part_params=part_config
     )
 
     # Generate sequences using different methods for comparison
