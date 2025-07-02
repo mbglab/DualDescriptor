@@ -733,7 +733,7 @@ class DualDescriptorAB:
                     # Normalize by sequence length
                     frqs.append(s_frq / L if L > 0 else 0.0)
                     pdvs.append(s_pdv / L if L > 0 else 0.0)        
-        # Remove last element (legacy compatibility)
+        # Remove last element because of dependency
         feats['frq'] = frqs[:-1]
         feats['pdv'] = pdvs[:-1]
         # 5. Concatenate all features
@@ -741,13 +741,83 @@ class DualDescriptorAB:
         return feats
 
     # ---- show state ----
-    def show(self):
-        print("DualDescriptorAB status:")
-        print(f" L={self.L}, m={self.m}, rank={self.rank}, mode={self.mode}")
-        print(" Sample Acoeff[0][:5]:", self.Acoeff[0][:5])
-        print(" Sample Bbasis[0][:5]:", self.Bbasis[0][:5])
-        tok0 = self.tokens[0]
-        print(" Sample x_map first token:", tok0, self.x_map[tok0][:5])
+    def show(self, what=None, first_num=5):
+        """
+        Display detailed information about the DualDescriptorAB model.
+        
+        Args:
+            what (str): Specific attribute to display. Options include:                
+                - None or 'config': Model configuration parameters
+                - 'Acoeff': Coefficient matrix (partial view)
+                - 'Bbasis': Basis matrix (partial view)
+                - 'x_map': Token embeddings (partial view)
+                - 'I': Interaction matrix (if exists)
+                - 'mean_t': Mean target vector
+                - 'mean_L': Mean sequence length
+                - 'tokens': Token vocabulary (partial view)
+                - 'all': Display all available attributes
+            first_num (int): Number of initial elements to display for large attributes
+        """        
+        # Default attribute views
+        if what is None or what == 'config' or what == 'all':
+            print("\n=== DualDescriptorAB Model Configuration ===")
+            print(f" Vector dimension (m): {self.m}")
+            print(f" Basis dimension (L): {self.L}")
+            print(f" K-mer rank: {self.rank}")
+            print(f" Rank mode: {self.rank_mode}")
+            print(f" Description mode: {self.mode}")
+            print(f" User step size: {self.step}")
+            print(f" Trained status: {self.trained}")
+        
+        if what == 'Acoeff' or what == 'all':
+            print("\n=== Coefficient Matrix (Acoeff) ===")
+            print(f" Shape: {len(self.Acoeff)}x{len(self.Acoeff[0])}")
+            print(" First few elements:")
+            for i in range(min(first_num, len(self.Acoeff))):
+                print(f" Row {i}: {self.Acoeff[i][:min(first_num, len(self.Acoeff[i]))]}")
+        
+        if what == 'Bbasis' or what == 'all':
+            print("\n=== Basis Matrix (Bbasis) ===")
+            print(f" Shape: {len(self.Bbasis)}x{len(self.Bbasis[0])}")
+            print(" First few elements:")
+            for i in range(min(first_num, len(self.Bbasis))):
+                print(f" Row {i}: {[round(x, 4) for x in self.Bbasis[i][:min(first_num, len(self.Bbasis[i]))]]}")
+        
+        if what == 'x_map' or what == 'all':
+            print("\n=== Token Embeddings (x_map) ===")
+            print(f" Vocabulary size: {len(self.tokens)}")
+            print(" First few tokens and embeddings:")
+            for i, tok in enumerate(list(self.tokens)[:first_num]):
+                vec_preview = self.x_map[tok][:min(first_num, self.m)]
+                print(f" '{tok}': {[round(x, 4) for x in vec_preview]}")
+        
+        if (what == 'I' or what == 'all') and hasattr(self, 'I'):
+            print("\n=== Interaction Matrix (I) ===")
+            print(f" Shape: {len(self.I)}x{len(self.I[0])}")
+            print(" First few elements:")
+            for i in range(min(first_num, len(self.I))):
+                print(f" Row {i}: {[round(x, 4) for x in self.I[i][:min(first_num, len(self.I[i]))]]}")
+        
+        if (what == 'mean_t' or what == 'all') and hasattr(self, 'mean_t'):
+            print("\n=== Mean Target Vector ===")
+            preview = self.mean_t[:min(first_num, len(self.mean_t))]
+            print(f" Values: {[round(x, 4) for x in preview]}")
+            print(f" Full length: {len(self.mean_t)}")
+        
+        if (what == 'mean_L' or what == 'all') and hasattr(self, 'mean_L'):
+            print("\n=== Mean Sequence Length ===")
+            print(f" Mean tokens per sequence: {round(self.mean_L, 2)}")
+        
+        if what == 'tokens' or what == 'all':
+            print("\n=== Token Vocabulary ===")
+            print(f" Total tokens: {len(self.tokens)}")
+            print(f" First {first_num} tokens: {self.tokens[:first_num]}")
+        
+        # Handle invalid attribute requests
+        if what not in [None, 'config', 'Acoeff', 'Bbasis', 'x_map', 'I', 
+                       'mean_t', 'mean_L', 'tokens', 'all']:
+            print(f"Invalid display option: '{what}'. Valid options are:")
+            print("'config', 'Acoeff', 'Bbasis', 'x_map', 'I', 'mean_t', 'mean_L', 'tokens', 'all'")
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                    continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
@@ -971,9 +1041,9 @@ class DualDescriptorAB:
             learning_rate=auto_params['learning_rate']
         )
         
-        # Stage 2: Convert sequences to vector sequences using S(l)
+        # Convert sequences to vector sequences using S(l)
         print("\n" + "="*50)
-        print("Stage 2: Converting sequences to vector representations")
+        print("Converting sequences to vector representations")
         print("="*50)
         vec_seqs = []
         for i, seq in enumerate(seqs):
@@ -985,9 +1055,9 @@ class DualDescriptorAB:
                 print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
                 print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
         
-        # Train I matrix on vector sequences
+        # Stage 2: Train I matrix on vector sequences
         print("\n" + "="*50)
-        print("Stage 3: Training I matrix on vector sequences")
+        print("Stage 2: Training I matrix on vector sequences")
         print("="*50)
         part_history = self.part_train(
             vec_seqs,
@@ -999,7 +1069,7 @@ class DualDescriptorAB:
         
         return auto_history, part_history
 
-    def double_generate(self, L, tau=0.0):
+    def double_generate(self, L, tau=0.0, mode='reg'):
         """
         Generate character sequences using a two-stage approach that combines:
           1. Character-level model (auto-trained) for token probabilities
@@ -1030,8 +1100,8 @@ class DualDescriptorAB:
         # Stage 2: Compute S(l) vectors for initial sequence
         s_vectors = self.S(init_seq)
         
-        # Stage 3: Refine vectors using I-matrix (part_generate in 'reg' mode)
-        refined_vectors = self.part_generate(len(s_vectors), mode='reg', tau=tau)
+        # Stage 3: Refine vectors using I-matrix with specified mode
+        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
         
         # Stage 4: Reconstruct character sequence using both models
         generated_tokens = []

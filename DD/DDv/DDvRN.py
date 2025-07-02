@@ -282,13 +282,24 @@ class DualDescriptorRN:
         Matches the computation method used in describe().
         
         For each token at position k:
-          idx = k % L  (basis index)
-          scalar = dot(Bbasis[idx], x)  (projection)
-          Nk = scalar * Acoeff[:, idx]  (m-dimensional vector)
+            idx = k % L  (basis index)
+            scalar = dot(Bbasis[idx], x)  (projection)
+            Nk = scalar * Acoeff[:, idx]  (m-dimensional vector)
         
-        Solve linear system: Mx = b for each token using correct formulation:
-          M = Σ [ (A_col ⊗ basis_vec)^T (A_col ⊗ basis_vec) ]
-          b = Σ [ <A_col, t> * basis_vec ]
+        Solve linear system: Mx = b for each token using:
+            M = Σ [ ||A_col||² * (basis_vec ⊗ basis_vec) ]
+            b = Σ [ <A_col, t> * basis_vec ]
+        
+        Where for each token occurrence:
+            - A_col = Acoeff[:, idx] (column vector)
+            - basis_vec = Bbasis[idx] (row vector)
+            - ||A_col||² = squared norm of A_col
+            - basis_vec ⊗ basis_vec = outer product of basis_vec with itself
+            - <A_col, t> = dot product of A_col and target vector t
+
+        Args:
+            seqs: List of training sequences
+            t_list: List of target vectors corresponding to sequences
         """
         m, L = self.m, self.L
         # Precompute token occurrence data: {token: [(idx, target)]}
@@ -746,20 +757,26 @@ class DualDescriptorRN:
     def generate(self, L, tau=0.0):
         """
         Generates a sequence of length L using temperature-controlled sampling.
+        Requires prior training (uses mean_t)
         
         Args:
             L: Desired sequence length
             tau: Temperature parameter (0=deterministic, >0=stochastic)
             
         Process:
-        1. Calculates required token count based on rank
-        2. For each position k:
-            a. Computes Nk for all tokens
-            b. Converts deviation to selection score
-            c. Samples token (deterministic if tau=0)
-        3. Truncates to exact length L
+        1. Calculates number of tokens needed: num_blocks = ceil(L / rank)
+        2. For each token position k (0 ≤ k < num_blocks):
+            a. j = k % L (basis index)
+            b. For each token:
+                i. Compute Nk = (Bbasis[j] • M[tok]) * Acoeff[:, j]
+                ii. Calculate deviation score = -MSE(Nk, mean_t)
+            c. Select token:
+                - Deterministic (tau=0): token with highest score
+                - Stochastic (tau>0): sample using softmax(scores/tau)
+        3. Concatenates tokens and truncates to exact length L
         
-        Requires prior training (uses mean_t)
+        Returns:
+        str: Generated character sequence of length L
         """
         assert self.trained, "Model must be trained first"
         if tau < 0:
@@ -874,13 +891,121 @@ class DualDescriptorRN:
         return feats
 
     # ---- show state ----
-    def show(self):
-        print("DualDescriptorRN status:")
-        print(f" L={self.L}, m={self.m}, rank={self.rank}, mode={self.mode}")
-        print(" Sample Acoeff[0][:5]:", self.Acoeff[0][:5])
-        print(" Sample Bbasis[0][:5]:", self.Bbasis[0][:5])
-        tok0 = self.tokens[0]
-        print(" Sample M first token:", tok0, self.M[tok0][:5])
+    def show(self, what=None, first_num=5):
+        """
+        Display comprehensive information about the DualDescriptorRN model.
+        
+        Args:
+            what (str or list): Specifies which components to display. Can be:
+                - None: Shows all available components
+                - String: Single component name ('params', 'Acoeff', 'Bbasis', 'M', 
+                          'tokens', 'stats', 'all')
+                - List: Multiple component names
+            first_num (int): Maximum number of items to display for long attributes
+                             (matrix rows, token embeddings, etc.)
+        
+        Display Groups:
+            'params': Core configuration parameters (L, m, rank, mode, etc.)
+            'Acoeff': Coefficient matrix (partial view)
+            'Bbasis': Basis matrix (partial view)
+            'M': Token embeddings (partial view)
+            'tokens': Token vocabulary (partial)
+            'stats': Training statistics (mean_L, mean_t)
+            'all': All available components
+        """
+        # Default display groups if none specified
+        if what is None:
+            what = ['params', 'stats']
+        elif isinstance(what, str):
+            what = [what]
+        
+        # Handle 'all' keyword
+        if 'all' in what:
+            what = ['params', 'Acoeff', 'Bbasis', 'M', 'tokens', 'stats']
+        
+        print("DualDescriptorRN Model Status:")
+        print("-" * 50)
+        
+        # 1. Display core parameters
+        if 'params' in what:
+            print("[Configuration Parameters]")
+            print(f"  L (basis dim)    : {self.L}")
+            print(f"  m (vector dim)   : {self.m}")
+            print(f"  rank (token len) : {self.rank}")
+            print(f"  rank_mode        : {self.rank_mode}")
+            print(f"  mode (tokenize)  : {self.mode}")
+            print(f"  user_step        : {self.step}")
+            print(f"  trained          : {self.trained}")
+            print("-" * 50)
+        
+        # 2. Display coefficient matrix Acoeff
+        if 'Acoeff' in what and hasattr(self, 'Acoeff'):
+            print("[Coefficient Matrix Acoeff (partial)]")
+            print(f"  Shape: {len(self.Acoeff)}x{len(self.Acoeff[0])}")
+            
+            # Calculate display limits
+            rows = min(first_num, len(self.Acoeff))
+            cols = min(first_num, len(self.Acoeff[0]))
+            
+            for i in range(rows):
+                row_preview = [f"{self.Acoeff[i][j]:.4f}" for j in range(cols)]
+                print(f"  Row {i}: {row_preview}" + 
+                      ("..." if len(self.Acoeff[0]) > cols else ""))
+            print("-" * 50)
+        
+        # 3. Display basis matrix Bbasis
+        if 'Bbasis' in what and hasattr(self, 'Bbasis'):
+            print("[Basis Matrix Bbasis (partial)]")
+            print(f"  Shape: {len(self.Bbasis)}x{len(self.Bbasis[0])}")
+            
+            # Calculate display limits
+            rows = min(first_num, len(self.Bbasis))
+            cols = min(first_num, len(self.Bbasis[0]))
+            
+            for i in range(rows):
+                row_preview = [f"{self.Bbasis[i][j]:.4f}" for j in range(cols)]
+                print(f"  Row {i}: {row_preview}" + 
+                      ("..." if len(self.Bbasis[0]) > cols else ""))
+            print("-" * 50)
+        
+        # 4. Display token embeddings
+        if 'M' in what and hasattr(self, 'M'):
+            print("[Token Embeddings (partial)]")
+            print(f"  Vocabulary size: {len(self.M)}")
+            
+            tokens = sorted(self.M.keys())
+            display_tokens = tokens[:min(first_num, len(tokens))]
+            
+            for i, tok in enumerate(display_tokens):
+                vec = self.M[tok]
+                # Limit vector display length
+                vec_preview = [f"{x:.4f}" for x in vec[:min(first_num, len(vec))]]
+                print(f"  '{tok}': {vec_preview}" + 
+                      ("..." if len(vec) > first_num else ""))
+            print("-" * 50)
+        
+        # 5. Display token vocabulary
+        if 'tokens' in what and hasattr(self, 'tokens'):
+            print("[Token Vocabulary (partial)]")
+            print(f"  Total tokens: {len(self.tokens)}")
+            
+            tokens = sorted(self.tokens)
+            display_tokens = tokens[:min(first_num, len(tokens))]
+            
+            for i, tok in enumerate(display_tokens):
+                print(f"  {i+1}. {tok}")
+            print("-" * 50)
+        
+        # 6. Display training statistics
+        if 'stats' in what and self.trained:
+            print("[Training Statistics]")
+            print(f"  mean_L (avg seq len): {self.mean_L}")
+            
+            if hasattr(self, 'mean_t'):
+                vec_preview = [f"{x:.4f}" for x in self.mean_t[:min(first_num, len(self.mean_t))]]
+                print(f"  mean_t (avg target): {vec_preview}" + 
+                      ("..." if len(self.mean_t) > first_num else ""))
+            print("-" * 50)
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01,
                continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
@@ -1161,7 +1286,7 @@ class DualDescriptorRN:
         
         return auto_history, part_history
 
-    def double_generate(self, L, tau=0.0):
+    def double_generate(self, L, tau=0.0, mode='reg'):
         """
         Generate character sequences using a two-stage approach that combines:
           1. Character-level model (auto-trained) for token probabilities
@@ -1192,8 +1317,8 @@ class DualDescriptorRN:
         # Stage 2: Compute S(l) vectors for initial sequence
         s_vectors = self.S(init_seq)
         
-        # Stage 3: Refine vectors using I-matrix (part_generate in 'reg' mode)
-        refined_vectors = self.part_generate(len(s_vectors), mode='reg', tau=tau)
+        # Stage 3: Refine vectors using I-matrix with specified mode
+        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
         
         # Stage 4: Reconstruct character sequence using both models
         generated_tokens = []

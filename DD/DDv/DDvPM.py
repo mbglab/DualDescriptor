@@ -677,13 +677,80 @@ class DualDescriptorPM:
         feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
         return feats
 
-    def show(self):
-        print("DualDescriptorPM status:")
-        print(f" m={self.m}, rank={self.rank}, mode={self.mode}")
-        print(" Sample period[0][0] = ", self.periods[0][0])
-        print(" Sample P[0][:] = ", self.P[0])
-        tok0=self.tokens[0]
-        print(" Sample M for token", tok0, self.M[tok0])
+    def show(self, what='status', first_num=5):
+        """
+        Display detailed information about the model state, controlled by the 'what' parameter.
+        
+        Parameters:
+            what (str): Specifies which part of the model to display. Options:
+                'status' : Basic configuration (default)
+                'tokens' : Token vocabulary
+                'M'      : Character embedding matrix
+                'P'      : Basis coefficient matrix
+                'periods': Positional period matrix
+                'stats'  : Training statistics
+                'all'    : All available information
+            first_num (int): Number of initial items to display for long lists (default: 5)
+        """
+        # Always display basic status information
+        print("="*50)
+        print("DualDescriptorPM Model Status")
+        print("="*50)
+        print(f"• m (vec_dim)    : {self.m}")
+        print(f"• rank (kmer_len): {self.rank}")
+        print(f"• mode           : {self.mode}")
+        print(f"• rank_mode      : {self.rank_mode}")
+        print(f"• step           : {self.step}")
+        print(f"• trained        : {self.trained}")
+        print(f"• charset        : {self.charset}")
+        print(f"• # tokens       : {len(self.tokens)}")
+        
+        # Display token vocabulary
+        if what in ('tokens', 'all'):
+            print("\n" + "-"*20 + " Token Vocabulary " + "-"*20)
+            print(f"Showing first {min(first_num, len(self.tokens))} of {len(self.tokens)} tokens:")
+            for i, tok in enumerate(self.tokens[:first_num]):
+                print(f"  {i+1:2d}. '{tok}'")
+        
+        # Display character embeddings
+        if what in ('M', 'all'):
+            print("\n" + "-"*20 + " Character Embeddings (M) " + "-"*20)
+            print(f"Showing first {min(first_num, len(self.tokens))} of {len(self.tokens)} embeddings:")
+            for i, tok in enumerate(self.tokens[:first_num]):
+                emb = [f"{x:.6f}" for x in self.M[tok]]
+                print(f"  '{tok}': [{', '.join(emb)}]")
+        
+        # Display basis coefficient matrix
+        if what in ('P', 'all'):
+            print("\n" + "-"*20 + " Basis Coefficient Matrix (P) " + "-"*20)
+            print(f"Matrix dimension: {self.m}×{self.m}")
+            print(f"First {min(first_num, self.m)} rows:")
+            for i, row in enumerate(self.P[:first_num]):
+                vals = [f"{x:.6f}" for x in row[:first_num]]
+                print(f"  Row {i}: [{', '.join(vals)}" + 
+                      (", ...]" if len(row) > first_num else "]"))
+        
+        # Display period matrix
+        if what in ('periods', 'all'):
+            print("\n" + "-"*20 + " Period Matrix " + "-"*20)
+            print(f"Matrix dimension: {self.m}×{self.m}")
+            print("First 5×5 elements:")
+            for i, row in enumerate(self.periods[:5]):
+                print(f"  Row {i}: {row[:5]}" + 
+                      (", ..." if len(row) > 5 else ""))
+        
+        # Display training statistics
+        if what in ('stats', 'all') and self.trained:
+            print("\n" + "-"*20 + " Training Statistics " + "-"*20)
+            print(f"• Avg tokens/seq : {self.mean_token_count:.2f}")
+            print("• Mean target (t): [" + 
+                  ", ".join(f"{x:.6f}" for x in self.mean_t) + "]")
+        
+        # Footer for complete display
+        if what == 'all':
+            print("\n" + "="*50)
+            print(f"Displayed first {first_num} items for long lists")
+            print("Use show('specific_property') for focused view")
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
@@ -908,9 +975,9 @@ class DualDescriptorPM:
             learning_rate=auto_params['learning_rate']
         )
         
-        # Stage 2: Convert sequences to vector sequences using S(l)
+        # Convert sequences to vector sequences using S(l)
         print("\n" + "="*50)
-        print("Stage 2: Converting sequences to vector representations")
+        print("Converting sequences to vector representations")
         print("="*50)
         vec_seqs = []
         for i, seq in enumerate(seqs):
@@ -922,9 +989,9 @@ class DualDescriptorPM:
                 print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
                 print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
         
-        # Train I matrix on vector sequences
+        # Stage 2: Train I matrix on vector sequences
         print("\n" + "="*50)
-        print("Stage 3: Training I matrix on vector sequences")
+        print("Stage 2: Training I matrix on vector sequences")
         print("="*50)
         part_history = self.part_train(
             vec_seqs,
@@ -936,7 +1003,7 @@ class DualDescriptorPM:
         
         return auto_history, part_history
 
-    def double_generate(self, L, tau=0.0):
+    def double_generate(self, L, tau=0.0, mode='reg'):
         """
         Generate character sequences using a two-stage approach that combines:
           1. Character-level model (auto-trained) for token probabilities
@@ -961,8 +1028,8 @@ class DualDescriptorPM:
         # Stage 2: Compute S(l) vectors for initial sequence
         s_vectors = self.S(init_seq)
         
-        # Stage 3: Refine vectors using I-matrix (part_generate in 'reg' mode)
-        refined_vectors = self.part_generate(len(s_vectors), mode='reg', tau=tau)
+        # Stage 3: Refine vectors using I-matrix with specified mode
+        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
         
         # Stage 4: Reconstruct character sequence using both models
         generated_tokens = []
@@ -1053,7 +1120,7 @@ if __name__=="__main__":
     #random.seed(0)
     charset = ['A','C','G','T']
     # Create matrix descriptor for vector targets
-    dd = DualDescriptorPM(charset, rank=4, vec_dim=2, mode='nonlinear', user_step=4)
+    dd = DualDescriptorPM(charset, rank=3, vec_dim=10, mode='nonlinear', user_step=2)
 
     # Generate 10 sequences with random vector targets
     seqs, t_list = [], []

@@ -703,13 +703,97 @@ class DualDescriptorTS:
         feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
         return feats
 
-    def show(self):
-        print("DualDescriptorTS status:")
-        print(f" m={self.m}, o={self.o}, rank={self.rank}, mode={self.mode}")
-        print(" Sample period[0][0] = ", self.periods[0][0])
-        print(" Sample P[0][0][:] = ", self.P[0][0])
-        tok0=self.tokens[0]
-        print(" Sample x_map for token", tok0, self.x_map[tok0])
+    def show(self, what=None, first_num=5):
+        """
+        Display model status with flexible output control.
+        
+        Args:
+            what (str|list): Attribute(s) to display. Options include:
+                - 'config': Basic configuration
+                - 'tokens': Vocabulary tokens
+                - 'x_map': Character embeddings
+                - 'P': Weight tensor
+                - 'periods': Basis function periods
+                - 'all': Show all available attributes
+                Default shows basic configuration and samples.
+            first_num (int): Number of items to show for long attributes
+        """
+        # Default attributes to show if not specified
+        default_attrs = ['config', 'tokens', 'x_map', 'P', 'periods']
+        
+        # Handle different what parameter types
+        if what is None:
+            attrs = default_attrs
+        elif what == 'all':
+            attrs = ['config', 'tokens', 'x_map', 'P', 'periods']
+        elif isinstance(what, str):
+            attrs = [what]
+        else:
+            attrs = what
+            
+        print("DualDescriptorTS Status")
+        print("=" * 50)
+        
+        # Display each requested attribute
+        for attr in attrs:
+            if attr == 'config':
+                # Display basic configuration
+                print("\n[Configuration]")
+                print(f"{'Charset:':<15} {self.charset}")
+                print(f"{'Rank:':<15} {self.rank} ({self.rank_mode} mode)")
+                print(f"{'Vector dim:':<15} {self.m}")
+                print(f"{'Basis count:':<15} {self.o}")
+                print(f"{'Token mode:':<15} {self.mode}")
+                print(f"{'Trained:':<15} {self.trained}")
+                if self.mode == 'nonlinear':
+                    print(f"{'Step size:':<15} {self.step or self.rank}")
+            
+            elif attr == 'tokens':
+                # Display vocabulary tokens
+                print("\n[Tokens]")
+                print(f"Total: {len(self.tokens)}")
+                if len(self.tokens) > first_num:
+                    print(f"First {first_num}: {self.tokens[:first_num]}")
+                    print(f"Last {first_num}: {self.tokens[-first_num:]}")
+                else:
+                    print(f"All: {self.tokens}")
+            
+            elif attr == 'x_map':
+                # Display character embeddings
+                print("\n[Character Embeddings (x_map)]")
+                print(f"Showing first {first_num} tokens:")
+                for i, tok in enumerate(self.tokens[:first_num]):
+                    print(f"  {tok:<5}: [{', '.join(f'{x:.4f}' for x in self.x_map[tok][:first_num])}" + 
+                          (f", ...]" if len(self.x_map[tok]) > first_num else "]"))
+            
+            elif attr == 'P':
+                # Display weight tensor
+                print("\n[Weight Tensor (P)]")
+                print(f"Shape: {len(self.P)}x{len(self.P[0])}x{len(self.P[0][0])}")
+                print("Sample slices:")
+                # Show first few elements from each dimension
+                for i in range(min(first_num, len(self.P))):
+                    for j in range(min(first_num, len(self.P[i]))):
+                        vals = self.P[i][j][:min(first_num, len(self.P[i][j]))]
+                        print(f"  P[{i}][{j}][:]: [{', '.join(f'{v:.6f}' for v in vals)}" + 
+                              (f", ...]" if len(self.P[i][j]) > first_num else "]"))
+            
+            elif attr == 'periods':
+                # Display basis function periods
+                print("\n[Basis Periods]")
+                print(f"Shape: {len(self.periods)}x{len(self.periods[0])}x{len(self.periods[0][0])}")
+                print("Sample values:")
+                # Show first few periods
+                for i in range(min(first_num, len(self.periods))):
+                    for j in range(min(first_num, len(self.periods[i]))):
+                        vals = self.periods[i][j][:min(first_num, len(self.periods[i][j]))]
+                        print(f"  periods[{i}][{j}][:]: {vals}" + 
+                              (f", ..." if len(self.periods[i][j]) > first_num else ""))
+            
+            else:
+                print(f"\n[Unknown attribute: {attr}]")
+        
+        print("=" * 50)
 
     def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
@@ -940,9 +1024,9 @@ class DualDescriptorTS:
             learning_rate=auto_params['learning_rate']
         )
         
-        # Stage 2: Convert sequences to vector sequences using S(l)
+        # Convert sequences to vector sequences using S(l)
         print("\n" + "="*50)
-        print("Stage 2: Converting sequences to vector representations")
+        print("Converting sequences to vector representations")
         print("="*50)
         vec_seqs = []
         for i, seq in enumerate(seqs):
@@ -954,9 +1038,9 @@ class DualDescriptorTS:
                 print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
                 print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
         
-        # Train I tensor on vector sequences
+        # Stage 2: Train I tensor on vector sequences
         print("\n" + "="*50)
-        print("Stage 3: Training I tensor on vector sequences")
+        print("Stage 2: Training I tensor on vector sequences")
         print("="*50)
         part_history = self.part_train(
             vec_seqs,
@@ -968,21 +1052,16 @@ class DualDescriptorTS:
         
         return auto_history, part_history
 
-    def double_generate(self, L, tau=0.0):
+    def double_generate(self, L, tau=0.0, mode='reg'):
         """
         Generate character sequences using a two-stage approach that combines:
           1. Character-level model (auto-trained) for token probabilities
           2. Vector-sequence model (part-trained) for structural coherence
         
-        Steps:
-          a. Generate initial sequence with character model
-          b. Compute cumulative vectors S(l) for initial sequence
-          c. Use I-tensor to refine vector sequence
-          d. Select tokens that best match the refined vectors
-        
         Parameters:
             L (int): Length of sequence to generate
             tau (float): Temperature for stochastic sampling (0=deterministic)
+            mode (str): Generation mode for vector refinement - 'gap' or 'reg' (default: 'reg')
         
         Returns:
             str: Generated character sequence
@@ -993,8 +1072,8 @@ class DualDescriptorTS:
         # Stage 2: Compute S(l) vectors for initial sequence
         s_vectors = self.S(init_seq)
         
-        # Stage 3: Refine vectors using I-tensor (part_generate in 'reg' mode)
-        refined_vectors = self.part_generate(len(s_vectors), mode='reg', tau=tau)
+        # Stage 3: Refine vectors using I-tensor with specified mode
+        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
         
         # Stage 4: Reconstruct character sequence using both models
         generated_tokens = []
