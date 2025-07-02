@@ -27,7 +27,8 @@ class DualDescriptorScalar:
     """
     Scalar Dual Descriptor with rank (r-per/k-mer) extension.
     - charset: list of base characters.
-    - rank: the r-per/k-mer length (r-per means permutations of length r).    
+    - rank: the r-per/k-mer length (r-per means permutations of length r).
+    - rank mode: 'pad' (with '_') or 'drop' (incomplete fragments).        
     - num_basis: number of default basis functions for PWF.
     - user_bases: the basis functions for PWF given by user,
       a list of callables like b(k) where k is integer for position index. 
@@ -38,7 +39,7 @@ class DualDescriptorScalar:
     def __init__(self, charset, num_basis=5, user_bases=None, rank=1, rank_mode='drop', mode='linear', user_step=None):
         self.charset = list(charset)
         self.rank = rank
-        self.rank_mode = rank_mode
+        self.rank_mode = rank_mode # 'pad' or 'drop'
         self.o = num_basis        
         assert mode in ('linear','nonlinear')
         self.mode = mode
@@ -566,19 +567,125 @@ class DualDescriptorScalar:
         full_seq = ''.join(generated_sequence)
         return full_seq[:L]
 
-    def show(self):
+    def show(self, what='config', first_num=5):
         """
-        Display current DualDescriptor status:
-        rank, mode, number of tokens, PWC and sample CWF.
+        Display current DualDescriptor status with customizable output.
+        
+        Args:
+            what (str): Controls what information to display. Can be:
+                - 'all': Show all available information
+                - 'config': Model configuration (rank, mode, etc.)
+                - 'tokens': List of tokens
+                - 'x': Composition Weight Map (CWF)
+                - 'a': Position Weight Coefficients (PWC)
+                - 'basis': Basis function details
+                - 'stats': Training statistics
+                - Any valid attribute name (e.g., 'rank', 'mode')
+            first_num (int): For long outputs, show only first N items (default: 5)
         """
-        print("DualDescriptorcalar Status:")
-        print(f"  rank = {self.rank}, mode = {self.mode}, bases = {self.o}")
-        print(f"  # tokens = {len(self.tokens)}")
-        print("  PWC a coefficients:")
-        print("   ", self.a)
-        print("  Sample CWM (first 5 tokens):")
-        for tok in sorted(self.tokens)[:5]:
-            print(f"    {tok}: {self.x[tok]:.4f}")       
+        # Helper function to limit long outputs
+        def limit_items(items, name, max_items=first_num):
+            if not items:
+                print(f"  No {name} available")
+                return
+                
+            if len(items) > max_items:
+                print(f"  First {max_items} of {len(items)} {name}:")
+                for i, item in enumerate(items[:max_items]):
+                    print(f"    {i+1}: {item}")
+                print(f"    ... {len(items) - max_items} more items not shown")
+            else:
+                print(f"  {name.capitalize()}:")
+                for i, item in enumerate(items):
+                    print(f"    {i+1}: {item}")
+        
+        # Show specific attribute if requested
+        if what not in ('all', 'config', 'tokens', 'x', 'a', 'basis', 'stats'):
+            if hasattr(self, what):
+                value = getattr(self, what)
+                print(f"{what}: {value}")
+            else:
+                print(f"Attribute '{what}' not found in DualDescriptorScalar")
+            return
+        
+        # Show all sections if requested
+        if what == 'all':
+            sections = ['config', 'tokens', 'x', 'a', 'basis', 'stats']
+            for section in sections:
+                print(f"\n=== {section.upper()} SECTION ===")
+                self.show(section, first_num)
+            return
+            
+        # CONFIGURATION SECTION
+        if what == 'config':
+            print("DualDescriptorScalar Configuration:")
+            print(f"  Character set: {self.charset}")
+            print(f"  Rank: {self.rank}")
+            print(f"  Rank mode: {self.rank_mode}")
+            print(f"  Mode: {self.mode}")
+            print(f"  Step size: {self.step}")
+            print(f"  Basis count: {self.o}")
+            print(f"  Trained: {self.trained}")
+            return
+            
+        # TOKENS SECTION
+        if what == 'tokens':
+            print(f"Token List (rank={self.rank}, mode={self.rank_mode}):")
+            print(f"  Total tokens: {len(self.tokens)}")
+            sorted_tokens = sorted(self.tokens)
+            limit_items(sorted_tokens, 'tokens')
+            return
+            
+        # COMPOSITION WEIGHTS (CWF) SECTION
+        if what == 'x':
+            print("Composition Weight Map (CWF):")
+            print(f"  Total tokens: {len(self.x)}")
+            
+            # Sort by token and limit output
+            sorted_items = sorted(self.x.items(), key=lambda x: x[0])
+            limited = sorted_items[:first_num]
+            
+            for tok, weight in limited:
+                print(f"    {tok}: {weight:.6f}")
+                
+            if len(self.x) > first_num:
+                print(f"    ... {len(self.x) - first_num} more entries not shown")
+            return
+            
+        # POSITION WEIGHT COEFFICIENTS (PWC) SECTION
+        if what == 'a':
+            print("Position Weight Coefficients (PWC):")
+            print("  Index\tValue\tBasis Type")
+            for i, coeff in enumerate(self.a):
+                basis_type = type(self.basis[i]).__name__ if i < len(self.basis) else "Unknown"
+                print(f"  {i}\t{coeff:.6f}\t{basis_type}")
+            return
+            
+        # BASIS FUNCTIONS SECTION
+        if what == 'basis':
+            print("Basis Functions:")
+            print("  Index\tType\tParameters")
+            for i, func in enumerate(self.basis):
+                # Try to get basis parameters
+                params = {}
+                if hasattr(func, 'period'):
+                    params['period'] = func.period
+                # Add other possible parameters here
+                
+                param_str = ", ".join(f"{k}={v}" for k, v in params.items())
+                print(f"  {i}\t{type(func).__name__}\t{param_str}")
+            return
+            
+        # TRAINING STATISTICS SECTION
+        if what == 'stats':
+            print("Training Statistics:")
+            if not self.trained:
+                print("  Model not trained - no statistics available")
+                return
+                
+            print(f"  Mean sequence length: {getattr(self, 'mean_L', 'N/A')}")
+            print(f"  Mean target value: {getattr(self, 'mean_t', 'N/A'):.6f}")
+            return     
 
     def dd_features(self, seq, t=None):
         """
