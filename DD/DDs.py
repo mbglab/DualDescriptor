@@ -35,7 +35,7 @@ class DualDescriptorScalar:
     After training, you can predict the target value t for a sequence via predict_t(),
     extract features per sequence via dd_features(), and inspect current model via show().
     """
-    def __init__(self, charset, num_basis=5, user_bases=None, rank=1, rank_mode='pad', mode='linear', user_step=None):
+    def __init__(self, charset, num_basis=5, user_bases=None, rank=1, rank_mode='drop', mode='linear', user_step=None):
         self.charset = list(charset)
         self.rank = rank
         self.rank_mode = rank_mode
@@ -132,19 +132,6 @@ class DualDescriptorScalar:
             S_list.append(S)
         return S_list        
 
-    def d(self, seq, t):
-        """
-        Compute mean squared deviation d for a single sequence:
-        d = average over positions of (N(k)-t)^2
-        """
-        total = 0.0
-        Nk_list = self.describe(seq)
-        L = len(Nk_list)
-        for Nk in Nk_list:
-            diff = Nk - t
-            total += diff * diff
-        return total / L if L > 0 else 0.0
-
     def D(self, seqs, t_list):
         """
         Compute mean squared deviation D across sequences:
@@ -224,7 +211,7 @@ class DualDescriptorScalar:
             if denom>0:
                 self.x[tok] = sumP[tok]/denom
 
-    def train(self, seqs, t_list, max_iters=1000, tol=1e-8):
+    def train(self, seqs, t_list, max_iters=1000, tol=1e-8, print_every=10):
         """
         Alternate optimization until D converges.
         Returns history of D values.
@@ -235,8 +222,9 @@ class DualDescriptorScalar:
             self.update_PWC(seqs, t_list)
             self.update_CWM(seqs, t_list)
             D = self.D(seqs, t_list)
-            history.append(D)
-            print(f"Iter {it:2d}: D = {D:.6e}")
+            history.append(D)            
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:2d}: D = {D:.6e}")
             if D >= D_prev - tol:
                 print("Converged.")
                 break
@@ -247,7 +235,7 @@ class DualDescriptorScalar:
         return history
 
     def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-               continued=False, decay_rate=1.0):
+               continued=False, decay_rate=1.0, print_every=10):
         """
         Train using gradient descent optimization with learning rate decay.
         Alternates between updating PWC (a) and CWM (x) using gradients.
@@ -318,7 +306,10 @@ class DualDescriptorScalar:
             # Compute current loss
             D_current = self.D(seqs, t_list)
             history.append(D_current)
-            print(f"Iter {it:2d}: D = {D_current:.6e}, LR = {current_lr:.4e}")
+            
+            # Print progress
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:2d}: D = {D_current:.6e}, LR = {current_lr:.4e}")
             
             # Apply learning rate decay
             current_lr *= decay_rate
@@ -337,7 +328,7 @@ class DualDescriptorScalar:
         return history
 
     def auto_train(self, seqs, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-                   continued=False, auto_mode='reg', decay_rate=1.0):
+                   continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
         """
         Self-training method using gradient descent with learning rate decay.
         Two modes:
@@ -451,8 +442,9 @@ class DualDescriptorScalar:
                     self.x[token] -= current_lr * grad_x[token]
             
             # Record and print progress
-            history.append(total_loss)
-            print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
+            history.append(total_loss)            
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
             
             # Apply learning rate decay
             current_lr *= decay_rate
@@ -478,7 +470,6 @@ class DualDescriptorScalar:
         self.mean_L = int(sum(len(self.extract_tokens(seq)) for seq in seqs) / len(seqs)) if seqs else 0
         self.trained = True
         return history
-
     
     def predict_t(self, seq):
         """
@@ -592,13 +583,30 @@ class DualDescriptorScalar:
     def dd_features(self, seq, t=None):
         """
         Extract feature dict for one sequence:
-        {'pwc': [PWC coefficients], 
+        { 'd' : [deviation value],
+         'pwc': [PWC coefficients], 
          'cwf': [CWF values for all tokens sorted],
          'frq': [Position-weighted frequency for each token],
-         'pdv': [Partial Dual Variable for each token],
+         'pdv': [Partial Dual Variable for each token],         
          'all': [concatenate the above]}
         """
+        tg = t or self.predict_t(seq)  
         feats = {}
+        # Deviation value 
+        feats['d'] = [self.D([seq], [tg])]
+        # PWC        
+        a_backup = self.a.copy()        
+        self.update_PWC([seq], [tg])        
+        feats['pwc'] = list(self.a)
+        self.a = a_backup        
+        # CWF sorted by token
+        x_backup = self.x.copy()        
+        self.update_CWM([seq], [tg])        
+        cwfs = []
+        for tok in sorted(self.tokens):
+            cwfs.append(self.x[tok])
+        feats['cwf'] = cwfs
+        self.x = x_backup        
         # Position-weighted frequencies and partial dual variables
         frqd = {}; pdvd = {}
         for tok in sorted(self.tokens):
@@ -618,26 +626,12 @@ class DualDescriptorScalar:
             pdvd[tok] = pdvd[tok] / L if L>0 else 0.0
             pdvs.append(pdvd[tok])        
         feats['frq'] = frqs[:-1] #remove the last one because of dependency
-        feats['pdv'] = pdvs[:-1] #remove the last one because of dependency
-        
-        tg = t or self.predict_t(seq)        
-        # PWC
-        a_backup = self.a.copy()
-        self.update_PWC([seq], [tg])
-        feats['pwc'] = list(self.a)
-        self.a = a_backup
-        # CWF sorted by token
-        self.update_CWM([seq], [tg])
-        cwfs = []
-        for tok in sorted(self.tokens):
-            cwfs.append(self.x[tok])
-        feats['cwf'] = cwfs   
-        
-        feats['all'] = feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']        
+        feats['pdv'] = pdvs[:-1] #remove the last one because of dependency          
+        feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv'] 
         return feats
 
     def part_train(self, num_seqs, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-               continued=False, auto_mode='reg', decay_rate=1.0):
+               continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
         """
         Train position weight coefficients (a) on real-valued sequences with learning rate decay.
         Learns position weighting function I(k) = Σ a_i * basis_i(k) without token mapping.
@@ -730,7 +724,8 @@ class DualDescriptorScalar:
             
             # Record and print progress
             history.append(total_loss)
-            print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:3d}: Loss = {total_loss:.6e}, LR = {current_lr:.4e}")
             
             # Apply learning rate decay
             current_lr *= decay_rate
@@ -878,13 +873,7 @@ class DualDescriptorScalar:
         # Final restoration
         self.trained = True
         return auto_history, part_history
-
-    def I(self, k):
-        """Serializable position weight function for S-sequences"""
-        if hasattr(self, 'stage2_a') and hasattr(self, 'stage2_basis'):
-            return sum(a * basis(k) for a, basis in zip(self.stage2_a, self.stage2_basis))
-        return 0.0
-    
+   
     def double_generate(self, L, tau1=0.0, tau2=0.0):
         """
         Generate a character sequence that integrates patterns from both stages:
@@ -912,7 +901,11 @@ class DualDescriptorScalar:
         
         for k in range(0, L, self.rank):
             # Calculate target S-value from stage 2
-            target_s = self.I(k) + (random.gauss(0, tau2) if tau2 > 0 else 0)
+            if hasattr(self, 'stage2_a') and hasattr(self, 'stage2_basis'):
+                I_val = sum(a * basis(k) for a, basis in zip(self.stage2_a, self.stage2_basis))
+            else:
+                I_val = 0.0             
+            target_s = I_val + (random.gauss(0, tau2) if tau2 > 0 else 0)
             
             # Score tokens based on both stages
             scores = {}
@@ -954,15 +947,13 @@ class DualDescriptorScalar:
         Load a saved DualDescriptorScalar model from a binary file.
         """
         with open(filename, 'rb') as f:
-            state = pickle.load(f)
-        
+            state = pickle.load(f)        
         # Create new instance without calling __init__
         obj = cls.__new__(cls)
         # Restore saved state
         obj.__dict__.update(state)
         print(f"Model loaded from {filename}")
         return obj
-
 
 # ===== Example Usage =====
 if __name__ == "__main__":
@@ -976,7 +967,7 @@ if __name__ == "__main__":
     user_bases = [SineBasis(period) for period in range(2, 2 + 7)]
     
     # create Scalar Dual Descriptor object
-    dd = DualDescriptorScalar(charset, rank=3, num_basis=6, user_bases=user_bases, mode='nonlinear', user_step=2) 
+    dd = DualDescriptorScalar(charset, rank=3, num_basis=5, user_bases=user_bases, mode='nonlinear', user_step=2) 
 
     # generate 10 sequences length 200-300 and random target scalars
     random.seed(0)
@@ -988,7 +979,7 @@ if __name__ == "__main__":
         t_list.append(random.uniform(-1.0,1.0))
 
     # train
-    history = dd.train(seqs, t_list)
+    history = dd.train(seqs, t_list, )
 
     # show status
     dd.show()
@@ -1021,7 +1012,7 @@ if __name__ == "__main__":
     dd = DualDescriptorScalar(charset, rank=3, num_basis=6, user_bases=user_bases, mode='nonlinear', user_step=2)
     # Train with gradient descent method
     print("Training with gradient descent:")
-    history_grad = dd.grad_train(seqs, t_list, learning_rate=1.0, max_iters=1000)
+    history_grad = dd.grad_train(seqs, t_list, learning_rate=2.0, max_iters=1000)
     
     # show status
     dd.show()
@@ -1052,7 +1043,7 @@ if __name__ == "__main__":
 
     # Self-train using auto_train method (auto_mode='gap')
     print("\n=== Starting Self-Training with auto_train (auto_mode='gap') ===")
-    loss_history = dd.auto_train(seqs, learning_rate=0.5, max_iters=1000, auto_mode='gap')
+    loss_history = dd.auto_train(seqs, learning_rate=0.5, max_iters=100, auto_mode='gap')
     
     # Show model status after self-training
     print("\nModel after self-training auto_mode='gap':")
@@ -1076,7 +1067,7 @@ if __name__ == "__main__":
     
     # Self-train using auto_train_reg method (auto_mode='reg')
     print("\n=== Starting Self-Training with auto_train (auto_mode='reg') ===")
-    loss_history = dd.auto_train(seqs, learning_rate=0.5, max_iters=1000, auto_mode='reg')
+    loss_history = dd.auto_train(seqs, learning_rate=0.5, max_iters=100, auto_mode='reg')
     
     # Show model status after self-training
     print("\nModel after self-training (auto_mode='reg'):")
@@ -1132,11 +1123,11 @@ if __name__ == "__main__":
     ]
 
     print("=== Training in 'gap' mode (predict current value) ===")
-    gap_history = dd.part_train(num_seqs, auto_mode='gap', learning_rate=0.1, max_iters=500)
+    gap_history = dd.part_train(num_seqs, auto_mode='gap', learning_rate=0.1, max_iters=50)
     print("\nFinal PWC coefficients:", dd.a)
 
     print("\n=== Training in 'reg' mode (predict next value) ===")
-    reg_history = dd.part_train(num_seqs, auto_mode='reg', learning_rate=0.1, max_iters=500, continued=True)
+    reg_history = dd.part_train(num_seqs, auto_mode='reg', learning_rate=0.1, max_iters=50, continued=True)
     print("\nFinal PWC coefficients:", dd.a)
 
     # Evaluate on new sequence
@@ -1176,14 +1167,13 @@ if __name__ == "__main__":
     print("High randomness (tau=0.5):", 
           dd.part_generate(L=5, mode='reg', initial_value=0.0, tau=0.5))
 
-
     print("=== Starting Double Training ===")
     auto_history, part_history = dd.double_train(
         seqs,
         auto_mode='reg',    # First stage: predict next token
         part_mode='reg',    # Second stage: predict next S-value
-        max_iters1=1000,
-        max_iters2=1000,
+        max_iters1=100,
+        max_iters2=100,
         learning_rate1=0.1,
         learning_rate2=0.1
     )
@@ -1206,27 +1196,6 @@ if __name__ == "__main__":
 
     print("\nFull-random (tau1=0.5, tau2=0.5):")
     print(dd.double_generate(L=20, tau1=0.5, tau2=0.5))
-
-    # Generate and analyze S-sequence
-    def analyze_generated_sequence(dd, seq):
-        """Analyze generated sequence with both stages"""
-        # Calculate actual S-sequence
-        actual_s = dd.S(seq)
-        
-        # Calculate ideal S-sequence from stage 2
-        ideal_s = [dd.I(k) for k in range(len(actual_s))]
-        
-        # Calculate correlation
-        from statistics import correlation
-        corr = correlation(actual_s, ideal_s) if len(actual_s) > 1 else 0
-        
-        print(f"\nGenerated sequence: {seq}")
-        print(f"S-sequence correlation: {corr:.4f}")
-        print(f"First 5 S-values: Actual {actual_s[:5]}, Ideal {ideal_s[:5]}")
-
-    print("\n=== Sequence Analysis ===")
-    seq = dd.double_generate(L=20, tau1=0.1, tau2=0.1)
-    analyze_generated_sequence(dd, seq)
     
     # Save trained model
     dd.save("trained_model.pkl")
@@ -1254,8 +1223,3 @@ if __name__ == "__main__":
     # Generate sequence with loaded model
     print("\nGenerated sequence with loaded model:")
     print(dd_loaded.double_generate(L=20, tau1=0.1, tau2=0.1))
-
-    # Verify I() function works after loading
-    print("\nTesting I() function after loading:")
-    for k in range(5):
-        print(f"I({k}) = {dd_loaded.I(k):.4f}")
