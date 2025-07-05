@@ -1,6 +1,6 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Dual Descriptor Vector class
-# Author: Bin-Guang Ma; Date: 2025-6-10
+# The Numeric Dual Descriptor class (Random AB matrix form) for Vector Sequences
+# Author: Bin-Guang Ma; Date: 2025-6-6
 
 # The program is provided as it is and without warranty of any kind,
 # either expressed or implied.
@@ -9,45 +9,49 @@ import math
 import random
 import pickle
 
-class NumDualDescriptor:
+class NumDualDescriptorAB:
     """
     Numeric Dual Descriptor for vector sequences with:
-      - Learnable coefficient matrix Acoeff ∈ R^{m×L}
-      - Learnable basis matrix Bbasis ∈ R^{L×m}
-      - Learnable transformation matrix M ∈ R^{m×m} (replaces token embeddings)
+      - learnable coefficient matrix Acoeff ∈ R^{m×L}
+      - learnable basis matrix Bbasis ∈ R^{L×m}
+      - learnable transformation matrix M ∈ R^{m×m}
     """
-    def __init__(self, vec_dim=10, bas_dim=50, rank=1, rank_mode='drop', rank_op='avg', mode='linear', user_step=None):
+    def __init__(self, vec_dim=4, bas_dim=50, rank=1, rank_mode='drop', mode='linear', user_step=None):
         """
         Initialize the Dual Descriptor for vector sequences.
         
         Args:
-            vec_dim (int): Dimensionality of input vectors (m)
-            bas_dim (int): Dimensionality of basis vectors (L)
-            rank (int): Parameter controlling step size in nonlinear mode
-            mode (str): 'linear' or 'nonlinear' processing mode
+            vec_dim (int): Dimension m of input vectors
+            bas_dim (int): Basis dimension L
+            rank (int): Window size for vector aggregation
+            rank_mode (str): 'pad' or 'drop' for handling incomplete windows
+            mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
         """
         self.m = vec_dim
         self.L = bas_dim
         self.rank = rank
         self.rank_mode = rank_mode
-        self.rank_op = rank_op        
-        assert mode in ('linear', 'nonlinear')
+        assert mode in ('linear','nonlinear')
         self.mode = mode
         self.step = user_step
         self.trained = False
         
         # Initialize transformation matrix M (m×m)
-        self.M = [[random.uniform(-0.5, 0.5) for _ in range(self.m)] 
-                  for _ in range(self.m)]
-        # Initialize Acoeff (m×L)
-        self.Acoeff = [[random.uniform(-0.1, 0.1) for _ in range(self.L)]
+        self.M = [[1.0 if i==j else random.uniform(-0.1, 0.1) 
+                  for j in range(self.m)] 
+                 for i in range(self.m)]
+        
+        # Initialize coefficient matrix Acoeff: m×L
+        self.Acoeff = [[random.uniform(-0.1,0.1) for _ in range(self.L)]
                        for _ in range(self.m)]
-        # Initialize Bbasis (L×m)
+        
+        # Initialize basis matrix Bbasis: L×m
         self.Bbasis = [[random.uniform(-0.1, 0.1) for _ in range(self.m)]
                        for _ in range(self.L)]
-        # Cache transpose
-        self.B_t = self._transpose(self.Bbasis)         
+        
+        # Cache transpose of Bbasis: m×L
+        self.B_t = self._transpose(self.Bbasis)
 
     # ---- linear algebra helpers ----
     def _transpose(self, M):
@@ -71,7 +75,7 @@ class NumDualDescriptor:
         return [sum(M[i][j]*v[j] for j in range(len(v))) for i in range(len(M))]
 
     def _invert(self, A):
-        """Gauss-Jordan inversion of n×n matrix"""
+        """Gauss-Jordan inversion for square matrix"""
         n = len(A)
         M = [A[i][:] + [1.0 if i==j else 0.0 for j in range(n)]
              for i in range(n)]
@@ -88,319 +92,249 @@ class NumDualDescriptor:
         return [row[n:] for row in M]
 
     # ---- sequence processing ----
-    def extract_vectors(self, seq):
+    def extract_windows(self, vec_seq):
         """
-        Extract vectors from sequence based on processing mode and rank operation.
-        
-        For linear mode:
-        - Slide window by 1 step, extracting contiguous vectors of length = rank
-        - Apply rank operation (avg/sum/pick/user_func) to each window
-        
-        For nonlinear mode:
-        - Slide window by custom step (or rank length if step not specified)
-        - Handle incomplete windows using rank_mode:
-            • 'pad': Pad with zero vectors to maintain rank length
-            • 'drop': Discard incomplete windows
-        - Apply rank operation to each complete window
-        
-        Rank operations:
-        - 'avg': Average vectors in window (default)
-        - 'sum': Sum vectors in window
-        - 'pick': Randomly select one vector in window
-        - 'user_func': Apply custom function to window
-            • Default behavior: Apply sigmoid to average vector
+        Extract window vectors from a sequence of m-dimensional vectors.
         
         Args:
-            seq: List of m-dimensional vectors
+            vec_seq (list): List of m-dimensional vectors
             
         Returns:
-            list: Processed vectors based on mode and operations
+            list: Aggregated window vectors
         """
-
-        
-        # Helper function to apply vector operations
-        def apply_op(vectors):
-            """Apply rank operation to a list of vectors"""
-            # Get vector dimension from first vector
-            d = len(vectors[0]) if vectors else 0
-            
-            if self.rank_op == 'sum':
-                return [sum(v[j] for v in vectors) for j in range(d)]
-                
-            elif self.rank_op == 'pick':
-                return random.choice(vectors)
-                
-            elif self.rank_op == 'user_func':
-                # Use custom function if provided, else default behavior
-                if hasattr(self, 'user_func') and callable(self.user_func):
-                    return self.user_func(vectors)
-                else:
-                    # Default: average + sigmoid
-                    avg = [sum(v[j] for v in vectors) / len(vectors) for j in range(d)]
-                    return [1 / (1 + math.exp(-x)) for x in avg]
-                    
-            else:  # 'avg' is default
-                return [sum(v[j] for v in vectors) / len(vectors) for j in range(d)]
-        
-        # Handle empty sequence case
-        if not seq:
-            return []
-        
+        L = len(vec_seq)
         # Linear mode: sliding window with step=1
         if self.mode == 'linear':
-            L = len(seq)
-            # Only process if sequence is long enough
-            if L < self.rank:
-                return []
-                
-            return [
-                apply_op(seq[i:i + self.rank])
-                for i in range(L - self.rank + 1)
-            ]
+            windows = []
+            for i in range(L - self.rank + 1):
+                # Extract vectors in current window
+                window_vecs = vec_seq[i:i+self.rank]
+                # Calculate average vector for the window
+                avg_vec = [0.0] * self.m
+                for vec in window_vecs:
+                    for d in range(self.m):
+                        avg_vec[d] += vec[d]
+                avg_vec = [x / self.rank for x in avg_vec]
+                windows.append(avg_vec)
+            return windows
         
         # Nonlinear mode: stepping with custom step size
-        step = self.step or self.rank
-        results = []
-        vector_dim = len(seq[0])  # Dimension of vectors
-        
-        for i in range(0, len(seq), step):
-            frag = seq[i:i + self.rank]
+        windows = []
+        step = self.step or self.rank  # Use custom step if defined, else use rank
+        for i in range(0, L, step):
+            window_vecs = vec_seq[i:i+self.rank]
+            num_vecs = len(window_vecs)
             
-            if self.rank_mode == 'pad':
-                # Pad fragment with zero vectors if shorter than rank
-                if len(frag) < self.rank:
-                    padding = [[0] * vector_dim] * (self.rank - len(frag))
-                    frag += padding
-                results.append(apply_op(frag))
-                
-            elif self.rank_mode == 'drop':
-                # Only process fragments that match full rank length
-                if len(frag) == self.rank:
-                    results.append(apply_op(frag))
-                    
-        return results
-    
+            # Handle incomplete windows based on rank_mode
+            if num_vecs < self.rank:
+                if self.rank_mode == 'pad':
+                    # Pad with zero vectors
+                    window_vecs += [[0.0]*self.m] * (self.rank - num_vecs)
+                elif self.rank_mode == 'drop':
+                    # Skip incomplete windows
+                    continue
+            
+            # Calculate average vector for the window
+            avg_vec = [0.0] * self.m
+            for vec in window_vecs:
+                for d in range(self.m):
+                    avg_vec[d] += vec[d]
+            avg_vec = [x / self.rank for x in avg_vec]
+            windows.append(avg_vec)
+        return windows
 
     # ---- describe sequence ----
-    def describe(self, seq):
-        """
-        Compute descriptor vectors for each position in the sequence.
-        
-        Args:
-            seq: List of m-dimensional vectors
-            
-        Returns:
-            list: Descriptor vectors (N) for each position
-        """
-        vecs = self.extract_vectors(seq)        
+    def describe(self, vec_seq):
+        """Compute descriptor vectors for each window position"""
+        windows = self.extract_windows(vec_seq)
         N = []
-        for k, v in enumerate(vecs):
-            # Transform input vector: x = M * v
-            x = self._mat_vec(self.M, v)
-            # Compute z = Bbasis * x
-            z = [sum(self.Bbasis[j][i] * x[i] for i in range(self.m))
-                 for j in range(self.L)]
-            # Compute Nk = Acoeff * z
-            Nk = [sum(self.Acoeff[i][j] * z[j] for j in range(self.L))
-                  for i in range(self.m)]
+        for k, window_vec in enumerate(windows):
+            # Apply transformation: x' = M * window_vec
+            transformed_vec = self._mat_vec(self.M, window_vec)
+            
+            j = k % self.L  # Basis index
+            # A: m×1 column vector from Acoeff
+            A_col = [[self.Acoeff[i][j]] for i in range(self.m)]
+            # B: 1×m row vector from Bbasis
+            B_row = [self.Bbasis[j]]
+            # P = A_col * B_row: m×m matrix
+            P = self._mat_mul(A_col, B_row)
+            # Nk = P * transformed_vec: m-vector
+            Nk = self._mat_vec(P, transformed_vec)
             N.append(Nk)
         return N
 
-    def S(self, seq):
-        """
-        Compute cumulative descriptor vectors S(l) = ΣN(k) for k=1 to l.
-        
-        Args:
-            seq: List of m-dimensional vectors
-            
-        Returns:
-            list: Cumulative descriptor vectors
-        """
-        Nk_list = self.describe(seq)
+    def S(self, vec_seq):
+        """Compute cumulative descriptor vectors S(l) = ΣN(k) for k=1 to l"""
+        Nk_list = self.describe(vec_seq)        
         S = [0.0] * self.m
         S_list = []
-        for l in range(len(Nk_list)):
+        for Nk in Nk_list:
             for i in range(self.m):
-                S[i] += Nk_list[l][i]
-            S_list.append(S[:])  # Append a copy
+                S[i] += Nk[i]
+            S_list.append(list(S))
         return S_list
 
     # ---- compute deviation ----
     def deviation(self, seqs, t_list):
-        """
-        Compute mean squared error between descriptors and targets.
-        
-        Args:
-            seqs: List of vector sequences
-            t_list: List of target vectors
-            
-        Returns:
-            float: Mean squared error
-        """
-        total_error = 0.0
-        position_count = 0
+        """Compute mean squared error between descriptors and targets"""
+        tot = 0.0
+        cnt = 0
         for seq, t in zip(seqs, t_list):
             for Nk in self.describe(seq):
                 for i in range(self.m):
-                    error = Nk[i] - t[i]
-                    total_error += error * error
-                position_count += 1
-        return total_error / position_count if position_count else 0.0
+                    diff = Nk[i] - t[i]
+                    tot += diff * diff
+                cnt += 1
+        return tot / cnt if cnt else 0.0
 
     # ---- update Acoeff ----
     def update_Acoeff(self, seqs, t_list):
-        """
-        Update Acoeff using closed-form least squares solution.
-        
-        Args:
-            seqs: List of training sequences
-            t_list: List of target vectors
-        """
-        L, m = self.L, self.m
-        U = [[0.0] * L for _ in range(L)]  # L×L
-        V = [[0.0] * L for _ in range(m)]  # m×L
+        """Update coefficient matrix using position-specific projections"""
+        m, L = self.m, self.L
+        # Initialize accumulators
+        numerator = [[0.0] * L for _ in range(m)]  # m x L
+        denominator = [0.0] * L  # L-dimensional
         
         for seq, t in zip(seqs, t_list):
-            vecs = self.extract_vectors(seq)
-            for v in vecs: 
-                # Transform vector: x = M * v
-                x = self._mat_vec(self.M, v)
-                # Compute z = Bbasis * x
-                z = [sum(self.Bbasis[j][i] * x[i] for i in range(m))
-                     for j in range(L)]
-                # Accumulate U and V
-                for i in range(L):
-                    for j in range(L):
-                        U[i][j] += z[i] * z[j]
+            windows = self.extract_windows(seq)
+            for k, window_vec in enumerate(windows):
+                idx = k % L  # Basis index
+                # Apply transformation: x' = M * window_vec
+                transformed_vec = self._mat_vec(self.M, window_vec)
+                
+                # Compute scalar: Bbasis[idx] • transformed_vec
+                scalar = sum(self.Bbasis[idx][i] * transformed_vec[i] for i in range(m))
+                
+                # Update accumulators
                 for i in range(m):
-                    for j in range(L):
-                        V[i][j] += t[i] * z[j]
+                    numerator[i][idx] += scalar * t[i]
+                denominator[idx] += scalar * scalar  # scalar²
         
-        U_inv = self._invert(U)
-        self.Acoeff = self._mat_mul(V, U_inv)
+        # Update Acoeff column-wise
+        for j in range(L):
+            if abs(denominator[j]) > 1e-12:  # Avoid division by zero
+                inv_denom = 1.0 / denominator[j]
+                for i in range(m):
+                    self.Acoeff[i][j] = numerator[i][j] * inv_denom
 
     def update_Bbasis(self, seqs, t_list):
-        """
-        Update Bbasis using closed-form least squares solution.
+        """Update basis matrix using position-specific least squares"""
+        m, L = self.m, self.L        
+        # Initialize accumulators for each basis index
+        M_list = [[[0.0] * m for _ in range(m)] for _ in range(L)]  # L x m x m matrices
+        v_list = [[0.0] * m for _ in range(L)]  # L x m vectors
         
-        Args:
-            seqs: List of training sequences
-            t_list: List of target vectors
-        """
-        L, m = self.L, self.m        
-        
-        # Initialize accumulation matrices
-        B = [[0.0] * m for _ in range(m)]  # m×m
-        TXT = [[0.0] * m for _ in range(m)]    # m×m
-        
+        # Collect data grouped by basis index j
         for seq, t in zip(seqs, t_list):
-            vecs = self.extract_vectors(seq)
-            for v in vecs: 
-                # Transform vector: x = M * v
-                x = self._mat_vec(self.M, v)
-                # Update B matrix: x * x^T
+            windows = self.extract_windows(seq)
+            for k, window_vec in enumerate(windows):
+                j = k % L  # Basis index
+                # Apply transformation: x' = M * window_vec
+                transformed_vec = self._mat_vec(self.M, window_vec)
+                A_j = [self.Acoeff[i][j] for i in range(m)]  # A_j: j-th column of Acoeff
+                
+                # Compute ||A_j||^2 = A_j • A_j
+                a_norm_sq = sum(a*a for a in A_j)
+                
+                # Update M_j: Σ [x' x'^T * ||A_j||^2]
+                for r in range(m):
+                    for s in range(m):
+                        M_list[j][r][s] += a_norm_sq * transformed_vec[r] * transformed_vec[s]
+                
+                # Update v_j: Σ [<A_j, t> * x']
+                a_dot_t = sum(A_j[i] * t[i] for i in range(m))
                 for i in range(m):
-                    for j in range(m):
-                        B[i][j] += x[i] * x[j]
-                # Update TXT matrix: t * x^T
+                    v_list[j][i] += a_dot_t * transformed_vec[i]
+        
+        # Update each basis vector b_j (j-th row of Bbasis)
+        for j in range(L):
+            M = M_list[j]
+            v = v_list[j]
+            
+            try:
+                # Solve linear system: M * b_j = v
+                M_inv = self._invert(M)
+                b_j = self._mat_vec(M_inv, v)
+                
+                # Update j-th row of Bbasis
                 for i in range(m):
-                    for j in range(m):
-                        TXT[i][j] += t[i] * x[j]
+                    self.Bbasis[j][i] = b_j[i]
+            except:  # Fallback to current values on singular matrix
+                pass
         
-        # Compute A = Acoeff^T * Acoeff (L×L)
-        Acoeff_t = self._transpose(self.Acoeff)
-        A = self._mat_mul(Acoeff_t, self.Acoeff)
-        
-        # Compute C = Acoeff^T * TXT (L×m)
-        C = self._mat_mul(Acoeff_t, TXT)  
-        
-        # Invert matrices
-        A_inv = self._invert(A)
-        B_inv = self._invert(B)
-        
-        # Compute new Bbasis = A_inv * C * B_inv
-        CB_inv = self._mat_mul(C, B_inv)
-        Bbasis_new = self._mat_mul(A_inv, CB_inv)
-        
-        # Update parameters
-        self.Bbasis = Bbasis_new
+        # Update transpose cache
         self.B_t = self._transpose(self.Bbasis)
 
-    # ---- update transformation matrix M ----
+    # ---- update M ----
     def update_M(self, seqs, t_list):
-        """
-        Update transformation matrix M using least squares.
-        
-        Args:
-            seqs: List of training sequences
-            t_list: List of target vectors
-        """
-        L, m = self.L, self.m        
-        
-        # Precompute C = Acoeff * Bbasis (m×m)
-        C = self._mat_mul(self.Acoeff, self.Bbasis)
-        C_t = self._transpose(C)
-        
-        # Compute left side: C^T * C (m×m)
-        left = self._mat_mul(C_t, C)
-        
-        # Initialize accumulation matrices
-        sum_vvT = [[0.0] * m for _ in range(m)]  # m×m
-        sum_tvT = [[0.0] * m for _ in range(m)]   # m×m
-        
+        """Update transformation matrix using position-specific least squares"""
+        m = self.m
+        # Initialize m² × m² matrix and m² vector
+        M_mat = [[0.0] * (m*m) for _ in range(m*m)]
+        v_vec = [0.0] * (m*m)
+
+        # Process each sequence and window
         for seq, t in zip(seqs, t_list):
-            vecs = self.extract_vectors(seq)
-            for v in vecs: 
-                # Compute v * v^T
-                for i in range(m):
-                    for j in range(m):
-                        sum_vvT[i][j] += v[i] * v[j]
-                # Compute t * v^T
-                for i in range(m):
-                    for j in range(m):
-                        sum_tvT[i][j] += t[i] * v[j] 
+            windows = self.extract_windows(seq)
+            for k, x_k in enumerate(windows):
+                j = k % self.L # Basis index
+                A_col = [self.Acoeff[i][j] for i in range(m)]
+                b_j = self.Bbasis[j]
+                
+                # Compute scalar constants
+                a_norm_sq = sum(a*a for a in A_col)
+                a_dot_t = sum(A_col[i] * t[i] for i in range(m))
+                
+                # Compute outer product matrix: x_k ⊗ b_j
+                for r in range(m):
+                    for s in range(m):
+                        idx1 = r * m + s
+                        val = a_norm_sq * x_k[r] * b_j[s]
+                        for p in range(m):
+                            for q in range(m):
+                                idx2 = p * m + q
+                                M_mat[idx1][idx2] += val * x_k[p] * b_j[q]
+                        v_vec[idx1] += a_dot_t * x_k[r] * b_j[s]
         
-        # Compute right side: C^T * (sum_tvT) * sum_vvT^{-1}
-        sum_vvT_inv = self._invert(sum_vvT)
-        Ct_sum_tvT = self._mat_mul(C_t, sum_tvT)
-        right = self._mat_mul(Ct_sum_tvT, sum_vvT_inv)
-        
-        # Solve left * M = right
-        left_inv = self._invert(left)
-        self.M = self._mat_mul(left_inv, right)
+        try:
+            M_inv = self._invert(M_mat)
+            M_flat = self._mat_vec(M_inv, v_vec)
+            # Reshape flattened solution to m × m matrix
+            self.M = [[M_flat[i*m + j] for j in range(m)] for i in range(m)]
+        except:
+            pass  # Fallback to current M on singular matrix
 
     # ---- training loop ----
-    def train(self, seqs, t_list, max_iters=10, tol=1e-8):
+    def train(self, seqs, t_list, max_iters=10, tol=1e-8, print_every=1):
         """
-        Train model using alternating least squares.
+        Train using alternating least squares updates.
         
         Args:
-            seqs: List of training sequences
+            seqs: List of training vector sequences
             t_list: List of target vectors
             max_iters: Maximum iterations
             tol: Convergence tolerance
+            print_every: Print frequency
             
         Returns:
-            list: Training history (MSE values)
+            list: Deviation history
         """
-        prev_dev = float('inf')
+        D_prev = float('inf')
         history = []
-        
         for it in range(max_iters):
             self.update_Acoeff(seqs, t_list)
             self.update_Bbasis(seqs, t_list)
             self.update_M(seqs, t_list)
-            
-            dev = self.deviation(seqs, t_list)
-            history.append(dev)
-            print(f"Iter {it:2d}: MSE = {dev:.6e}")
-            
-            if abs(prev_dev - dev) < tol:
+            D = self.deviation(seqs, t_list)
+            history.append(D)
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"Iter {it:2d}: D = {D:.6e}")
+            if D - D_prev >= tol:
                 print("Converged.")
                 break
-            prev_dev = dev
-        
-        # Compute statistics
+            D_prev = D
+        # Compute training statistics
         self.mean_L = int(sum(len(seq) for seq in seqs) / len(seqs))
         self.mean_t = [0.0] * self.m
         for t in t_list:
@@ -408,31 +342,43 @@ class NumDualDescriptor:
                 self.mean_t[i] += t[i]
         self.mean_t = [x / len(t_list) for x in self.mean_t]
         self.trained = True
-        
         return history
 
-    def grad_train(self, seqs, t_list, learning_rate=0.01, max_iters=100, 
-                  tol=1e-9, print_every=10, lr_decay=1.0):
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, 
+                   learning_rate=0.01, continued=False, 
+                   decay_rate=1.0, print_every=10):
         """
-        Train model using gradient descent.
+        Train using gradient descent optimization.
         
         Args:
-            seqs: List of training sequences
+            seqs: List of training vector sequences
             t_list: List of target vectors
-            learning_rate: Initial step size
             max_iters: Maximum iterations
             tol: Convergence tolerance
-            print_every: Print interval
-            lr_decay: Learning rate decay factor per iteration
-                      (1.0 = no decay, 0.99 = 1% decay per iteration)
+            learning_rate: Initial learning rate
+            continued: Continue from current parameters
+            decay_rate: Learning rate decay
+            print_every: Print frequency
             
         Returns:
-            list: Training loss history
-        """        
-        history = []
-        prev_loss = float('inf')
+            list: Loss history
+        """
+        if not continued:
+            # Reinitialize parameters
+            self.M = [[1.0 if i==j else random.uniform(-0.1, 0.1) 
+                      for j in range(self.m)] 
+                     for i in range(self.m)]
+            self.Acoeff = [[random.uniform(-0.1,0.1) for _ in range(self.L)]
+                           for _ in range(self.m)]
+            self.Bbasis = [[random.uniform(-0.1, 0.1) for _ in range(self.m)]
+                           for _ in range(self.L)]
         
-        # Store initial learning rate for decay
+        total_positions = sum(len(self.extract_windows(seq)) for seq in seqs)
+        if total_positions == 0:
+            raise ValueError("No valid windows in sequences")
+        
+        history = []
+        D_prev = float('inf')
         current_lr = learning_rate
         
         for it in range(max_iters):
@@ -440,92 +386,80 @@ class NumDualDescriptor:
             grad_A = [[0.0] * self.L for _ in range(self.m)]
             grad_B = [[0.0] * self.m for _ in range(self.L)]
             grad_M = [[0.0] * self.m for _ in range(self.m)]
-            
             total_loss = 0.0
-            total_positions = 0
             
-            # Process all sequences
+            # Process each sequence
             for seq, t in zip(seqs, t_list):
-                vecs = self.extract_vectors(seq)
-                total_positions += len(vecs)
-                
-                for v in vecs:
-                    # Forward pass
-                    x = self._mat_vec(self.M, v)          # M * v
-                    z = self._mat_vec(self.Bbasis, x)     # Bbasis * x
-                    N = self._mat_vec(self.Acoeff, z)     # Acoeff * z
+                windows = self.extract_windows(seq)
+                for k, window_vec in enumerate(windows):
+                    j = k % self.L  # Basis index
                     
-                    # Compute error
-                    error = [N_i - t_i for N_i, t_i in zip(N, t)]
-                    total_loss += sum(e*e for e in error)
+                    # Apply transformation: x' = M * window_vec
+                    transformed_vec = self._mat_vec(self.M, window_vec)
                     
-                    # Backpropagation
-                    # Gradient w.r.t. Acoeff: dL/dAcoeff = error * z^T
+                    # Compute scalar: B_j • x'
+                    scalar = sum(self.Bbasis[j][i] * transformed_vec[i] for i in range(self.m))
+                    
+                    # Compute Nk = scalar * A_j
+                    A_j = [self.Acoeff[i][j] for i in range(self.m)]
+                    Nk = [A_j[i] * scalar for i in range(self.m)]
+                    
+                    # Compute position loss
+                    pos_loss = 0.0
+                    dNk = [0.0] * self.m
                     for i in range(self.m):
-                        for j in range(self.L):
-                            grad_A[i][j] += 2 * error[i] * z[j]
+                        error = Nk[i] - t[i]
+                        pos_loss += error * error
+                        dNk[i] = 2 * error / self.m  # Gradient w.r.t Nk
+                    total_loss += pos_loss / self.m
                     
-                    # Gradient w.r.t. Bbasis: dL/dBbasis = (Acoeff^T @ error) * x^T
-                    Acoeff_t_error = self._mat_vec(self._transpose(self.Acoeff), error)
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            grad_B[j][i] += 2 * Acoeff_t_error[j] * x[i]
-                    
-                    # Gradient w.r.t. M: dL/dM = (Bbasis^T @ Acoeff^T @ error) * v^T
-                    B_t_Acoeff_t_error = self._mat_vec(
-                        self.B_t, Acoeff_t_error
-                    )
+                    # Compute gradients
                     for i in range(self.m):
-                        for j in range(self.m):
-                            grad_M[i][j] += 2 * B_t_Acoeff_t_error[i] * v[j]
+                        # Gradient for Acoeff
+                        grad_A[i][j] += dNk[i] * scalar
+                        
+                        # Common factor
+                        factor = dNk[i] * A_j[i]
+                        
+                        # Gradient for Bbasis
+                        for d in range(self.m):
+                            grad_B[j][d] += factor * transformed_vec[d]
+                            
+                        # Gradient for M (through transformed_vec)
+                        for d in range(self.m):
+                            for e in range(self.m):
+                                # ∂(transformed_vec[d])/∂M[d][e] = window_vec[e]
+                                grad_M[d][e] += factor * self.Bbasis[j][d] * window_vec[e]
             
-            # Average gradients
-            if total_positions > 0:
-                norm = 1 / total_positions
-                for i in range(self.m):
-                    for j in range(self.L):
-                        grad_A[i][j] *= norm
-                for j in range(self.L):
-                    for i in range(self.m):
-                        grad_B[j][i] *= norm
-                for i in range(self.m):
-                    for j in range(self.m):
-                        grad_M[i][j] *= norm
-            
-            # Update parameters
+            # Update parameters with gradients
             for i in range(self.m):
                 for j in range(self.L):
                     self.Acoeff[i][j] -= current_lr * grad_A[i][j]
             
             for j in range(self.L):
-                for i in range(self.m):
-                    self.Bbasis[j][i] -= current_lr * grad_B[j][i]
+                for d in range(self.m):
+                    self.Bbasis[j][d] -= current_lr * grad_B[j][d]
             
-            for i in range(self.m):
-                for j in range(self.m):
-                    self.M[i][j] -= current_lr * grad_M[i][j]
+            for d in range(self.m):
+                for e in range(self.m):
+                    self.M[d][e] -= current_lr * grad_M[d][e]
             
-            # Update B_t
-            self.B_t = self._transpose(self.Bbasis)
-            
-            # Apply learning rate decay
-            current_lr *= lr_decay
-            
-            # Calculate and record loss
-            avg_loss = total_loss / total_positions if total_positions else 0
+            # Calculate average loss
+            avg_loss = total_loss / total_positions
             history.append(avg_loss)
+            current_lr *= decay_rate  # Decay learning rate
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
-                print(f"Iter {it:3d}: Loss = {avg_loss:.6f} (LR: {current_lr:.6f})")
-            
+                print(f"Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
+                
             # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it} iterations")
+            if D_prev - avg_loss < tol:
+                print(f"Converged after {it+1} iterations")
                 break
-            prev_loss = avg_loss
+            D_prev = avg_loss
         
-        # Final statistics
+        # Finalize training
         self.mean_L = int(sum(len(seq) for seq in seqs) / len(seqs))
         self.mean_t = [0.0] * self.m
         for t in t_list:
@@ -533,100 +467,106 @@ class NumDualDescriptor:
                 self.mean_t[i] += t[i]
         self.mean_t = [x / len(t_list) for x in self.mean_t]
         self.trained = True
-        
         return history
 
-    def auto_train(self, seqs, learning_rate=0.01, max_iters=100, tol=1e-6,
-                   print_every=10, auto_mode='reg', lr_decay=1.0):
+    def auto_train(self, seqs, auto_mode='reg', max_iters=1000, tol=1e-8,
+                   learning_rate=0.01, continued=False, decay_rate=0.99,
+                   print_every=10):
         """
         Self-supervised training for vector sequences.
         
         Args:
-            seqs: List of training sequences
-            learning_rate: Initial step size
+            seqs: List of training vector sequences
+            auto_mode: 'reg' (predict next window) only
             max_iters: Maximum iterations
             tol: Convergence tolerance
-            print_every: Print interval
-            auto_mode: 'gap' (autoencoder) or 'reg' (next-vector prediction)
-            lr_decay: Learning rate decay factor per iteration
-                      (1.0 = no decay, 0.99 = 1% decay per iteration)
+            learning_rate: Initial learning rate
+            continued: Continue from current parameters
+            decay_rate: Learning rate decay
+            print_every: Print frequency
             
         Returns:
-            list: Training loss history
+            list: Loss history
         """
-        assert auto_mode in ('gap', 'reg')        
+        if not continued:
+            # Reinitialize parameters
+            self.M = [[1.0 if i==j else random.uniform(-0.1, 0.1) 
+                      for j in range(self.m)] 
+                     for i in range(self.m)]
+            self.Acoeff = [[random.uniform(-0.1,0.1) for _ in range(self.L)]
+                           for _ in range(self.m)]
+            self.Bbasis = [[random.uniform(-0.1, 0.1) for _ in range(self.m)]
+                           for _ in range(self.L)]
+        
+        # Prepare training samples: (sequence, window_index, next_window_vector)
+        samples = []
+        for seq in seqs:
+            windows = self.extract_windows(seq)
+            if len(windows) < 2:
+                continue
+                
+            if auto_mode == 'reg':
+                # Predict next window from current window
+                for k in range(len(windows) - 1):
+                    samples.append((seq, k, windows[k+1]))
+        
+        if not samples:
+            print("Warning: No training samples generated")
+            return []
+        
         history = []
         prev_loss = float('inf')
-        
-        # Store initial learning rate for decay
         current_lr = learning_rate
         
         for it in range(max_iters):
-            # Initialize gradients
+            total_loss = 0.0
             grad_A = [[0.0] * self.L for _ in range(self.m)]
             grad_B = [[0.0] * self.m for _ in range(self.L)]
             grad_M = [[0.0] * self.m for _ in range(self.m)]
             
-            total_loss = 0.0
-            total_instances = 0
-            
-            # Process all sequences
-            for seq in seqs:
-                vecs = self.extract_vectors(seq)
-                n = len(vecs)
+            for seq, k, next_window in samples:
+                windows = self.extract_windows(seq)
+                if k >= len(windows):
+                    continue
+                    
+                current_window = windows[k]
+                j = k % self.L  # Basis index
                 
-                if auto_mode == 'reg' and n < 2:
-                    continue  # Skip short sequences
+                # Apply transformation: x' = M * current_window
+                transformed_vec = self._mat_vec(self.M, current_window)
                 
-                # Determine processing range
-                indices = range(n) if auto_mode == 'gap' else range(n - 1)
+                # Compute scalar: B_j • x'
+                scalar = sum(self.Bbasis[j][i] * transformed_vec[i] for i in range(self.m))
                 
-                for k in indices:
-                    current_vec = vecs[k]
-                    target_vec = vecs[k] if auto_mode == 'gap' else vecs[k + 1]
-                    
-                    # Forward pass
-                    x = self._mat_vec(self.M, current_vec)
-                    z = self._mat_vec(self.Bbasis, x)
-                    N = self._mat_vec(self.Acoeff, z)
-                    
-                    # Compute error
-                    error = [N_i - target_vec_i for N_i, target_vec_i in zip(N, target_vec)]
-                    total_loss += sum(e*e for e in error)
-                    total_instances += 1
-                    
-                    # Backpropagation
-                    # Gradient w.r.t. Acoeff: dL/dAcoeff = error * z^T
-                    for i in range(self.m):
-                        for j in range(self.L):
-                            grad_A[i][j] += 2 * error[i] * z[j]
-                    
-                    # Gradient w.r.t. Bbasis: dL/dBbasis = (Acoeff^T @ error) * x^T
-                    Acoeff_t_error = self._mat_vec(self._transpose(self.Acoeff), error)
-                    for j in range(self.L):
-                        for i in range(self.m):
-                            grad_B[j][i] += 2 * Acoeff_t_error[j] * x[i]
-                    
-                    # Gradient w.r.t. M: dL/dM = (Bbasis^T @ Acoeff^T @ error) * current_vec^T
-                    B_t_Acoeff_t_error = self._mat_vec(
-                        self.B_t, Acoeff_t_error
-                    )
-                    for i in range(self.m):
-                        for j in range(self.m):
-                            grad_M[i][j] += 2 * B_t_Acoeff_t_error[i] * current_vec[j]
-            
-            # Average gradients
-            if total_instances > 0:
-                norm = 1 / total_instances
+                # Compute Nk = scalar * A_j
+                A_j = [self.Acoeff[i][j] for i in range(self.m)]
+                Nk = [A_j[i] * scalar for i in range(self.m)]
+                
+                # Compute loss to next window vector
+                loss_val = 0.0
+                dNk = [0.0] * self.m
                 for i in range(self.m):
-                    for j in range(self.L):
-                        grad_A[i][j] *= norm
-                for j in range(self.L):
-                    for i in range(self.m):
-                        grad_B[j][i] *= norm
+                    error = Nk[i] - next_window[i]
+                    loss_val += error * error
+                    dNk[i] = 2 * error / self.m
+                total_loss += loss_val / self.m
+                
+                # Compute gradients
                 for i in range(self.m):
-                    for j in range(self.m):
-                        grad_M[i][j] *= norm
+                    # Gradient for Acoeff
+                    grad_A[i][j] += dNk[i] * scalar
+                    
+                    # Common factor
+                    factor = dNk[i] * A_j[i]
+                    
+                    # Gradient for Bbasis
+                    for d in range(self.m):
+                        grad_B[j][d] += factor * transformed_vec[d]
+                        
+                    # Gradient for M
+                    for d in range(self.m):
+                        for e in range(self.m):
+                            grad_M[d][e] += factor * self.Bbasis[j][d] * current_window[e]
             
             # Update parameters
             for i in range(self.m):
@@ -634,144 +574,290 @@ class NumDualDescriptor:
                     self.Acoeff[i][j] -= current_lr * grad_A[i][j]
             
             for j in range(self.L):
-                for i in range(self.m):
-                    self.Bbasis[j][i] -= current_lr * grad_B[j][i]
+                for d in range(self.m):
+                    self.Bbasis[j][d] -= current_lr * grad_B[j][d]
             
-            for i in range(self.m):
-                for j in range(self.m):
-                    self.M[i][j] -= current_lr * grad_M[i][j]
+            for d in range(self.m):
+                for e in range(self.m):
+                    self.M[d][e] -= current_lr * grad_M[d][e]
             
-            # Update B_t
-            self.B_t = self._transpose(self.Bbasis)
-            
-            # Apply learning rate decay
-            current_lr *= lr_decay
-            
-            # Calculate and record loss
-            avg_loss = total_loss / total_instances if total_instances else 0
+            # Calculate average loss
+            avg_loss = total_loss / len(samples)
             history.append(avg_loss)
+            current_lr *= decay_rate
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
-                mode_str = "Autoencoder" if auto_mode == 'gap' else "Next-vector"
-                print(f"Iter {it:3d} ({mode_str}): Loss = {avg_loss:.6f} (LR: {current_lr:.6f})")
+                print(f"Iter {it:4d}: loss = {avg_loss:.6e}, lr = {current_lr:.6f}")
             
             # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it} iterations")
+            if prev_loss - avg_loss < tol:
+                print(f"Converged after {it+1} iterations")
                 break
             prev_loss = avg_loss
         
-        # Final statistics
-        self.mean_L = int(sum(len(seq) for seq in seqs) / len(seqs))
-        # Compute mean descriptor vector
+        # Finalize training
+        self.trained = True
+        self.mean_L = sum(len(seq) for seq in seqs) / len(seqs)
         self.mean_t = [0.0] * self.m
         count = 0
         for seq in seqs:
-            for Nk in self.describe(seq):
+            windows = self.extract_windows(seq)
+            for window in windows:
                 for i in range(self.m):
-                    self.mean_t[i] += Nk[i]
+                    self.mean_t[i] += window[i]
                 count += 1
-        self.mean_t = [x / count for x in self.mean_t] if count > 0 else self.mean_t
-        self.trained = True
+        if count > 0:
+            self.mean_t = [x / count for x in self.mean_t]
         
         return history
 
-    def predict_t(self, seq):
-        """
-        Predict target vector for a sequence.
-        
-        Args:
-            seq: List of m-dimensional vectors
-            
-        Returns:
-            list: Predicted target vector (m-dimensional)
-        """
-        N_list = self.describe(seq)
+    def predict_t(self, vec_seq):
+        """Predict target vector as average of all N(k) vectors"""
+        N_list = self.describe(vec_seq)
         if not N_list:
             return [0.0] * self.m
-        
-        # Average all position vectors
-        t_pred = [0.0] * self.m
+        sum_t = [0.0] * self.m
         for Nk in N_list:
-            for i in range(self.m):
-                t_pred[i] += Nk[i]
-        
-        n_pos = len(N_list)
-        return [x / n_pos for x in t_pred]
+            for d in range(self.m):
+                sum_t[d] += Nk[d]
+        N = len(N_list)
+        return [ti / N for ti in sum_t]
 
-    def generate(self, length, init_vec=None, tau=0.0):
+    def reconstruct(self, length):
         """
-        Generate a sequence of vectors.
+        Reconstruct a representative vector sequence.
         
         Args:
-            length: Number of vectors to generate
-            init_vec: Starting vector (random if None)
-            tau: Temperature (0=deterministic, >0=stochastic)
+            length (int): Desired sequence length
             
         Returns:
-            list: Generated sequence of vectors
+            list: Reconstructed vector sequence
         """
-        assert self.trained, "Model must be trained before generation"
-        if tau < 0:
-            raise ValueError("Temperature must be non-negative")
-        
-        # Initialize sequence
-        if init_vec is None:
-            init_vec = [random.gauss(0, 1) for _ in range(self.m)]
-        sequence = [init_vec]
-        current_vec = init_vec
-        
-        for _ in range(length - 1):
-            # Compute descriptor for current vector
-            x = self._mat_vec(self.M, current_vec)
-            z = self._mat_vec(self.Bbasis, x)
-            next_pred = self._mat_vec(self.Acoeff, z)
+        assert self.trained, "Model must be trained first"
+        seq = []
+        for k in range(length):
+            j = k % self.L  # Basis index
+            best_vec = [0.0] * self.m
+            min_error = float('inf')
             
-            # Apply temperature
-            if tau == 0.0:
-                next_vec = next_pred
-            else:
-                next_vec = [random.gauss(p, tau) for p in next_pred]
-            
-            sequence.append(next_vec)
-            current_vec = next_vec
+            # For simplicity, generate random candidate vectors
+            for _ in range(100):
+                candidate = [random.uniform(-1, 1) for _ in range(self.m)]
+                # Apply transformation: x' = M * candidate
+                transformed = self._mat_vec(self.M, candidate)
+                
+                # Compute scalar: B_j • transformed
+                scalar = sum(self.Bbasis[j][i] * transformed[i] for i in range(self.m))
+                
+                # Compute Nk
+                Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                
+                # Calculate error to mean target
+                error = 0.0
+                for d in range(self.m):
+                    diff = Nk[d] - self.mean_t[d]
+                    error += diff * diff
+                
+                # Track best vector
+                if error < min_error:
+                    min_error = error
+                    best_vec = candidate
+            seq.append(best_vec)
+        return seq
+
+    def generate(self, length, tau=0.0):
+        """
+        Generate a vector sequence using temperature-controlled sampling.
         
-        return sequence
+        Args:
+            length (int): Desired sequence length
+            tau (float): Temperature parameter
+            
+        Returns:
+            list: Generated vector sequence
+        """
+        assert self.trained, "Model must be trained first"
+        seq = []
+        prev_vec = [random.uniform(-1, 1) for _ in range(self.m)]  # Initial vector
+        
+        for k in range(length):
+            j = k % self.L  # Basis index
+            candidates = []
+            scores = []
+            
+            # Generate candidate next vectors
+            for _ in range(100):
+                # Simple random walk generation
+                candidate = [prev_vec[d] + random.uniform(-0.2, 0.2) for d in range(self.m)]
+                candidates.append(candidate)
+                
+                # Apply transformation: x' = M * candidate
+                transformed = self._mat_vec(self.M, candidate)
+                
+                # Compute scalar: B_j • transformed
+                scalar = sum(self.Bbasis[j][i] * transformed[i] for i in range(self.m))
+                
+                # Compute Nk
+                Nk = [self.Acoeff[i][j] * scalar for i in range(self.m)]
+                
+                # Calculate error to mean target
+                error = 0.0
+                for d in range(self.m):
+                    diff = Nk[d] - self.mean_t[d]
+                    error += diff * diff
+                scores.append(-error)  # Higher score is better
+            
+            # Select next vector
+            if tau == 0:  # Deterministic selection
+                best_idx = scores.index(max(scores))
+                next_vec = candidates[best_idx]
+            else:  # Stochastic selection
+                exp_scores = [math.exp(s / tau) for s in scores]
+                sum_exp = sum(exp_scores)
+                probs = [s / sum_exp for s in exp_scores]
+                next_vec = random.choices(candidates, weights=probs, k=1)[0]
+            
+            seq.append(next_vec)
+            prev_vec = next_vec  # Update for next iteration
+        
+        return seq
 
     # ---- feature extraction ----
-    def dd_features(self, seq):
-        """Extract features from a sequence"""
-        feats = []
+    def dd_features(self, vec_seq, t=None):
+        """
+        Extract feature vector for a vector sequence.
         
-        # Flatten Acoeff
-        for row in self.Acoeff:
-            feats.extend(row)
+        Features include:
+          'd' : Deviation value
+          'pwc': Flattened PWC coefficients
+          'cwf': Flattened transformation matrix
+          'frq': Position-weighted frequencies
+          'pdv': Partial dual variables
+          'all': Concatenated features
+        """
+        tg = t or self.predict_t(vec_seq)
+        feats = {}
         
-        # Flatten M
-        for row in self.M:
-            feats.extend(row)
+        # 1. Deviation value
+        feats['d'] = [self.deviation([vec_seq], [tg])]
         
-        # Basis-weighted features
-        vecs = self.extract_vectors(seq) 
-        weighted_sum = [0.0] * self.m
-        for j, v in enumerate(vecs):
-            # Transform vector
-            x = self._mat_vec(self.M, v)
-            for i in range(self.m):
-                weighted_sum[i] += self.Bbasis[j][i] * x[i]
+        # 2. PWC coefficients (Acoeff ⊗ Bbasis)
+        A_backup = [row[:] for row in self.Acoeff]
+        B_backup = [row[:] for row in self.Bbasis]
+        self.update_Acoeff([vec_seq], [tg])
+        self.update_Bbasis([vec_seq], [tg])
+        p_flat = []
+        for i in range(self.m):
+            for j in range(self.m):
+                for g in range(self.L):
+                    p_flat.append(self.Acoeff[i][g] * self.Bbasis[g][j])
+        feats['pwc'] = p_flat
+        self.Acoeff = A_backup
+        self.Bbasis = B_backup
         
-        feats.extend(weighted_sum)
+        # 3. Transformation matrix (flattened)
+        M_backup = [row[:] for row in self.M]
+        self.update_M([vec_seq], [tg])
+        feats['cwf'] = [item for row in self.M for item in row]
+        self.M = M_backup
+        
+        # 4. Position-weighted frequencies and partial dual variables
+        frqs = []
+        pdvs = []
+        windows = self.extract_windows(vec_seq)
+        L = len(windows)
+        for g in range(self.L):      # Basis index
+            for i in range(self.m):  # Vector dimension
+                s_frq = 0.0
+                s_pdv = 0.0
+                for k, window_vec in enumerate(windows):
+                    if (k % self.L) == g:
+                        # Apply transformation: x' = M * window_vec
+                        transformed = self._mat_vec(self.M, window_vec)
+                        basis_val = self.Bbasis[g][i]
+                        s_frq += basis_val
+                        s_pdv += basis_val * transformed[i]
+                frqs.append(s_frq / L if L > 0 else 0.0)
+                pdvs.append(s_pdv / L if L > 0 else 0.0)
+        feats['frq'] = frqs
+        feats['pdv'] = pdvs
+        
+        # 5. Concatenated features
+        feats['all'] = feats['d'] + feats['pwc'] + feats['cwf'] + feats['frq'] + feats['pdv']
         return feats
 
     # ---- show state ----
-    def show(self):
-        """Display model state"""
-        print("DualDescriptorVectorRNM status:")
-        print(f" L={self.L}, m={self.m}, mode={self.mode}")
-        print(" Sample Acoeff[0][:5]:", self.Acoeff[0][:5])
-        print(" Sample Bbasis[0][:5]:", self.Bbasis[0][:5])
-        print(" Sample M[0]:", self.M[0])
+    def show(self, what=None, first_num=5):
+        """Display model state information"""
+        if what is None:
+            what = ['params', 'stats']
+        elif isinstance(what, str):
+            what = [what]
+        
+        if 'all' in what:
+            what = ['params', 'Acoeff', 'Bbasis', 'M', 'stats']
+        
+        print("NumDualDescriptorAB Model Status:")
+        print("-" * 50)
+        
+        # 1. Configuration parameters
+        if 'params' in what:
+            print("[Configuration Parameters]")
+            print(f"  L (basis dim)    : {self.L}")
+            print(f"  m (vector dim)   : {self.m}")
+            print(f"  rank (window)    : {self.rank}")
+            print(f"  rank_mode        : {self.rank_mode}")
+            print(f"  mode (processing): {self.mode}")
+            print(f"  user_step        : {self.step}")
+            print(f"  trained          : {self.trained}")
+            print("-" * 50)
+        
+        # 2. Coefficient matrix
+        if 'Acoeff' in what:
+            print("[Coefficient Matrix Acoeff (partial)]")
+            print(f"  Shape: {len(self.Acoeff)}x{len(self.Acoeff[0])}")
+            rows = min(first_num, len(self.Acoeff))
+            cols = min(first_num, len(self.Acoeff[0]))
+            for i in range(rows):
+                row_preview = [f"{self.Acoeff[i][j]:.4f}" for j in range(cols)]
+                print(f"  Row {i}: {row_preview}" + 
+                      ("..." if len(self.Acoeff[0]) > cols else ""))
+            print("-" * 50)
+        
+        # 3. Basis matrix
+        if 'Bbasis' in what:
+            print("[Basis Matrix Bbasis (partial)]")
+            print(f"  Shape: {len(self.Bbasis)}x{len(self.Bbasis[0])}")
+            rows = min(first_num, len(self.Bbasis))
+            cols = min(first_num, len(self.Bbasis[0]))
+            for i in range(rows):
+                row_preview = [f"{self.Bbasis[i][j]:.4f}" for j in range(cols)]
+                print(f"  Row {i}: {row_preview}" + 
+                      ("..." if len(self.Bbasis[0]) > cols else ""))
+            print("-" * 50)
+        
+        # 4. Transformation matrix
+        if 'M' in what:
+            print("[Transformation Matrix M (partial)]")
+            print(f"  Shape: {len(self.M)}x{len(self.M[0])}")
+            rows = min(first_num, len(self.M))
+            cols = min(first_num, len(self.M[0]))
+            for i in range(rows):
+                row_preview = [f"{self.M[i][j]:.4f}" for j in range(cols)]
+                print(f"  Row {i}: {row_preview}" + 
+                      ("..." if len(self.M[0]) > cols else ""))
+            print("-" * 50)
+        
+        # 5. Training statistics
+        if 'stats' in what and self.trained:
+            print("[Training Statistics]")
+            print(f"  mean_L (avg seq len): {self.mean_L}")
+            if hasattr(self, 'mean_t'):
+                vec_preview = [f"{x:.4f}" for x in self.mean_t[:min(first_num, len(self.mean_t))]]
+                print(f"  mean_t (avg target): {vec_preview}" + 
+                      ("..." if len(self.mean_t) > first_num else ""))
+            print("-" * 50)
 
     def count_parameters(self):
         """
@@ -810,139 +896,162 @@ class NumDualDescriptor:
         """Load model from file"""
         with open(filename, 'rb') as f:
             state = pickle.load(f)
-        
-        # Create instance without __init__
         obj = cls.__new__(cls)
         obj.__dict__.update(state)
         print(f"Model loaded from {filename}")
         return obj
 
-
 # === Example Usage ===
 if __name__ == "__main__":
-    
-    from statistics import correlation, mean
 
-    random.seed(3)
-    # Configuration   
-    m = 30  # Vector dimension
-    L = 50  # Basis dimension
-    n_seqs = 10  # Number of training sequences
+    from statistics import correlation, mean    
+   
+    # Set random seed for reproducibility
+    #random.seed(42)
+    
+    # Configuration
+    vec_dim = 3  # Dimension of input vectors
+    seq_count = 10  # Number of training sequences
+    min_len = 100  # Minimum sequence length
+    max_len = 200  # Maximum sequence length
+    
+    # Generate training data
+    seqs = []  # List of vector sequences
+    t_list = []  # List of target vectors
+    
+    print("Generating training data...")
+    for i in range(seq_count):
+        # Random sequence length
+        length = random.randint(min_len, max_len)
+        # Generate vector sequence: list of vec_dim-dimensional vectors
+        sequence = []
+        for _ in range(length):
+            vector = [random.uniform(-1, 1) for _ in range(vec_dim)]
+            sequence.append(vector)
+        seqs.append(sequence)
+        
+        # Generate random target vector
+        target = [random.uniform(-1, 1) for _ in range(vec_dim)]
+        t_list.append(target)
+        print(f"Sequence {i+1}: length={length}, target={[round(t,2) for t in target]}")
+    
+    # Initialize model
+    print("\nInitializing NumDualDescriptorAB model...")
+    dd = NumDualDescriptorAB(
+        vec_dim=vec_dim,
+        bas_dim=150,  # Basis dimension
+        rank=1,       # Window size
+        rank_mode='drop',
+        mode='linear'
+    )
+    
+    # Train model with alternating least squares
+    print("\nTraining with ALS...")
+    als_history = dd.train(
+        seqs, 
+        t_list,
+        max_iters=50,
+        tol=1e-12,
+        print_every=1
+    )
+    dd.show(['params', 'stats'])
 
-    # generate 10 sequences of length 100–200 and random targets
-    seqs, t_list = [], []
-    for _ in range(n_seqs):
-        Length = random.randint(100, 200)
-        seq = [[random.uniform(-1,1) for _ in range(m)] for __ in range(Length)]        
-        seqs.append(seq)
-        t_list.append([random.uniform(-1,1) for _ in range(m)])
-    
-    # Create model
-    dd = NumDualDescriptor(vec_dim=m, bas_dim=L, rank=1, rank_mode='drop', rank_op='user_func', mode='nonlinear', user_step=1)
-    
-    # Train with ALS
-    print("Training with Alternating Least Squares:")
-    als_history = dd.train(seqs, t_list, max_iters=10)
-    
-    # Predict targets
-    print("\nPredictions:")
-    for i, seq in enumerate(seqs[:3]):  # First 3 sequences
-        t_pred = dd.predict_t(seq)
-        print(f"Seq {i+1}: Target={[f'{x:.4f}' for x in t_list[i]]}")
-        print(f"         Predicted={[f'{x:.4f}' for x in t_pred]}")
-    
-    # Calculate prediction correlations
-    preds = [dd.predict_t(seq) for seq in seqs]
-    correlations = []
-    for i in range(m):
-        actual = [t[i] for t in t_list]
-        predicted = [p[i] for p in preds]
-        corr = correlation(actual, predicted)
-        correlations.append(corr)
-        print(f"Dim {i} correlation: {corr:.4f}")
-    print(f"Average correlation: {mean(correlations):.4f}")
-
-    # Parameter count
-    print("\nParameter count:")
+    # Count learnable parameters
     dd.count_parameters()
     
-    # Train with Gradient Descent (with learning rate decay)
-    print("\nTraining with Gradient Descent and LR decay:")
-    dd_grad = NumDualDescriptor(vec_dim=m, bas_dim=L, rank=1, rank_mode='drop', rank_op='avg', mode='nonlinear', user_step=1)
-    grad_history = dd_grad.grad_train(
-        seqs, 
-        t_list, 
-        learning_rate=0.3,
-        max_iters=300,
-        print_every=10,
-        lr_decay=0.995  # 0.5% decay per iteration
+    # Evaluate predictions
+    print("\nEvaluating predictions...")
+    pred_t_list = [dd.predict_t(seq) for seq in seqs]
+    
+    # Calculate correlations per dimension
+    print("Prediction correlations per dimension:")
+    dim_corrs = []
+    for d in range(vec_dim):
+        actuals = [t[d] for t in t_list]
+        preds = [p[d] for p in pred_t_list]
+        corr = correlation(actuals, preds)
+        dim_corrs.append(corr)
+        print(f"  Dim {d}: correlation = {corr:.4f}")
+    
+    print(f"Average correlation: {mean(dim_corrs):.4f}")
+    
+    # Train with gradient descent
+    print("\nTraining with Gradient Descent...")
+    dd_grad = NumDualDescriptorAB(
+        vec_dim=vec_dim,
+        bas_dim=150,
+        rank=1,
+        rank_mode='drop',
+        mode='linear'
     )
-
-    # Calculate prediction correlations
-    preds = [dd_grad.predict_t(seq) for seq in seqs]
-    correlations = []
-    for i in range(m):
-        actual = [t[i] for t in t_list]
-        predicted = [p[i] for p in preds]
-        corr = correlation(actual, predicted)
-        correlations.append(corr)
-        print(f"Dim {i} correlation: {corr:.4f}")
-    print(f"Average correlation: {mean(correlations):.4f}")
-
-
-    # Create a new model for auto_train examples
-    dd_auto = NumDualDescriptor(vec_dim=m, bas_dim=L, rank=3, mode='nonlinear', user_step=2)
-
-    # Example of auto_train in 'gap' mode with learning rate decay
-    print("\nAuto-train in 'gap' mode with LR decay:")
-    gap_history = dd_auto.auto_train(
-        seqs, 
-        learning_rate=0.1,
-        max_iters=50,
-        auto_mode='gap',
-        print_every=5,
-        lr_decay=0.98  # 2% decay per iteration
+    
+    gd_history = dd_grad.grad_train(
+        seqs,
+        t_list,
+        learning_rate=0.01,
+        max_iters=100,
+        decay_rate=0.995,
+        print_every=10
     )
-    print(f"Final autoencoder loss: {gap_history[-1]:.6f}")
-
-    # Example of auto_train in 'reg' mode with learning rate decay
-    print("\nAuto-train in 'reg' mode with LR decay:")
-    reg_history = dd_auto.auto_train(
-        seqs, 
-        learning_rate=0.1,
-        max_iters=50,
+    
+    # Evaluate GD predictions
+    pred_t_list_gd = [dd_grad.predict_t(seq) for seq in seqs]
+    print("\nGD Prediction correlations per dimension:")
+    gd_corrs = []
+    for d in range(vec_dim):
+        actuals = [t[d] for t in t_list]
+        preds = [p[d] for p in pred_t_list_gd]
+        corr = correlation(actuals, preds)
+        gd_corrs.append(corr)
+        print(f"  Dim {d}: correlation = {corr:.4f}")
+    
+    print(f"GD Average correlation: {mean(gd_corrs):.4f}")
+    
+    # Self-supervised training
+    print("\nSelf-supervised training (auto-regressive)...")
+    dd_auto = NumDualDescriptorAB(
+        vec_dim=vec_dim,
+        bas_dim=100,
+        rank=1,
+        rank_mode='drop',
+        mode='linear'
+    )
+    
+    auto_history = dd_auto.auto_train(
+        seqs,
         auto_mode='reg',
-        print_every=5,
-        lr_decay=0.98  # 2% decay per iteration
+        learning_rate=0.05,
+        max_iters=100,
+        decay_rate=0.99,
+        print_every=10
     )
-    print(f"Final next-vector prediction loss: {reg_history[-1]:.6f}")
-
-    # Example of sequence generation after auto_train
-    print("\nGenerating sequence with 'reg' trained model:")
-    generated_seq = dd_auto.generate(
-        length=10,
-        init_vec=seqs[0][0],  # Start with first vector of first sequence
-        tau=0.05  # Small randomness
-    )
-    print(f"First 3 generated vectors:")
-    for i, vec in enumerate(generated_seq[:3]):
-        print(f"Vec {i+1}: {[f'{x:.4f}' for x in vec]}")
-
-    # Example of feature extraction
-    print("\nFeature extraction example:")
-    sample_seq = seqs[0][:20]  # First 20 vectors of first sequence
-    features = dd_auto.dd_features(sample_seq)
-    print(f"Extracted {len(features)} features")
-    print(f"First 5 features: {[f'{x:.6f}' for x in features[:5]]}")
-    print(f"Last 5 features: {[f'{x:.6f}' for x in features[-5:]]}")
-
-    # Example of show method
-    print("\nModel state visualization:")
-    dd_auto.show()
-
-    # Example of save/load
-    print("\nModel saving/loading example:")
-    dd_auto.save("dd_auto_model.pkl")
-    loaded_model = NumDualDescriptor.load("dd_auto_model.pkl")
-    print("Loaded model show:")
-    loaded_model.show()
+    
+    # Generate new sequence
+    print("\nGenerating new vector sequence...")
+    gen_seq = dd_auto.generate(length=20, tau=0.1)
+    print("Generated sequence (first 5 vectors):")
+    for i, vec in enumerate(gen_seq[:5]):
+        print(f"  Vec {i}: {[round(v, 3) for v in vec]}")
+    
+    # Reconstruct representative sequence
+    print("\nReconstructing representative sequence...")
+    recon_seq = dd_auto.reconstruct(length=10)
+    print("Reconstructed sequence (first 5 vectors):")
+    for i, vec in enumerate(recon_seq[:5]):
+        print(f"  Vec {i}: {[round(v, 3) for v in vec]}")
+    
+    # Feature extraction
+    print("\nExtracting features for first sequence...")
+    feats = dd_auto.dd_features(seqs[0])
+    print(f"Feature vector length: {len(feats['all'])}")
+    print(f"First 10 features: {feats['all'][:10]}")
+    
+    # Save and load model
+    print("\nTesting model persistence...")
+    dd_auto.save("vector_model.pkl")
+    dd_loaded = NumDualDescriptorAB.load("vector_model.pkl")
+    print("Loaded model prediction for first sequence:")
+    pred = dd_loaded.predict_t(seqs[0])
+    print(f"  Predicted target: {[round(p, 4) for p in pred]}")
+    
+    print("\n=== Vector Sequence Processing Demo Completed ===")
