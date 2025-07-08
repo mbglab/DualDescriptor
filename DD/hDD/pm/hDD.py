@@ -1,368 +1,442 @@
 # Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# Hierarchical Dual Descriptor class for vector sequences
-# Modified to support n-dimensional input and m-dimensional output through multiple layers
-# Author: Bin-Guang Ma; Date: 2025-6-20
+# The Numeric Dual Descriptor class (Tensor form) with hierarchical structure
+# Author: Bin-Guang Ma; Date: 2025-6-4
 
 import math
 import random
 import pickle
 from statistics import correlation, mean
 
-class HierarchicalDD:
+class NumDualDescriptorPM:
     """
-    Hierarchical Dual Descriptor for sequences of n-dimensional input vectors and m-dimensional outputs.
-    - input_dim: dimension of input vectors
-    - model_dims: list of dimensions for each layer's output
-    - num_layers: number of layers in the hierarchy
-    Model: 
-        For each vector x_k in sequence: 
-            Layer 0: N0(k) = P0 * M0 * x_k
-            Layer 1: N1(k) = P1 * M1 * N0(k)
-            ...
-            Layer L-1: N_{L-1}(k) = P_{L-1} * M_{L-1} * N_{L-2}(k)
-        S(l) = cumulative sum of N(k) from k=1 to l
+    Hierarchical Numeric Dual Descriptor for vector sequences with:
+      - Multiple layers with linear transformation M and tensor P
+      - Each layer: P ∈ R^{m×m×o} of basis coefficients, M ∈ R^{m×n}
+      - Periods: period[i,j,g] = i*(m*o) + j*o + g + 2
+      - Basis function: phi_{i,j,g}(k) = cos(2π * k / period[i,j,g])
     """
-
-    def __init__(self, input_dim=4, model_dims=[4]):
+    def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5]):
         """
-        Initialize the Hierarchical Dual Descriptor for vector sequences.
+        Initialize hierarchical NumDualDescriptorPM
         
         Args:
-            input_dim (int): Dimensionality of input vectors (n)
-            model_dims (list): List of output dimensions for each layer
+            input_dim (int): Input vector dimension
+            model_dims (list): Output dimensions for each layer
+            num_basis_list (list): Number of basis functions for each layer
         """
-        self.input_dim = input_dim  # Input vector dimension
-        self.model_dims = model_dims  # Output dimensions for each layer
-        self.num_layers = len(model_dims)  # Number of layers
+        self.input_dim = input_dim
+        self.model_dims = model_dims
+        self.num_basis_list = num_basis_list
+        self.num_layers = len(model_dims)
         self.trained = False
         
         # Initialize layers
         self.layers = []
-        for i, dim in enumerate(model_dims):
+        for l, out_dim in enumerate(model_dims):
             # Determine input dimension for this layer
-            if i == 0:
-                layer_input_dim = input_dim
+            if l == 0:
+                in_dim = input_dim
             else:
-                layer_input_dim = model_dims[i-1]
+                in_dim = model_dims[l-1]
                 
-            # Create a new layer
-            layer = {
-                'M': [[random.uniform(-0.5, 0.5) for _ in range(layer_input_dim)] 
-                      for _ in range(dim)],
-                'P': [[random.uniform(-0.1, 0.1) for _ in range(dim)] 
-                      for _ in range(dim)]
-            }
-            self.layers.append(layer)
-
-    # ---- linear algebra helpers ----
-    def mat_vec(self, M, v):
-        """Multiply matrix M (with dimensions a×b) by vector v (length b) → vector of length a."""
-        a = len(M)
-        b = len(M[0])
-        assert b == len(v), f"Matrix columns {b} != vector length {len(v)}"
-        return [sum(M[i][j] * v[j] for j in range(b)) for i in range(a)]
-
-    def mat_mul(self, A, B):
-        """Multiply p×q matrix A by q×r matrix B → p×r matrix."""
-        p, q = len(A), len(A[0])
-        r = len(B[0])
-        C = [[0.0]*r for _ in range(p)]
-        for i in range(p):
-            for k in range(q):
-                aik = A[i][k]
-                for j in range(r):
-                    C[i][j] += aik * B[k][j]
-        return C
-
-    def transpose(self, M):
-        """Transpose a matrix."""
-        return [list(col) for col in zip(*M)]
-
-    def vec_sub(self, u, v):
-        """Subtract two vectors of same length."""
-        assert len(u) == len(v), "Vector dimensions must match for subtraction"
-        return [u[i] - v[i] for i in range(len(u))]
-
-    def dot(self, u, v):
-        """Dot product of two vectors of same length."""
-        assert len(u) == len(v), "Vector dimensions must match for dot product"
-        return sum(u[i] * v[i] for i in range(len(u)))
-    
-    def describe(self, seq):
-        """
-        Compute the output of the hierarchical model for a given vector sequence.
-        
-        Args:
-            seq (list): List of n-dimensional vectors
+            # Initialize M matrix (out_dim x in_dim)
+            M = [[random.uniform(-0.5, 0.5) for _ in range(in_dim)] 
+                 for _ in range(out_dim)]
             
-        Returns:
-            list: Output from the final layer for each position
-        """
+            # Initialize P tensor (out_dim x out_dim x num_basis)
+            P = [[[random.uniform(-0.1, 0.1) for _ in range(num_basis_list[l])]
+                  for _ in range(out_dim)]
+                 for _ in range(out_dim)]
+            
+            # Precompute periods tensor
+            periods = [[[ i*(out_dim*num_basis_list[l]) + j*num_basis_list[l] + g + 2
+                         for g in range(num_basis_list[l])]
+                        for j in range(out_dim)]
+                       for i in range(out_dim)]
+            
+            self.layers.append({
+                'M': M,
+                'P': P,
+                'periods': periods
+            })
+
+    # ---- Helper functions ----
+    def _mat_vec(self, M, v):
+        """Matrix-vector multiplication"""
+        return [sum(M[i][j]*v[j] for j in range(len(v))) for i in range(len(M))]
+    
+    def _transpose(self, M):
+        """Matrix transpose"""
+        return [list(col) for col in zip(*M)]
+    
+    def _vec_sub(self, u, v):
+        """Vector subtraction"""
+        return [u_i - v_i for u_i, v_i in zip(u, v)]
+    
+    def _dot(self, u, v):
+        """Vector dot product"""
+        return sum(u_i * v_i for u_i, v_i in zip(u, v))
+
+    def describe(self, seq):
+        """Compute N(k) vectors for each position and vector in sequence"""
         current = seq
-        # Process through each layer
         for layer in self.layers:
-            output = []
-            M = layer['M']
-            P = layer['P']
-            for xk in current:
-                M_xk = self.mat_vec(M, xk)
-                Nk = self.mat_vec(P, M_xk)
-                output.append(Nk)
-            current = output
+            new_seq = []
+            for k, vec in enumerate(current):
+                # Linear transformation: x = M * vec
+                x = self._mat_vec(layer['M'], vec)
+                out_dim = len(layer['P'])
+                Nk = [0.0] * out_dim
+                
+                # Apply position-dependent transformation
+                for i in range(out_dim):
+                    for j in range(out_dim):
+                        for g in range(len(layer['P'][i][j])):
+                            period = layer['periods'][i][j][g]
+                            phi = math.cos(2 * math.pi * k / period)
+                            Nk[i] += layer['P'][i][j][g] * x[j] * phi
+                new_seq.append(Nk)
+            current = new_seq
         return current
 
     def deviation(self, seqs, t_list):
         """
-        Compute mean squared deviation D:
-        D = average over all positions and sequences of ||Final_layer_output - t_j||^2.
+        Compute mean squared deviation D across sequences:
+        D = average over all positions of (N(k)-t_seq)^2
         """
         total = 0.0
         count = 0
         for seq, t in zip(seqs, t_list):
-            # Get final layer outputs
             outputs = self.describe(seq)
             for vec in outputs:
-                # Compute error: vec - t
-                err = self.vec_sub(vec, t)
-                total += self.dot(err, err)
+                err = self._vec_sub(vec, t)
+                total += self._dot(err, err)
                 count += 1
         return total / count if count else 0.0
 
-    def grad_train(self, seqs, t_list, max_iters=100, tol=1e-8, 
-                   learning_rate=0.01, decay_rate=0.95):
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, 
+                  learning_rate=0.01, continued=False, decay_rate=1.0, 
+                  print_every=10):
         """
-        Train using gradient descent with backpropagation through layers.
+        Train using gradient descent with backpropagation through layers
         """
+        if not continued:
+            # Reinitialize with small random values
+            self.__init__(self.input_dim, self.model_dims, self.num_basis_list)
+            
         history = []
         D_prev = float('inf')
-        
-        # Initialize gradients for all layers
-        grad_P_list = []
-        grad_M_list = []
-        for layer in self.layers:
-            m = len(layer['P'])
-            grad_P_list.append([[0.0] * m for _ in range(m)])
-            
-            if self.layers.index(layer) == 0:
-                input_dim = self.input_dim
-            else:
-                input_dim = self.model_dims[self.layers.index(layer)-1]
-            grad_M_list.append([[0.0] * input_dim for _ in range(m)])
+        total_positions = sum(len(seq) for seq in seqs)
         
         for it in range(max_iters):
-            total_vectors = 0
+            # Initialize gradients for all layers
+            grad_P_list = []
+            grad_M_list = []
+            for l in range(self.num_layers):
+                out_dim = self.model_dims[l]
+                num_basis = self.num_basis_list[l]
+                
+                # Gradients for P tensor
+                grad_P = [[[0.0] * num_basis for _ in range(out_dim)] 
+                          for _ in range(out_dim)]
+                grad_P_list.append(grad_P)
+                
+                # Gradients for M matrix
+                if l == 0:
+                    in_dim = self.input_dim
+                else:
+                    in_dim = self.model_dims[l-1]
+                grad_M = [[0.0] * in_dim for _ in range(out_dim)]
+                grad_M_list.append(grad_M)
             
-            # Reset gradients
-            for i in range(self.num_layers):
-                for j in range(len(grad_P_list[i])):
-                    grad_P_list[i][j] = [0.0] * len(grad_P_list[i][j])
-                for j in range(len(grad_M_list[i])):
-                    grad_M_list[i][j] = [0.0] * len(grad_M_list[i][j])
-            
-            # Process each sequence
-            for seq, t in zip(seqs, t_list):
-                # Forward pass: store intermediate results for each layer
-                intermediates = []
+            # Forward pass: store intermediate results
+            for seq, t_vec in zip(seqs, t_list):
+                intermediates = []  # Store layer intermediates for backprop
                 current = seq
                 
-                # Process through each layer and save intermediate results
-                for layer in self.layers:
-                    M = layer['M']
-                    P = layer['P']
+                # Forward pass through layers
+                for l, layer in enumerate(self.layers):
                     layer_intermediate = []
-                    output = []
-                    for xk in current:
-                        M_xk = self.mat_vec(M, xk)
-                        Nk = self.mat_vec(P, M_xk)
-                        layer_intermediate.append((xk, M_xk))
-                        output.append(Nk)
-                    intermediates.append(layer_intermediate)
-                    current = output
-                
-                total_vectors += len(seq)
-                
-                # Backward pass: calculate gradients
-                for k in range(len(seq)):
-                    # Start with error from final layer
-                    error = [2 * (x - t_val) for x, t_val in zip(current[k], t)]
+                    next_seq = []
                     
-                    # Propagate error backward through layers
-                    for l in range(self.num_layers-1, -1, -1):
-                        x, M_x = intermediates[l][k]
-                        layer = self.layers[l]
-                        P = layer['P']
-                        M = layer['M']
+                    for k, vec in enumerate(current):
+                        # Apply linear transformation
+                        x = self._mat_vec(layer['M'], vec)
+                        out_dim = len(layer['P'])
+                        Nk = [0.0] * out_dim
+                        phi_vals = {}
                         
-                        # Compute gradient for P matrix
-                        for i in range(len(error)):
-                            for j in range(len(M_x)):
-                                grad_P_list[l][i][j] += error[i] * M_x[j]
+                        # Compute output and store basis values
+                        for i in range(out_dim):
+                            for j in range(out_dim):
+                                for g in range(len(layer['P'][i][j])):
+                                    period = layer['periods'][i][j][g]
+                                    phi = math.cos(2 * math.pi * k / period)
+                                    phi_vals[(i, j, g)] = phi
+                                    Nk[i] += layer['P'][i][j][g] * x[j] * phi
+                        
+                        layer_intermediate.append({
+                            'input_vec': vec,
+                            'x': x,
+                            'phi_vals': phi_vals,
+                            'output_vec': Nk
+                        })
+                        next_seq.append(Nk)
+                    
+                    intermediates.append(layer_intermediate)
+                    current = next_seq
+                
+                # Backward pass through layers
+                for k in range(len(seq)):
+                    # Start with last layer
+                    d_out = None
+                    for l in range(self.num_layers-1, -1, -1):
+                        layer = self.layers[l]
+                        interm = intermediates[l][k]
+                        x = interm['x']
+                        phi_vals = interm['phi_vals']
+                        input_vec = interm['input_vec']
+                        output_vec = interm['output_vec']
+                        
+                        # Initialize error for this layer
+                        if l == self.num_layers-1:
+                            # Final layer error: 2*(output - target)
+                            d_out = [2 * (output_vec[i] - t_vec[i]) 
+                                     for i in range(len(output_vec))]
+                        else:
+                            # Propagate error from next layer
+                            d_out = d_next
+                        
+                        # Compute gradient for P tensor
+                        for i in range(len(d_out)):
+                            for j in range(len(layer['P'][i])):
+                                for g in range(len(layer['P'][i][j])):
+                                    grad_P_list[l][i][j][g] += (
+                                        d_out[i] * x[j] * phi_vals[(i, j, g)]
+                                    ) / total_positions
                         
                         # Compute gradient for M matrix
-                        Pt_error = self.mat_vec(self.transpose(P), error)
-                        for i in range(len(Pt_error)):
-                            for j in range(len(x)):
-                                grad_M_list[l][i][j] += Pt_error[i] * x[j]
+                        d_x = [0.0] * len(x)
+                        for j in range(len(x)):
+                            for i in range(len(d_out)):
+                                for g in range(len(layer['P'][i][j])):
+                                    term = d_out[i] * layer['P'][i][j][g] * phi_vals[(i, j, g)]
+                                    d_x[j] += term
+                            
+                            # Propagate to M gradients
+                            for d in range(len(input_vec)):
+                                grad_M_list[l][j][d] += d_x[j] * input_vec[d] / total_positions
                         
                         # Propagate error to previous layer
                         if l > 0:
-                            Mt_error = self.mat_vec(self.transpose(M), Pt_error)
-                            error = Mt_error
+                            # d_input = M^T * d_x
+                            M_T = self._transpose(layer['M'])
+                            d_next = self._mat_vec(M_T, d_x)
                         else:
-                            error = None
+                            d_next = None
             
-            # Apply updates to all layers
-            if total_vectors > 0:
-                lr = learning_rate / total_vectors
-                for l in range(self.num_layers):
-                    P = self.layers[l]['P']
-                    M = self.layers[l]['M']
-                    for i in range(len(P)):
-                        for j in range(len(P[i])):
-                            P[i][j] -= lr * grad_P_list[l][i][j]
-                    for i in range(len(M)):
-                        for j in range(len(M[i])):
-                            M[i][j] -= lr * grad_M_list[l][i][j]
+            # Update parameters
+            for l in range(self.num_layers):
+                layer = self.layers[l]
+                # Update P tensor
+                for i in range(len(layer['P'])):
+                    for j in range(len(layer['P'][i])):
+                        for g in range(len(layer['P'][i][j])):
+                            layer['P'][i][j][g] -= learning_rate * grad_P_list[l][i][j][g]
+                
+                # Update M matrix
+                for i in range(len(layer['M'])):
+                    for j in range(len(layer['M'][i])):
+                        layer['M'][i][j] -= learning_rate * grad_M_list[l][i][j]
             
-            # Compute current deviation
-            D = self.deviation(seqs, t_list)
-            history.append(D)
-            print(f"Iter {it:3d}: D = {D:.6e}, lr = {learning_rate:.6f}")
+            # Calculate current loss
+            current_D = self.deviation(seqs, t_list)
+            history.append(current_D)
+            
+            # Print progress
+            if it % print_every == 0 or it == max_iters - 1:
+                print(f"GD Iter {it:3d}: D = {current_D:.6e}, LR = {learning_rate:.6f}")
             
             # Check convergence
-            if abs(D - D_prev) < tol:
-                print("Converged.")
+            if current_D >= D_prev - tol:
+                print(f"Converged after {it+1} iterations.")
                 break
-            D_prev = D
+            D_prev = current_D
             
-            # Update learning rate
+            # Apply learning rate decay
             learning_rate *= decay_rate
         
-        # Calculate statistics
-        total_vectors = sum(len(seq) for seq in seqs)
-        total_t = [0.0] * self.model_dims[-1]
-        for t in t_list:
-            for d in range(self.model_dims[-1]):
-                total_t[d] += t[d]
-        self.mean_vector_count = total_vectors / len(seqs)
-        self.mean_t = [t_val / len(seqs) for t_val in total_t]
         self.trained = True
         return history
 
     def predict_t(self, seq):
         """
-        Predict target vector t for a sequence.
-        Optimal t is the mean of all final layer outputs.
-        Returns m-dimensional vector.
+        Predict target vector for a sequence
+        Returns the average of all N(k) vectors in the sequence
         """
         outputs = self.describe(seq)
         if not outputs:
             return [0.0] * self.model_dims[-1]
-            
+        
+        # Average all output vectors
         t_pred = [0.0] * self.model_dims[-1]
         for vec in outputs:
             for i in range(len(vec)):
                 t_pred[i] += vec[i]
         return [x / len(outputs) for x in t_pred]
 
-    def show(self):
-        """Display model status."""
-        print("HierarchicalDD Status:")
-        print(f"  Input dimension (n) = {self.input_dim}")
-        print(f"  Number of layers = {self.num_layers}")
-        print(f"  Layer dimensions = {self.model_dims}")
+    def show(self, what=None, first_num=5):
+        """
+        Display model status with hierarchical support
+        """
+        # Default attributes to show
+        default_attrs = ['config', 'M', 'P', 'periods']
         
-        for i, layer in enumerate(self.layers):
-            print(f"\n  Layer {i}:")
-            print(f"    Input dim: {self.input_dim if i==0 else self.model_dims[i-1]}")
-            print(f"    Output dim: {self.model_dims[i]}")
-            print("    M matrix:")
-            for row in layer['M']:
-                print("      ", [f"{x:.4f}" for x in row])
-            print("    P matrix:")
-            for row in layer['P']:
-                print("      ", [f"{x:.4f}" for x in row])
+        # Handle different what parameter types
+        if what is None:
+            attrs = default_attrs
+        elif what == 'all':
+            attrs = default_attrs
+        elif isinstance(what, str):
+            attrs = [what]
+        else:
+            attrs = what
+            
+        print("Hierarchical NumDualDescriptorPM Status")
+        print("=" * 50)
+        
+        # Display each requested attribute
+        for attr in attrs:
+            if attr == 'config':
+                print("\n[Configuration]")
+                print(f"{'Input dim:':<20} {self.input_dim}")
+                print(f"{'Layer dims:':<20} {self.model_dims}")
+                print(f"{'Num basis:':<20} {self.num_basis_list}")
+                print(f"{'Trained:':<20} {self.trained}")
+            
+            elif attr in ['M', 'P', 'periods']:
+                print(f"\n[{attr.upper()} Matrices/Tensors]")
+                for l in range(self.num_layers):
+                    print(f"  Layer {l}:")
+                    if attr == 'M':
+                        M = self.layers[l]['M']
+                        print(f"    Shape: {len(M)}x{len(M[0])}")
+                        print("    Sample values:")
+                        for i in range(min(first_num, len(M))):
+                            vals = M[i][:min(first_num, len(M[i]))]
+                            print(f"      Row {i}: [{', '.join(f'{x:.4f}' for x in vals)}" + 
+                                  (f", ...]" if len(M[i]) > first_num else "]"))
+                    
+                    elif attr in ['P', 'periods']:
+                        tensor = self.layers[l][attr]
+                        print(f"    Shape: {len(tensor)}x{len(tensor[0])}x{len(tensor[0][0])}")
+                        print("    Sample slices:")
+                        for i in range(min(first_num, len(tensor))):
+                            for j in range(min(first_num, len(tensor[i]))):
+                                vals = tensor[i][j][:min(first_num, len(tensor[i][j]))]
+                                if attr == 'P':
+                                    formatted = [f"{v:.6f}" for v in vals]
+                                else:
+                                    formatted = [str(int(v)) for v in vals]
+                                print(f"      {attr}[{i}][{j}][:]: [{', '.join(formatted)}" + 
+                                      (f", ...]" if len(tensor[i][j]) > first_num else "]"))
+            
+            else:
+                print(f"\n[Unknown attribute: {attr}]")
+        
+        print("=" * 50)
 
     def count_parameters(self):
-        """Count learnable parameters (M and P matrices for all layers)."""
+        """Count learnable parameters (P tensors and M matrices for all layers)"""
         total_params = 0
         print("Parameter Count:")
         
-        for i, layer in enumerate(self.layers):
-            M = layer['M']
-            P = layer['P']
+        for l in range(self.num_layers):
+            M = self.layers[l]['M']
+            P = self.layers[l]['P']
             M_params = len(M) * len(M[0])
-            P_params = len(P) * len(P[0])
+            P_params = len(P) * len(P[0]) * len(P[0][0])
             layer_params = M_params + P_params
             total_params += layer_params
             
-            print(f"  Layer {i}:")
+            print(f"  Layer {l}:")
             print(f"    M matrix: {len(M)}×{len(M[0])} = {M_params} parameters")
-            print(f"    P matrix: {len(P)}×{len(P[0])} = {P_params} parameters")
+            print(f"    P tensor: {len(P)}×{len(P[0])}×{len(P[0][0])} = {P_params} parameters")
             print(f"    Layer total: {layer_params}")
         
         print(f"Total parameters: {total_params}")
         return total_params
 
     def save(self, filename):
-        """Save model state to file."""
+        """Save model state to file"""
         with open(filename, 'wb') as f:
             pickle.dump(self.__dict__, f)
         print(f"Model saved to {filename}")
 
     @classmethod
     def load(cls, filename):
-        """Load model state from file."""
+        """Load model state from file"""
         with open(filename, 'rb') as f:
             state = pickle.load(f)
-        # Create instance without calling __init__
+        
+        # Create new instance without calling __init__
         obj = cls.__new__(cls)
+        # Restore saved state
         obj.__dict__.update(state)
         print(f"Model loaded from {filename}")
         return obj
 
 
 # === Example Usage ===
-if __name__ == "__main__":
-    random.seed(12)
+if __name__=="__main__":
+    #random.seed(3)
     
-    # Configuration with hierarchical dimensions
-    input_dim = 20      # Input vector dimension (n)
-    model_dims = [15, 10, 5]  # Output dimensions for each layer
+    # Hierarchical configuration
+    input_dim = 10      # Input vector dimension
+    model_dims = [8, 6, 3]  # Output dimensions for each layer
+    num_basis_list = [5, 4, 3]  # Basis functions per layer
     num_seqs = 10
     min_len, max_len = 100, 200
 
     # Generate synthetic training data
-    seqs = []
-    t_list = []
+    seqs = []     # List of sequences (each sequence: list of n-dim vectors)
+    t_list = []   # List of target vectors (m-dim)
+    
     for _ in range(num_seqs):
         L = random.randint(min_len, max_len)
-        # Generate n-dimensional vectors
+        # Generate n-dimensional input sequence
         seq = [[random.uniform(-1,1) for _ in range(input_dim)] for __ in range(L)]
         seqs.append(seq)
-        # Generate target vectors with dimension matching final layer
+        # Generate m-dimensional target vector
         t_list.append([random.uniform(-1,1) for _ in range(model_dims[-1])])
+
+    # Create and train hierarchical model
+    print("\nTraining Hierarchical NumDualDescriptorPM...")
+    hndd = NumDualDescriptorPM(
+        input_dim=input_dim,
+        model_dims=model_dims,
+        num_basis_list=num_basis_list
+    )
     
-    # Train with Gradient Descent
-    print("\nTraining HierarchicalDD with Gradient Descent:")
-    hdd = HierarchicalDD(input_dim=input_dim, model_dims=model_dims)
-    grad_history = hdd.grad_train(
+    # Gradient Descent Training
+    grad_history = hndd.grad_train(
         seqs, 
         t_list, 
-        learning_rate=10.3,
         max_iters=50,
-        decay_rate=0.98
+        learning_rate=5.0,
+        decay_rate=0.9999,
+        print_every=5
     )
 
     # Predict targets
     print("\nPredictions (first 3 sequences):")
     for i, seq in enumerate(seqs[:3]):
-        t_pred = hdd.predict_t(seq)
+        t_pred = hndd.predict_t(seq)
         print(f"Seq {i+1}: Target={[f'{x:.4f}' for x in t_list[i]]}")
         print(f"         Predicted={[f'{x:.4f}' for x in t_pred]}")
-    
+
     # Calculate prediction correlations
-    preds = [hdd.predict_t(seq) for seq in seqs]
+    preds = [hndd.predict_t(seq) for seq in seqs]
     correlations = []
     for i in range(model_dims[-1]):
         actual = [t[i] for t in t_list]
@@ -372,17 +446,19 @@ if __name__ == "__main__":
         print(f"Output dim {i} correlation: {corr:.4f}")
     print(f"Average correlation: {mean(correlations):.4f}")
 
-##    # Show model structure
-##    print("\nModel structure:")
-##    hdd.show()
+    # Show model status
+    print("\nModel status:")
+    hndd.show(['config', 'M'])
 
-    # Parameter count
+    # Count learnable parameters
     print("\nParameter count:")
-    hdd.count_parameters()
+    hndd.count_parameters()
 
     # Save and load model
     print("\nTesting save/load functionality:")
-    hdd.save("hierarchical_model.pkl")
-    loaded = HierarchicalDD.load("hierarchical_model.pkl")
-    print("Loaded model prediction on first sequence:")
-    print([f"{x:.4f}" for x in loaded.predict_t(seqs[0])])
+    hndd.save("hierarchical_ndd_model.pkl")
+    loaded = NumDualDescriptorPM.load("hierarchical_ndd_model.pkl")
+    
+    # Verify loaded model
+    t_pred_loaded = loaded.predict_t(seqs[0])
+    print(f"Prediction from loaded model: {[f'{x:.4f}' for x in t_pred_loaded]}")
