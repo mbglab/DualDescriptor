@@ -5,9 +5,8 @@
 import math
 import random
 import pickle
-from statistics import correlation, mean
 
-class NumDualDescriptorPM:
+class HierDDpm:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
@@ -17,7 +16,7 @@ class NumDualDescriptorPM:
     """
     def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5]):
         """
-        Initialize hierarchical NumDualDescriptorPM
+        Initialize hierarchical HierDDpm
         
         Args:
             input_dim (int): Input vector dimension
@@ -302,7 +301,7 @@ class NumDualDescriptorPM:
         else:
             attrs = what
             
-        print("Hierarchical NumDualDescriptorPM Status")
+        print("Hierarchical HierDDpm Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -389,6 +388,9 @@ class NumDualDescriptorPM:
 
 # === Example Usage ===
 if __name__=="__main__":
+
+    from statistics import correlation, mean
+    
     #random.seed(3)
     
     # Hierarchical configuration
@@ -411,8 +413,8 @@ if __name__=="__main__":
         t_list.append([random.uniform(-1,1) for _ in range(model_dims[-1])])
 
     # Create and train hierarchical model
-    print("\nTraining Hierarchical NumDualDescriptorPM...")
-    hndd = NumDualDescriptorPM(
+    print("\nTraining Hierarchical HierDDpm...")
+    hndd = HierDDpm(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list
@@ -457,7 +459,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nTesting save/load functionality:")
     hndd.save("hierarchical_ndd_model.pkl")
-    loaded = NumDualDescriptorPM.load("hierarchical_ndd_model.pkl")
+    loaded = HierDDpm.load("hierarchical_ndd_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = loaded.predict_t(seqs[0])

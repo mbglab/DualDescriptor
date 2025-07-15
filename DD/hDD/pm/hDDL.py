@@ -7,9 +7,8 @@
 import math
 import random
 import pickle
-from statistics import correlation, mean
 
-class NumDualDescriptorPM:
+class HierDDLpm:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
@@ -24,7 +23,7 @@ class NumDualDescriptorPM:
     def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5],
                  input_seq_len=100, linker_dims=[50], linker_trainable=False):
         """
-        Initialize hierarchical NumDualDescriptorPM with sequence length transformation
+        Initialize hierarchical HierDDLpm with sequence length transformation
         
         Args:
             input_dim (int): Input vector dimension
@@ -533,7 +532,7 @@ class NumDualDescriptorPM:
         else:
             attrs = what
             
-        print("Hierarchical NumDualDescriptorPM Status")
+        print("Hierarchical HierDDLpm Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -647,6 +646,9 @@ class NumDualDescriptorPM:
 
 # === Example Usage ===
 if __name__=="__main__":
+
+    from statistics import correlation, mean
+    
     #random.seed(3)
     
     # Hierarchical configuration
@@ -672,7 +674,7 @@ if __name__=="__main__":
 
     # Test Case 1: All Linker matrices trainable
     print("\n=== Test Case 1: All Linker Matrices Trainable ===")
-    hndd_trainable = NumDualDescriptorPM(
+    hndd_trainable = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -716,7 +718,7 @@ if __name__=="__main__":
     
     # Test Case 2: Mixed trainability (first layer trainable, others not)
     print("\n\n=== Test Case 2: Mixed Linker Trainability ===")
-    hndd_mixed = NumDualDescriptorPM(
+    hndd_mixed = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -752,7 +754,7 @@ if __name__=="__main__":
     
     # Test Case 3: No Linker matrices trainable
     print("\n\n=== Test Case 3: No Linker Matrices Trainable ===")
-    hndd_fixed = NumDualDescriptorPM(
+    hndd_fixed = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -789,7 +791,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nTesting save/load functionality:")
     hndd_trainable.save("hierarchical_ndd_model.pkl")
-    loaded = NumDualDescriptorPM.load("hierarchical_ndd_model.pkl")
+    loaded = HierDDLpm.load("hierarchical_ndd_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = loaded.predict_t(seqs[0])
