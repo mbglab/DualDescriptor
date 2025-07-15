@@ -6,14 +6,13 @@
 import math
 import random
 import pickle
-from statistics import correlation, mean
 
-class NumDualDescriptorAB:
+class HierDDLab:
     """
-    Hierarchical Numeric Dual Descriptor for vector sequences with:
+    Hierarchical Numeric Dual Descriptor with Linker for vector sequences with:
       - input_dim: dimension of input vectors
       - model_dims: list of output dimensions for each layer
-      - bas_dims: list of basis dimensions for each layer
+      - basis_dims: list of basis dimensions for each layer
       - linker_dims: list of output sequence lengths for each layer
       - linker_trainable: controls whether Linker matrices are trainable
     Each layer contains:
@@ -22,7 +21,7 @@ class NumDualDescriptorAB:
       - Matrix Bbasis ∈ R^{L_i×m_i} of basis functions
       - Linker matrix for sequence length transformation
     """
-    def __init__(self, input_dim=4, model_dims=[4], bas_dims=[50], 
+    def __init__(self, input_dim=4, model_dims=[4], basis_dims=[50], 
                  linker_dims=[50], input_seq_len=100, linker_trainable=False):
         """
         Initialize the hierarchical Dual Descriptor with Linker matrices.
@@ -30,22 +29,22 @@ class NumDualDescriptorAB:
         Args:
             input_dim (int): Input vector dimension
             model_dims (list): List of output dimensions for each layer
-            bas_dims (list): List of basis dimensions for each layer
+            basis_dims (list): List of basis dimensions for each layer
             linker_dims (list): List of output sequence lengths for each layer
             input_seq_len (int): Fixed input sequence length
             linker_trainable (bool|list): Controls if Linker matrices are trainable
         """
         self.input_dim = input_dim
         self.model_dims = model_dims
-        self.bas_dims = bas_dims
+        self.basis_dims = basis_dims
         self.linker_dims = linker_dims
         self.input_seq_len = input_seq_len
         self.num_layers = len(model_dims)
         self.trained = False
         
         # Validate dimensions
-        if len(bas_dims) != self.num_layers:
-            raise ValueError("bas_dims length must match model_dims length")
+        if len(basis_dims) != self.num_layers:
+            raise ValueError("basis_dims length must match model_dims length")
         if len(linker_dims) != self.num_layers:
             raise ValueError("linker_dims length must match model_dims length")
         
@@ -71,7 +70,7 @@ class NumDualDescriptorAB:
                 in_dim = model_dims[i-1]
                 in_seq = linker_dims[i-1]
                 
-            L_i = bas_dims[i]  # Basis dimension for this layer
+            L_i = basis_dims[i]  # Basis dimension for this layer
             out_seq = linker_dims[i]  # Output sequence length for this layer
             
             # Initialize transformation matrix M (out_dim × in_dim)
@@ -210,7 +209,7 @@ class NumDualDescriptorAB:
         """
         if not continued:
             # Reinitialize parameters
-            self.__init__(self.input_dim, self.model_dims, self.bas_dims,
+            self.__init__(self.input_dim, self.model_dims, self.basis_dims,
                           self.linker_dims, self.input_seq_len, self.linker_trainable)
         
         total_sequences = len(seqs)
@@ -628,7 +627,7 @@ class NumDualDescriptorAB:
         elif isinstance(what, str):
             what = ['params', 'stats'] if what == 'all' else [what]
         
-        print("Hierarchical NumDualDescriptorAB with Linker Matrices - Model Status:")
+        print("Hierarchical HierDDLab with Linker Matrices - Model Status:")
         print("=" * 70)
         
         # Configuration parameters
@@ -637,7 +636,7 @@ class NumDualDescriptorAB:
             print(f"  Input dim        : {self.input_dim}")
             print(f"  Input seq len    : {self.input_seq_len}")
             print(f"  Layer dims       : {self.model_dims}")
-            print(f"  Basis dims       : {self.bas_dims}")
+            print(f"  Basis dims       : {self.basis_dims}")
             print(f"  Linker dims      : {self.linker_dims}")
             print(f"  Linker trainable : {self.linker_trainable}")
             print(f"  Number of layers : {self.num_layers}")
@@ -651,7 +650,7 @@ class NumDualDescriptorAB:
                 in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
                 in_seq = self.input_seq_len if l_idx == 0 else self.linker_dims[l_idx-1]
                 out_dim = self.model_dims[l_idx]
-                L_i = self.bas_dims[l_idx]
+                L_i = self.basis_dims[l_idx]
                 out_seq = self.linker_dims[l_idx]
                 
                 # Show M matrix sample
@@ -705,7 +704,7 @@ class NumDualDescriptorAB:
             in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
             in_seq = self.input_seq_len if l_idx == 0 else self.linker_dims[l_idx-1]
             out_dim = self.model_dims[l_idx]
-            L_i = self.bas_dims[l_idx]
+            L_i = self.basis_dims[l_idx]
             out_seq = self.linker_dims[l_idx]
             
             m_params = len(M) * len(M[0])
@@ -750,6 +749,9 @@ class NumDualDescriptorAB:
 
 # === Example Usage ===
 if __name__ == "__main__":
+
+    from statistics import correlation, mean
+    
     # Set random seed for reproducibility
     #random.seed(42)
     
@@ -757,14 +759,14 @@ if __name__ == "__main__":
     input_dim = 9        # Input vector dimension
     input_seq_len = 100   # Fixed input sequence length
     model_dims = [6, 3]   # Output dimensions for each layer
-    bas_dims = [100, 50]   # Basis dimensions for each layer
+    basis_dims = [100, 50]   # Basis dimensions for each layer
     linker_dims = [50, 20]  # Output sequence lengths for each layer
     seq_count = 30        # Number of training sequences
     
     # Generate training data with fixed sequence length
     print("Generating training data with fixed sequence length...")
     print(f"Input dimension: {input_dim}, Input seq length: {input_seq_len}")
-    print(f"Layer dims: {model_dims}, Basis dims: {bas_dims}, Linker dims: {linker_dims}")
+    print(f"Layer dims: {model_dims}, Basis dims: {basis_dims}, Linker dims: {linker_dims}")
     
     seqs = []  # List of sequences
     t_list = []  # List of target vectors (dimension = last layer output)
@@ -783,10 +785,10 @@ if __name__ == "__main__":
     
     # Create models with different Linker trainability settings
     print("\n=== Test Case 1: All Linker Matrices Trainable ===")
-    hdd_trainable = NumDualDescriptorAB(
+    hdd_trainable = HierDDLab(
         input_dim=input_dim,
         model_dims=model_dims,
-        bas_dims=bas_dims,
+        basis_dims=basis_dims,
         linker_dims=linker_dims,
         input_seq_len=input_seq_len,
         linker_trainable=True  # All Linker matrices trainable
@@ -824,10 +826,10 @@ if __name__ == "__main__":
     
     # Test Case 2: Mixed Linker trainability
     print("\n\n=== Test Case 2: Mixed Linker Trainability ===")
-    hdd_mixed = NumDualDescriptorAB(
+    hdd_mixed = HierDDLab(
         input_dim=input_dim,
         model_dims=model_dims,
-        bas_dims=bas_dims,
+        basis_dims=basis_dims,
         linker_dims=linker_dims,
         input_seq_len=input_seq_len,
         linker_trainable=[True, False]  # First layer trainable, second not
@@ -859,10 +861,10 @@ if __name__ == "__main__":
     
     # Test Case 3: No Linker matrices trainable
     print("\n\n=== Test Case 3: No Linker Matrices Trainable ===")
-    hdd_fixed = NumDualDescriptorAB(
+    hdd_fixed = HierDDLab(
         input_dim=input_dim,
         model_dims=model_dims,
-        bas_dims=bas_dims,
+        basis_dims=basis_dims,
         linker_dims=linker_dims,
         input_seq_len=input_seq_len,
         linker_trainable=False  # No Linker matrices trainable
@@ -895,7 +897,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     hdd_trainable.save("hierarchical_vector_model_linker.pkl")
-    loaded = NumDualDescriptorAB.load("hierarchical_vector_model_linker.pkl")
+    loaded = HierDDLab.load("hierarchical_vector_model_linker.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")

@@ -6,37 +6,36 @@
 import math
 import random
 import pickle
-from statistics import correlation, mean
 
-class NumDualDescriptorAB:
+class HierDDab:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - input_dim: dimension of input vectors
       - model_dims: list of output dimensions for each layer
-      - bas_dims: list of basis dimensions for each layer
+      - basis_dims: list of basis dimensions for each layer
     Each layer contains:
       - Matrix M ∈ R^{m_i×m_{i-1}} for linear transformation
       - Matrix Acoeff ∈ R^{m_i×L_i} of coefficients
       - Matrix Bbasis ∈ R^{L_i×m_i} of basis functions
     """
-    def __init__(self, input_dim=4, model_dims=[4], bas_dims=[50]):
+    def __init__(self, input_dim=4, model_dims=[4], basis_dims=[50]):
         """
         Initialize the hierarchical Dual Descriptor.
         
         Args:
             input_dim (int): Input vector dimension
             model_dims (list): List of output dimensions for each layer
-            bas_dims (list): List of basis dimensions for each layer
+            basis_dims (list): List of basis dimensions for each layer
         """
         self.input_dim = input_dim
         self.model_dims = model_dims
-        self.bas_dims = bas_dims
+        self.basis_dims = basis_dims
         self.num_layers = len(model_dims)
         self.trained = False
         
         # Validate dimensions
-        if len(bas_dims) != self.num_layers:
-            raise ValueError("bas_dims length must match model_dims length")
+        if len(basis_dims) != self.num_layers:
+            raise ValueError("basis_dims length must match model_dims length")
         
         self.layers = []
         
@@ -48,7 +47,7 @@ class NumDualDescriptorAB:
             else:
                 in_dim = model_dims[i-1]
                 
-            L_i = bas_dims[i]  # Basis dimension for this layer
+            L_i = basis_dims[i]  # Basis dimension for this layer
             
             # Initialize transformation matrix M (out_dim × in_dim)
             M = [[random.uniform(-0.1, 0.1) for _ in range(in_dim)]
@@ -165,12 +164,11 @@ class NumDualDescriptorAB:
             decay_rate: Learning rate decay factor
             print_every: Print progress every N iterations
             epsilon: Small constant for numerical stability in normalization
-        """
-        import math  # Required for normalization calculations
+        """        
         
         if not continued:
             # Reinitialize parameters
-            self.__init__(self.input_dim, self.model_dims, self.bas_dims)
+            self.__init__(self.input_dim, self.model_dims, self.basis_dims)
         
         total_positions = sum(len(seq) for seq in seqs)
         if total_positions == 0:
@@ -442,7 +440,7 @@ class NumDualDescriptorAB:
         elif isinstance(what, str):
             what = ['params', 'stats'] if what == 'all' else [what]
         
-        print("Hierarchical NumDualDescriptorAB Model Status:")
+        print("Hierarchical HierDDab Model Status:")
         print("=" * 50)
         
         # Configuration parameters
@@ -450,7 +448,7 @@ class NumDualDescriptorAB:
             print("[Configuration Parameters]")
             print(f"  Input dim       : {self.input_dim}")
             print(f"  Layer dims      : {self.model_dims}")
-            print(f"  Basis dims      : {self.bas_dims}")
+            print(f"  Basis dims      : {self.basis_dims}")
             print(f"  Number of layers: {self.num_layers}")
             print(f"  Trained         : {self.trained}")
             print("=" * 50)
@@ -461,7 +459,7 @@ class NumDualDescriptorAB:
                 print(f"\nLayer {l_idx}:")
                 in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
                 out_dim = self.model_dims[l_idx]
-                L_i = self.bas_dims[l_idx]
+                L_i = self.basis_dims[l_idx]
                 
                 # Show M matrix sample
                 M = layer['M']
@@ -503,7 +501,7 @@ class NumDualDescriptorAB:
             
             in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
             out_dim = self.model_dims[l_idx]
-            L_i = self.bas_dims[l_idx]
+            L_i = self.basis_dims[l_idx]
             
             m_params = len(M) * len(M[0])
             a_params = len(Acoeff) * len(Acoeff[0])
@@ -538,20 +536,23 @@ class NumDualDescriptorAB:
 
 # === Example Usage ===
 if __name__ == "__main__":
+
+    from statistics import correlation, mean
+    
     # Set random seed for reproducibility
     #random.seed(222)
     
     # Hierarchical configuration
     input_dim = 10     # Input vector dimension
     model_dims = [5, 2]  # Output dimensions for each layer
-    bas_dims = [150, 150]   # Basis dimensions for each layer
+    basis_dims = [150, 150]   # Basis dimensions for each layer
     seq_count = 10    # Number of training sequences
     min_len = 100     # Minimum sequence length
     max_len = 200     # Maximum sequence length
     
     # Generate training data
     print("Generating training data...")
-    print(f"Input dimension: {input_dim}, Layer dims: {model_dims}, Basis dims: {bas_dims}")
+    print(f"Input dimension: {input_dim}, Layer dims: {model_dims}, Basis dims: {basis_dims}")
     seqs = []  # List of sequences
     t_list = []  # List of target vectors (dimension = last layer output)
     
@@ -571,11 +572,11 @@ if __name__ == "__main__":
         print(f"Sequence {i+1}: length={length}, target={[round(t,2) for t in target]}")
     
     # Create and train the hierarchical model
-    print("\nCreating Hierarchical NumDualDescriptorAB...")
-    hdd = NumDualDescriptorAB(
+    print("\nCreating Hierarchical HierDDab...")
+    hdd = HierDDab(
         input_dim=input_dim,
         model_dims=model_dims,
-        bas_dims=bas_dims
+        basis_dims=basis_dims
     )
     
     # Show initial model structure
@@ -591,7 +592,7 @@ if __name__ == "__main__":
         learning_rate=0.02,
         max_iters=300,
         tol=1e-88,
-        decay_rate=0.95,
+        decay_rate=0.98,
         print_every=10
     )
     
@@ -616,7 +617,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     hdd.save("hierarchical_vector_model.pkl")
-    loaded = NumDualDescriptorAB.load("hierarchical_vector_model.pkl")
+    loaded = HierDDab.load("hierarchical_vector_model.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
