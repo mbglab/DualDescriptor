@@ -73,6 +73,9 @@ class HierLayer(nn.Module):
         
         # Linear transformation: x' = x @ M^T
         x_trans = torch.matmul(x, self.M.t())  # (batch_size, seq_len, out_dim)
+
+        # Layer normalization
+        x_trans = self.norm(x_trans)
         
         # Prepare position-dependent transformation
         # Expand tensors for broadcasting: positions (seq_len, 1, 1, 1)
@@ -96,10 +99,7 @@ class HierLayer(nn.Module):
         
         # Sum over j (input dim) and g (basis index)
         Nk = torch.sum(product, dim=(3, 4))  # (batch_size, seq_len, out_dim)
-
-        # Layer normalization
-        Nk = self.norm(Nk)
-        
+       
         # Residual connection processing 
         if self.use_residual == 'separate':
             residual = self.residual_proj(x)
@@ -313,16 +313,16 @@ if __name__ == "__main__":
     from scipy.stats import pearsonr
     
     # Set random seeds for reproducibility
-    torch.manual_seed(1)
-    random.seed(1)
-    np.random.seed(1)
+    torch.manual_seed(0)
+    random.seed(0)
+    np.random.seed(0)
     
     # Configuration
     input_dim = 10          # Input vector dimension
     model_dims = [8, 6, 3]  # Output dimensions for each layer
     num_basis_list = [5, 4, 3]  # Basis functions per layer
     use_residual_list = ['separate'] * 3 
-    num_seqs = 300          # Number of training sequences
+    num_seqs = 100          # Number of training sequences
     min_len, max_len = 100, 200  # Sequence length range
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
