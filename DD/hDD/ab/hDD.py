@@ -1,7 +1,8 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Hierarchical Numeric Dual Descriptor class (Random AB matrix form) for Vector Sequences
+# The Hierarchical Numeric Dual Descriptor class (Fixed Bbasis matrix form) for Vector Sequences
 # Modified to support hierarchical structure with multiple layers
 # Author: Bin-Guang Ma; Date: 2025-7-7
+# Bbasis matrix now follows fixed cosine pattern: Bbasis[k][i] = cos(2π*(k+1)/(i+1))
 
 import math
 import random
@@ -15,8 +16,8 @@ class HierDDab:
       - basis_dims: list of basis dimensions for each layer
     Each layer contains:
       - Matrix M ∈ R^{m_i×m_{i-1}} for linear transformation
-      - Matrix Acoeff ∈ R^{m_i×L_i} of coefficients
-      - Matrix Bbasis ∈ R^{L_i×m_i} of basis functions
+      - Matrix Acoeff ∈ R^{m_i×L_i} of coefficients (learnable)
+      - Matrix Bbasis ∈ R^{L_i×m_i} of fixed basis functions
     """
     def __init__(self, input_dim=4, model_dims=[4], basis_dims=[50]):
         """
@@ -53,18 +54,24 @@ class HierDDab:
             M = [[random.uniform(-0.1, 0.1) for _ in range(in_dim)]
                  for _ in range(out_dim)]
             
-            # Initialize coefficient matrix Acoeff (out_dim × L_i)
+            # Initialize coefficient matrix Acoeff (out_dim × L_i) - learnable
             Acoeff = [[random.uniform(-0.1, 0.1) for _ in range(L_i)]
                        for _ in range(out_dim)]
             
-            # Initialize basis matrix Bbasis (L_i × out_dim)
-            Bbasis = [[random.uniform(-0.1, 0.1) for _ in range(out_dim)]
-                       for _ in range(L_i)]
+            # Initialize FIXED basis matrix Bbasis (L_i × out_dim) using cosine formula
+            # Bbasis[k][i] = cos(2π*(k+1)/(i+1))
+            Bbasis = [[0.0] * out_dim for _ in range(L_i)]
+            for k in range(L_i):
+                for d in range(out_dim):
+                    # Calculate fixed cosine value for basis element
+                    # k+1 and d+1 to avoid division by zero
+                    value = math.cos(2 * math.pi * (k+1) / (d+1))
+                    Bbasis[k][d] = value
             
             self.layers.append({
                 'M': M,
                 'Acoeff': Acoeff,
-                'Bbasis': Bbasis
+                'Bbasis': Bbasis  # Fixed basis matrix
             })
 
     # ---- linear algebra helpers ----
@@ -104,7 +111,7 @@ class HierDDab:
         for layer in self.layers:
             M = layer['M']
             Acoeff = layer['Acoeff']
-            Bbasis = layer['Bbasis']
+            Bbasis = layer['Bbasis']  # Fixed basis matrix
             L_i = len(Bbasis)  # Basis dimension for this layer
             out_dim = len(Acoeff)  # Output dimension for this layer
             
@@ -184,17 +191,14 @@ class HierDDab:
             for layer in self.layers:
                 # Create deep copies of all parameter matrices
                 Acoeff_copy = [row[:] for row in layer['Acoeff']]
-                Bbasis_copy = [row[:] for row in layer['Bbasis']]
                 M_copy = [row[:] for row in layer['M']]
                 current_params.append({
                     'Acoeff': Acoeff_copy,
-                    'Bbasis': Bbasis_copy,
                     'M': M_copy
                 })
             
-            # Initialize gradients for all layers
+            # Initialize gradients for all layers (Bbasis is fixed, no gradient needed)
             grad_A_list = []
-            grad_B_list = []
             grad_M_list = []
             for layer in self.layers:
                 out_dim = len(layer['Acoeff'])
@@ -203,13 +207,10 @@ class HierDDab:
                 
                 # Gradient for Acoeff matrix
                 grad_A = [[0.0] * L_i for _ in range(out_dim)]
-                # Gradient for Bbasis matrix
-                grad_B = [[0.0] * out_dim for _ in range(L_i)]
                 # Gradient for M matrix
                 grad_M = [[0.0] * in_dim for _ in range(out_dim)]
                 
                 grad_A_list.append(grad_A)
-                grad_B_list.append(grad_B)
                 grad_M_list.append(grad_M)
             
             total_loss = 0.0
@@ -224,7 +225,7 @@ class HierDDab:
                 for layer_idx, layer in enumerate(self.layers):
                     M = layer['M']
                     Acoeff = layer['Acoeff']
-                    Bbasis = layer['Bbasis']
+                    Bbasis = layer['Bbasis']  # Fixed basis matrix
                     L_i = len(Bbasis)  # Basis dimension for this layer
                     out_dim = len(Acoeff)  # Output dimension for this layer
                     
@@ -234,7 +235,7 @@ class HierDDab:
                         # Apply transformation
                         transformed_vec = self._mat_vec(M, vec)
                         
-                        # NEW: Apply Layer Normalization to transformed vector
+                        # Apply Layer Normalization to transformed vector
                         # Calculate mean and variance
                         d = len(transformed_vec)  # Feature dimension
                         vec_mean = sum(transformed_vec) / d
@@ -290,7 +291,7 @@ class HierDDab:
                         inter = intermediates[l_idx][pos]
                         M = layer['M']
                         Acoeff = layer['Acoeff']
-                        Bbasis = layer['Bbasis']
+                        Bbasis = layer['Bbasis']  # Fixed basis matrix
                         L_i = len(Bbasis)
                         out_dim = len(Acoeff)  # Current layer output dimension
                         in_dim = len(M[0])
@@ -311,11 +312,6 @@ class HierDDab:
                         # Gradient for Acoeff
                         for i in range(len(Acoeff)):
                             grad_A_list[l_idx][i][j] += dNk[i] * scalar
-                        
-                        # Gradient for Bbasis
-                        for d in range(len(Bbasis[j])):
-                            # Uses normalized vector for gradient calculation
-                            grad_B_list[l_idx][j][d] += dscalar * normalized_vec[d]
                         
                         # NEW: Backpropagation through normalization layer
                         # Gradient w.r.t normalized vector
@@ -368,22 +364,16 @@ class HierDDab:
                     pos_loss = sum((Nk[i] - t[i])**2 for i in range(final_out_dim)) / final_out_dim
                     total_loss += pos_loss
             
-            # Update parameters with gradients
+            # Update parameters with gradients (skip Bbasis since it's fixed)
             for l_idx in range(self.num_layers):
                 layer = self.layers[l_idx]
                 M = layer['M']
                 Acoeff = layer['Acoeff']
-                Bbasis = layer['Bbasis']
                 
                 # Update Acoeff matrix
                 for i in range(len(Acoeff)):
                     for j in range(len(Acoeff[i])):
                         Acoeff[i][j] -= current_lr * grad_A_list[l_idx][i][j]
-                
-                # Update Bbasis matrix
-                for j in range(len(Bbasis)):
-                    for d in range(len(Bbasis[j])):
-                        Bbasis[j][d] -= current_lr * grad_B_list[l_idx][j][d]
                 
                 # Update M matrix
                 for d in range(len(M)):
@@ -396,14 +386,13 @@ class HierDDab:
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
-                print(f"Iter {it:3d}: Loss = {D:.36f}, LR = {current_lr:.6f}")
+                print(f"Iter {it:3d}: Loss = {D:.6f}, LR = {current_lr:.6f}")
             
             # Check convergence: if loss increases (D >= D_prev - tol)
             if D >= D_prev - tol:
                 # Roll back parameters to state before update
                 for l_idx, layer in enumerate(self.layers):
                     layer['Acoeff'] = current_params[l_idx]['Acoeff']
-                    layer['Bbasis'] = current_params[l_idx]['Bbasis']
                     layer['M'] = current_params[l_idx]['M']
                 # Replace last history entry with previous loss value
                 history[-1] = D_prev
@@ -477,12 +466,12 @@ class HierDDab:
                     print(f"    Row {i}: [{', '.join(f'{x:.4f}' for x in row)}" + 
                           (", ...]" if len(Acoeff[0]) > first_num else "]"))
                 
-                # Show Bbasis matrix sample
+                # Show Bbasis matrix sample (fixed values)
                 Bbasis = layer['Bbasis']
-                print(f"  Bbasis matrix ({len(Bbasis)}x{len(Bbasis[0])}):")
-                for i in range(min(first_num, len(Bbasis))):
-                    row = Bbasis[i][:min(first_num, len(Bbasis[0]))]
-                    print(f"    Row {i}: [{', '.join(f'{x:.4f}' for x in row)}" + 
+                print(f"  Bbasis matrix (FIXED) ({len(Bbasis)}x{len(Bbasis[0])}):")
+                for k in range(min(first_num, len(Bbasis))):
+                    row = Bbasis[k][:min(first_num, len(Bbasis[0]))]
+                    print(f"    Row {k}: [{', '.join(f'{x:.4f}' for x in row)}" + 
                           (", ...]" if len(Bbasis[0]) > first_num else "]"))       
 
             print("=" * 50)
@@ -490,14 +479,14 @@ class HierDDab:
     def count_parameters(self):
         """
         Calculate and print the number of learnable parameters.
+        Bbasis parameters are excluded since they are fixed.
         """
         total_params = 0
-        print("Model Parameter Counts:")
+        print("Model Parameter Counts (learnable only):")
         
         for l_idx, layer in enumerate(self.layers):
             M = layer['M']
             Acoeff = layer['Acoeff']
-            Bbasis = layer['Bbasis']
             
             in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
             out_dim = self.model_dims[l_idx]
@@ -505,17 +494,16 @@ class HierDDab:
             
             m_params = len(M) * len(M[0])
             a_params = len(Acoeff) * len(Acoeff[0])
-            b_params = len(Bbasis) * len(Bbasis[0])
-            layer_params = m_params + a_params + b_params
+            layer_params = m_params + a_params
             total_params += layer_params
             
             print(f"  Layer {l_idx} (in: {in_dim}, out: {out_dim}, L: {L_i}):")
             print(f"    M: {len(M)}×{len(M[0])} = {m_params} params")
             print(f"    Acoeff: {len(Acoeff)}×{len(Acoeff[0])} = {a_params} params")
-            print(f"    Bbasis: {len(Bbasis)}×{len(Bbasis[0])} = {b_params} params")
+            print(f"    Bbasis: FIXED (0 learnable parameters)")
             print(f"    Layer total: {layer_params}")
         
-        print(f"Total parameters: {total_params}")        
+        print(f"Total learnable parameters: {total_params}")        
         return total_params
 
     def save(self, filename):
@@ -540,15 +528,15 @@ if __name__ == "__main__":
     from statistics import correlation, mean
     
     # Set random seed for reproducibility
-    #random.seed(222)
+    random.seed(2)
     
     # Hierarchical configuration
     input_dim = 10     # Input vector dimension
     model_dims = [5, 2]  # Output dimensions for each layer
     basis_dims = [150, 150]   # Basis dimensions for each layer
-    seq_count = 10    # Number of training sequences
-    min_len = 100     # Minimum sequence length
-    max_len = 200     # Maximum sequence length
+    seq_count = 10     # Number of training sequences
+    min_len = 100      # Minimum sequence length
+    max_len = 200      # Maximum sequence length
     
     # Generate training data
     print("Generating training data...")
@@ -569,10 +557,10 @@ if __name__ == "__main__":
         # Generate random target vector (dimension = last layer output)
         target = [random.uniform(-1, 1) for _ in range(model_dims[-1])]
         t_list.append(target)
-        print(f"Sequence {i+1}: length={length}, target={[round(t,2) for t in target]}")
+        print(f"Sequence {i+1}: length={length}, target={[round(t, 4) for t in target]}")
     
     # Create and train the hierarchical model
-    print("\nCreating Hierarchical HierDDab...")
+    print("\nCreating Hierarchical HierDDab with fixed Bbasis...")
     hdd = HierDDab(
         input_dim=input_dim,
         model_dims=model_dims,
@@ -590,7 +578,7 @@ if __name__ == "__main__":
         seqs,
         t_list,
         learning_rate=0.02,
-        max_iters=300,
+        max_iters=100,
         tol=1e-88,
         decay_rate=0.98,
         print_every=10
@@ -611,15 +599,16 @@ if __name__ == "__main__":
     
     # Show final model
     print("\nTrained model structure:")
-    hdd.show('all')
+    hdd.show('params')
     hdd.count_parameters()
     
     # Save and load model
     print("\nTesting model persistence...")
-    hdd.save("hierarchical_vector_model.pkl")
-    loaded = HierDDab.load("hierarchical_vector_model.pkl")
+    hdd.save("hierarchical_vector_model_fixedB.pkl")
+    loaded = HierDDab.load("hierarchical_vector_model_fixedB.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
+    print(f"  Actual target: {[round(t, 4) for t in t_list[0]]}")
     
     print("\n=== Hierarchical Vector Sequence Processing Demo Completed ===")

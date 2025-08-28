@@ -18,7 +18,7 @@ class HierDDLab:
     Each layer contains:
       - Matrix M ∈ R^{m_i×m_{i-1}} for linear transformation
       - Matrix Acoeff ∈ R^{m_i×L_i} of coefficients
-      - Matrix Bbasis ∈ R^{L_i×m_i} of basis functions
+      - Fixed Matrix Bbasis ∈ R^{L_i×m_i} of basis functions (calculated using cosine formula)
       - Linker matrix for sequence length transformation
     """
     def __init__(self, input_dim=4, model_dims=[4], basis_dims=[50], 
@@ -81,9 +81,14 @@ class HierDDLab:
             Acoeff = [[random.uniform(-0.1, 0.1) for _ in range(L_i)]
                        for _ in range(out_dim)]
             
-            # Initialize basis matrix Bbasis (L_i × out_dim)
-            Bbasis = [[random.uniform(-0.1, 0.1) for _ in range(out_dim)]
-                       for _ in range(L_i)]
+            # Initialize FIXED basis matrix Bbasis (L_i × out_dim) using cosine formula
+            # Bbasis[k][i] = cos(2π*(k+1)/(i+1))
+            Bbasis = [[0.0] * out_dim for _ in range(L_i)]
+            for k in range(L_i):
+                for d in range(out_dim):
+                    # Calculate fixed basis value using cosine formula
+                    # Avoid division by zero with d+1
+                    Bbasis[k][d] = math.cos(2 * math.pi * (k+1) / (d+1))
             
             # Initialize Linker matrix (in_seq × out_seq)
             Linker = [[random.uniform(-0.1, 0.1) for _ in range(out_seq)]
@@ -92,7 +97,7 @@ class HierDDLab:
             self.layers.append({
                 'M': M,
                 'Acoeff': Acoeff,
-                'Bbasis': Bbasis,
+                'Bbasis': Bbasis,  # Fixed, not trainable
                 'Linker': Linker,
                 'linker_trainable': self.linker_trainable[i]
             })
@@ -148,7 +153,7 @@ class HierDDLab:
         for l_idx, layer in enumerate(self.layers):
             M = layer['M']
             Acoeff = layer['Acoeff']
-            Bbasis = layer['Bbasis']
+            Bbasis = layer['Bbasis']  # Fixed basis matrix
             Linker = layer['Linker']
             L_i = len(Bbasis)  # Basis dimension for this layer
             out_dim = len(Acoeff)  # Output dimension for this layer
@@ -165,7 +170,7 @@ class HierDDLab:
                 U_col = [Acoeff[i][j] * scalar for i in range(out_dim)]
                 U.append(U_col)
             
-            # Convert U to matrix: out_dim × in_seq (each column is a vector)
+            # Convert U to matrix: out_dim × in_seq
             U_mat = [list(col) for col in zip(*U)]
             
             # Step 3: Apply sequence length transformation using Linker matrix
@@ -203,7 +208,7 @@ class HierDDLab:
                decay_rate=1.0, print_every=10, epsilon=1e-8):
         """
         Train using gradient descent with backpropagation through layers.
-        Supports learning M, Acoeff, Bbasis, and Linker matrices.
+        Supports learning M, Acoeff, and Linker matrices (Bbasis is FIXED).
         Rolls back parameters when loss increases during training.
         Added Layer Normalization after M transformation for better gradient scaling.
         """
@@ -222,7 +227,7 @@ class HierDDLab:
         
         # Initialize gradient storage for all layers
         grad_A_list = []
-        grad_B_list = []
+        grad_B_list = []  # Will be computed but not used (for fixed Bbasis)
         grad_M_list = []
         grad_Linker_list = []
         for layer in self.layers:
@@ -233,7 +238,7 @@ class HierDDLab:
             out_seq = len(layer['Linker'][0])
             
             grad_A = [[0.0] * L_i for _ in range(out_dim)]
-            grad_B = [[0.0] * out_dim for _ in range(L_i)]
+            grad_B = [[0.0] * out_dim for _ in range(L_i)]  # Not used for fixed Bbasis
             grad_M = [[0.0] * in_dim for _ in range(out_dim)]
             grad_Linker = [[0.0] * out_seq for _ in range(in_seq)]
             
@@ -251,7 +256,7 @@ class HierDDLab:
             for layer in self.layers:
                 layer_params = {
                     'Acoeff': [row[:] for row in layer['Acoeff']],
-                    'Bbasis': [row[:] for row in layer['Bbasis']],
+                    'Bbasis': [row[:] for row in layer['Bbasis']],  # Fixed but saved for consistency
                     'M': [row[:] for row in layer['M']],
                     'Linker': [row[:] for row in layer['Linker']]
                 }
@@ -279,7 +284,7 @@ class HierDDLab:
                 for l_idx, layer in enumerate(self.layers):
                     M = layer['M']
                     Acoeff = layer['Acoeff']
-                    Bbasis = layer['Bbasis']
+                    Bbasis = layer['Bbasis']  # Fixed basis
                     Linker = layer['Linker']
                     L_i = len(Bbasis)
                     out_dim = len(Acoeff)
@@ -317,7 +322,7 @@ class HierDDLab:
                     for k in range(len(T_norm_mat[0])):
                         vec = [T_norm_mat[i][k] for i in range(len(T_norm_mat))]
                         j = k % L_i
-                        scalar = self._dot(Bbasis[j], vec)
+                        scalar = self._dot(Bbasis[j], vec)  # Use fixed Bbasis
                         U_col = [Acoeff[i][j] * scalar for i in range(out_dim)]
                         U.append(U_col)
                         intermediate_vals.append({
@@ -383,7 +388,7 @@ class HierDDLab:
                     layer = self.layers[l_idx]
                     M = layer['M']
                     Acoeff = layer['Acoeff']
-                    Bbasis = layer['Bbasis']
+                    Bbasis = layer['Bbasis']  # Fixed, not updated
                     Linker = layer['Linker']
                     L_i = len(Bbasis)
                     out_dim = len(Acoeff)
@@ -410,7 +415,7 @@ class HierDDLab:
                     # Initialize gradients for position processing
                     dT_norm = [[0.0] * len(T_norm[0]) for _ in range(len(T_norm))]  # dL/dT_norm
                     dAcoeff = [[0.0] * len(Acoeff[0]) for _ in range(len(Acoeff))]
-                    dBbasis = [[0.0] * len(Bbasis[0]) for _ in range(len(Bbasis))]
+                    # Skip dBbasis since Bbasis is fixed
                     dM = [[0.0] * len(M[0]) for _ in range(len(M))]
                     
                     # Backpropagate through position processing
@@ -433,10 +438,7 @@ class HierDDLab:
                         # Gradient w.r.t scalar
                         d_scalar = sum(dU_col[i] * Acoeff[i][j] for i in range(len(Acoeff)))
                         
-                        # Gradient w.r.t Bbasis
-                        for d in range(len(Bbasis[j])):
-                            dBbasis[j][d] += d_scalar * vec[d]
-                        
+                        # Skip gradient for Bbasis (fixed)
                         # Gradient w.r.t normalized vec (input to this position)
                         d_vec = [d_scalar * Bbasis[j][d] for d in range(len(Bbasis[j]))]
                         
@@ -497,14 +499,10 @@ class HierDDLab:
                     # Gradient w.r.t X (for previous layer): dL/dX = M^T * dT
                     dX_prev = self._mat_mul(self._transpose(M), dT)
                     
-                    # Accumulate gradients
+                    # Accumulate gradients (skip Bbasis since it's fixed)
                     for i in range(len(grad_A_list[l_idx])):
                         for j in range(len(grad_A_list[l_idx][i])):
                             grad_A_list[l_idx][i][j] += dAcoeff[i][j]
-                    
-                    for i in range(len(grad_B_list[l_idx])):
-                        for j in range(len(grad_B_list[l_idx][i])):
-                            grad_B_list[l_idx][i][j] += dBbasis[i][j]
                     
                     for i in range(len(grad_M_list[l_idx])):
                         for j in range(len(grad_M_list[l_idx][i])):
@@ -530,13 +528,7 @@ class HierDDLab:
                             grad = max_grad_norm if grad > 0 else -max_grad_norm
                         grad_A_list[l_idx][i][j] = grad / total_sequences
                 
-                # Clip Bbasis gradients
-                for i in range(len(grad_B_list[l_idx])):
-                    for j in range(len(grad_B_list[l_idx][i])):
-                        grad = grad_B_list[l_idx][i][j]
-                        if abs(grad) > max_grad_norm:
-                            grad = max_grad_norm if grad > 0 else -max_grad_norm
-                        grad_B_list[l_idx][i][j] = grad / total_sequences
+                # Skip Bbasis clipping (fixed)
                 
                 # Clip M gradients
                 for i in range(len(grad_M_list[l_idx])):
@@ -558,7 +550,7 @@ class HierDDLab:
             # Calculate effective learning rate
             effective_lr = current_lr / total_sequences
             
-            # Update parameters with effective learning rate
+            # Update parameters with effective learning rate (skip Bbasis)
             for l_idx in range(self.num_layers):
                 layer = self.layers[l_idx]
                 
@@ -567,10 +559,7 @@ class HierDDLab:
                     for j in range(len(layer['Acoeff'][i])):
                         layer['Acoeff'][i][j] -= effective_lr * grad_A_list[l_idx][i][j]
                 
-                # Update Bbasis
-                for i in range(len(layer['Bbasis'])):
-                    for j in range(len(layer['Bbasis'][i])):
-                        layer['Bbasis'][i][j] -= effective_lr * grad_B_list[l_idx][i][j]
+                # Skip Bbasis update (fixed)
                 
                 # Update M
                 for i in range(len(layer['M'])):
@@ -596,7 +585,7 @@ class HierDDLab:
                 # Roll back to previous parameters
                 for l_idx, layer in enumerate(self.layers):
                     layer['Acoeff'] = [row[:] for row in prev_params[l_idx]['Acoeff']]
-                    layer['Bbasis'] = [row[:] for row in prev_params[l_idx]['Bbasis']]
+                    # Bbasis remains fixed (no need to roll back)
                     layer['M'] = [row[:] for row in prev_params[l_idx]['M']]
                     layer['Linker'] = [row[:] for row in prev_params[l_idx]['Linker']]
                 
@@ -669,9 +658,9 @@ class HierDDLab:
                     print(f"    Row {i}: [{', '.join(f'{x:.4f}' for x in row)}" + 
                           (", ...]" if len(Acoeff[0]) > first_num else "]"))
                 
-                # Show Bbasis matrix sample
+                # Show FIXED Bbasis matrix sample
                 Bbasis = layer['Bbasis']
-                print(f"  Bbasis matrix ({len(Bbasis)}x{len(Bbasis[0])}):")
+                print(f"  FIXED Bbasis matrix ({len(Bbasis)}x{len(Bbasis[0])}):")
                 for i in range(min(first_num, len(Bbasis))):
                     row = Bbasis[i][:min(first_num, len(Bbasis[0]))]
                     print(f"    Row {i}: [{', '.join(f'{x:.4f}' for x in row)}" + 
@@ -690,15 +679,16 @@ class HierDDLab:
     def count_parameters(self):
         """
         Calculate and print the number of learnable parameters.
+        Bbasis is FIXED and not counted as trainable.
         """
         total_params = 0
         trainable_params = 0
-        print("Model Parameter Counts:")
+        print("Model Parameter Counts (Bbasis is FIXED):")
         
         for l_idx, layer in enumerate(self.layers):
             M = layer['M']
             Acoeff = layer['Acoeff']
-            Bbasis = layer['Bbasis']
+            Bbasis = layer['Bbasis']  # Fixed, not trainable
             Linker = layer['Linker']
             
             in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
@@ -709,13 +699,14 @@ class HierDDLab:
             
             m_params = len(M) * len(M[0])
             a_params = len(Acoeff) * len(Acoeff[0])
-            b_params = len(Bbasis) * len(Bbasis[0])
+            b_params = len(Bbasis) * len(Bbasis[0])  # Total params (fixed)
             linker_params = len(Linker) * len(Linker[0])
             
             layer_params = m_params + a_params + b_params + linker_params
             total_params += layer_params
             
-            layer_trainable = m_params + a_params + b_params
+            # Trainable params: M + Acoeff + Linker (if trainable)
+            layer_trainable = m_params + a_params
             if layer['linker_trainable']:
                 layer_trainable += linker_params
             trainable_params += layer_trainable
@@ -723,7 +714,7 @@ class HierDDLab:
             print(f"  Layer {l_idx} (in_dim: {in_dim}, out_dim: {out_dim}, L: {L_i}, in_seq: {in_seq}, out_seq: {out_seq}):")
             print(f"    M: {len(M)}×{len(M[0])} = {m_params} params")
             print(f"    Acoeff: {len(Acoeff)}×{len(Acoeff[0])} = {a_params} params")
-            print(f"    Bbasis: {len(Bbasis)}×{len(Bbasis[0])} = {b_params} params")
+            print(f"    Bbasis: {len(Bbasis)}×{len(Bbasis[0])} = {b_params} params [FIXED]")
             print(f"    Linker: {len(Linker)}×{len(Linker[0])} = {linker_params} params [Trainable: {layer['linker_trainable']}]")
             print(f"    Layer total: {layer_params} (Trainable: {layer_trainable})")
         
@@ -753,7 +744,7 @@ if __name__ == "__main__":
     from statistics import correlation, mean
     
     # Set random seed for reproducibility
-    #random.seed(42)
+    random.seed(2)
     
     # Hierarchical configuration with sequence length transformation
     input_dim = 9        # Input vector dimension
@@ -877,7 +868,7 @@ if __name__ == "__main__":
         learning_rate=5,
         max_iters=200,
         tol=1e-36,
-        decay_rate=0.99,
+        decay_rate=0.95,
         print_every=10
     )
     
