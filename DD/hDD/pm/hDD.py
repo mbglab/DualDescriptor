@@ -1,6 +1,7 @@
 # Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
 # The Numeric Dual Descriptor class (Tensor form) with hierarchical structure
 # Author: Bin-Guang Ma; Date: 2025-6-4
+# Modified: Simplified P tensor to 2D matrix (removed basis dimension)
 
 import math
 import random
@@ -9,23 +10,21 @@ import pickle
 class HierDDpm:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
-      - Multiple layers with linear transformation M and tensor P
-      - Each layer: P ∈ R^{m×m×o} of basis coefficients, M ∈ R^{m×n}
-      - Periods: period[i,j,g] = i*(m*o) + j*o + g + 2
-      - Basis function: phi_{i,j,g}(k) = cos(2π * k / period[i,j,g])
+      - Multiple layers with linear transformation M and matrix P
+      - Each layer: P ∈ R^{m×m} of basis coefficients, M ∈ R^{m×n}
+      - Periods: period[i,j] = i*m + j + 2
+      - Basis function: phi_{i,j}(k) = cos(2π * k / period[i,j])
     """
-    def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5]):
+    def __init__(self, input_dim=2, model_dims=[2]):
         """
         Initialize hierarchical HierDDpm
         
         Args:
             input_dim (int): Input vector dimension
             model_dims (list): Output dimensions for each layer
-            num_basis_list (list): Number of basis functions for each layer
         """
         self.input_dim = input_dim
         self.model_dims = model_dims
-        self.num_basis_list = num_basis_list
         self.num_layers = len(model_dims)
         self.trained = False
         
@@ -42,15 +41,12 @@ class HierDDpm:
             M = [[random.uniform(-0.5, 0.5) for _ in range(in_dim)] 
                  for _ in range(out_dim)]
             
-            # Initialize P tensor (out_dim x out_dim x num_basis)
-            P = [[[random.uniform(-0.1, 0.1) for _ in range(num_basis_list[l])]
+            # Initialize P matrix (out_dim x out_dim)
+            P = [[random.uniform(-0.1, 0.1) for _ in range(out_dim)]
                   for _ in range(out_dim)]
-                 for _ in range(out_dim)]
             
-            # Precompute periods tensor
-            periods = [[[ i*(out_dim*num_basis_list[l]) + j*num_basis_list[l] + g + 2
-                         for g in range(num_basis_list[l])]
-                        for j in range(out_dim)]
+            # Precompute periods matrix
+            periods = [[i * out_dim + j + 2 for j in range(out_dim)]
                        for i in range(out_dim)]
             
             self.layers.append({
@@ -90,10 +86,9 @@ class HierDDpm:
                 # Apply position-dependent transformation
                 for i in range(out_dim):
                     for j in range(out_dim):
-                        for g in range(len(layer['P'][i][j])):
-                            period = layer['periods'][i][j][g]
-                            phi = math.cos(2 * math.pi * k / period)
-                            Nk[i] += layer['P'][i][j][g] * x[j] * phi
+                        period = layer['periods'][i][j]
+                        phi = math.cos(2 * math.pi * k / period)
+                        Nk[i] += layer['P'][i][j] * x[j] * phi
                 new_seq.append(Nk)
             current = new_seq
         return current
@@ -121,7 +116,7 @@ class HierDDpm:
         """
         if not continued:
             # Reinitialize with small random values
-            self.__init__(self.input_dim, self.model_dims, self.num_basis_list)
+            self.__init__(self.input_dim, self.model_dims)
             
         history = []
         D_prev = float('inf')
@@ -133,11 +128,9 @@ class HierDDpm:
             grad_M_list = []
             for l in range(self.num_layers):
                 out_dim = self.model_dims[l]
-                num_basis = self.num_basis_list[l]
                 
-                # Gradients for P tensor
-                grad_P = [[[0.0] * num_basis for _ in range(out_dim)] 
-                          for _ in range(out_dim)]
+                # Gradients for P matrix
+                grad_P = [[0.0] * out_dim for _ in range(out_dim)]
                 grad_P_list.append(grad_P)
                 
                 # Gradients for M matrix
@@ -163,16 +156,15 @@ class HierDDpm:
                         x = self._mat_vec(layer['M'], vec)
                         out_dim = len(layer['P'])
                         Nk = [0.0] * out_dim
-                        phi_vals = {}
+                        phi_vals = [[0.0] * out_dim for _ in range(out_dim)]
                         
                         # Compute output and store basis values
                         for i in range(out_dim):
                             for j in range(out_dim):
-                                for g in range(len(layer['P'][i][j])):
-                                    period = layer['periods'][i][j][g]
-                                    phi = math.cos(2 * math.pi * k / period)
-                                    phi_vals[(i, j, g)] = phi
-                                    Nk[i] += layer['P'][i][j][g] * x[j] * phi
+                                period = layer['periods'][i][j]
+                                phi = math.cos(2 * math.pi * k / period)
+                                phi_vals[i][j] = phi
+                                Nk[i] += layer['P'][i][j] * x[j] * phi
                         
                         layer_intermediate.append({
                             'input_vec': vec,
@@ -206,21 +198,19 @@ class HierDDpm:
                             # Propagate error from next layer
                             d_out = d_next
                         
-                        # Compute gradient for P tensor
+                        # Compute gradient for P matrix
                         for i in range(len(d_out)):
                             for j in range(len(layer['P'][i])):
-                                for g in range(len(layer['P'][i][j])):
-                                    grad_P_list[l][i][j][g] += (
-                                        d_out[i] * x[j] * phi_vals[(i, j, g)]
-                                    ) / total_positions
+                                grad_P_list[l][i][j] += (
+                                    d_out[i] * x[j] * phi_vals[i][j]
+                                ) / total_positions
                         
                         # Compute gradient for M matrix
                         d_x = [0.0] * len(x)
                         for j in range(len(x)):
                             for i in range(len(d_out)):
-                                for g in range(len(layer['P'][i][j])):
-                                    term = d_out[i] * layer['P'][i][j][g] * phi_vals[(i, j, g)]
-                                    d_x[j] += term
+                                term = d_out[i] * layer['P'][i][j] * phi_vals[i][j]
+                                d_x[j] += term
                             
                             # Propagate to M gradients
                             for d in range(len(input_vec)):
@@ -237,11 +227,10 @@ class HierDDpm:
             # Update parameters
             for l in range(self.num_layers):
                 layer = self.layers[l]
-                # Update P tensor
+                # Update P matrix
                 for i in range(len(layer['P'])):
                     for j in range(len(layer['P'][i])):
-                        for g in range(len(layer['P'][i][j])):
-                            layer['P'][i][j][g] -= learning_rate * grad_P_list[l][i][j][g]
+                        layer['P'][i][j] -= learning_rate * grad_P_list[l][i][j]
                 
                 # Update M matrix
                 for i in range(len(layer['M'])):
@@ -310,11 +299,10 @@ class HierDDpm:
                 print("\n[Configuration]")
                 print(f"{'Input dim:':<20} {self.input_dim}")
                 print(f"{'Layer dims:':<20} {self.model_dims}")
-                print(f"{'Num basis:':<20} {self.num_basis_list}")
                 print(f"{'Trained:':<20} {self.trained}")
             
             elif attr in ['M', 'P', 'periods']:
-                print(f"\n[{attr.upper()} Matrices/Tensors]")
+                print(f"\n[{attr.upper()} Matrices]")
                 for l in range(self.num_layers):
                     print(f"  Layer {l}:")
                     if attr == 'M':
@@ -327,18 +315,17 @@ class HierDDpm:
                                   (f", ...]" if len(M[i]) > first_num else "]"))
                     
                     elif attr in ['P', 'periods']:
-                        tensor = self.layers[l][attr]
-                        print(f"    Shape: {len(tensor)}x{len(tensor[0])}x{len(tensor[0][0])}")
-                        print("    Sample slices:")
-                        for i in range(min(first_num, len(tensor))):
-                            for j in range(min(first_num, len(tensor[i]))):
-                                vals = tensor[i][j][:min(first_num, len(tensor[i][j]))]
-                                if attr == 'P':
-                                    formatted = [f"{v:.6f}" for v in vals]
-                                else:
-                                    formatted = [str(int(v)) for v in vals]
-                                print(f"      {attr}[{i}][{j}][:]: [{', '.join(formatted)}" + 
-                                      (f", ...]" if len(tensor[i][j]) > first_num else "]"))
+                        matrix = self.layers[l][attr]
+                        print(f"    Shape: {len(matrix)}x{len(matrix[0])}")
+                        print("    Sample rows:")
+                        for i in range(min(first_num, len(matrix))):
+                            vals = matrix[i][:min(first_num, len(matrix[i]))]
+                            if attr == 'P':
+                                formatted = [f"{v:.6f}" for v in vals]
+                            else:
+                                formatted = [str(int(v)) for v in vals]
+                            print(f"      {attr}[{i}][:]: [{', '.join(formatted)}" + 
+                                  (f", ...]" if len(matrix[i]) > first_num else "]"))
             
             else:
                 print(f"\n[Unknown attribute: {attr}]")
@@ -346,7 +333,7 @@ class HierDDpm:
         print("=" * 50)
 
     def count_parameters(self):
-        """Count learnable parameters (P tensors and M matrices for all layers)"""
+        """Count learnable parameters (P matrices and M matrices for all layers)"""
         total_params = 0
         print("Parameter Count:")
         
@@ -354,13 +341,13 @@ class HierDDpm:
             M = self.layers[l]['M']
             P = self.layers[l]['P']
             M_params = len(M) * len(M[0])
-            P_params = len(P) * len(P[0]) * len(P[0][0])
+            P_params = len(P) * len(P[0])
             layer_params = M_params + P_params
             total_params += layer_params
             
             print(f"  Layer {l}:")
             print(f"    M matrix: {len(M)}×{len(M[0])} = {M_params} parameters")
-            print(f"    P tensor: {len(P)}×{len(P[0])}×{len(P[0][0])} = {P_params} parameters")
+            print(f"    P matrix: {len(P)}×{len(P[0])} = {P_params} parameters")
             print(f"    Layer total: {layer_params}")
         
         print(f"Total parameters: {total_params}")
@@ -391,12 +378,11 @@ if __name__=="__main__":
 
     from statistics import correlation, mean
     
-    #random.seed(3)
+    random.seed(3)
     
     # Hierarchical configuration
     input_dim = 10      # Input vector dimension
     model_dims = [8, 6, 3]  # Output dimensions for each layer
-    num_basis_list = [5, 4, 3]  # Basis functions per layer
     num_seqs = 10
     min_len, max_len = 100, 200
 
@@ -416,8 +402,7 @@ if __name__=="__main__":
     print("\nTraining Hierarchical HierDDpm...")
     hndd = HierDDpm(
         input_dim=input_dim,
-        model_dims=model_dims,
-        num_basis_list=num_basis_list
+        model_dims=model_dims
     )
     
     # Gradient Descent Training
@@ -425,7 +410,7 @@ if __name__=="__main__":
         seqs, 
         t_list, 
         max_iters=50,
-        learning_rate=5.0,
+        learning_rate=15.0,
         decay_rate=0.9999,
         print_every=5
     )

@@ -12,15 +12,16 @@ class HierDDLpm:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
-      - Each layer: P ∈ R^{m×m×o} of basis coefficients, M ∈ R^{m×n}
-      - Periods: period[i,j,g] = i*(m*o) + j*o + g + 2
-      - Basis function: phi_{i,j,g}(k) = cos(2π * k / period[i,j,g])
+      - Each layer: P ∈ R^{m×m} of basis coefficients, M ∈ R^{m×n}
+      - Periods: period[i,j] = i*m + j + 2
+      - Basis function: phi_{i,j}(k) = cos(2π * k / period[i,j])
     Key modifications:
     - Added Linker matrices for sequence length transformation
     - Layer operations: T = position-dependent transform, U = T * Linker
     - Added linker_trainable parameter to control Linker matrix training
+    - Simplified P tensor from 3D to 2D matrix
     """
-    def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5],
+    def __init__(self, input_dim=2, model_dims=[2],
                  input_seq_len=100, linker_dims=[50], linker_trainable=False):
         """
         Initialize hierarchical HierDDLpm with sequence length transformation
@@ -28,14 +29,12 @@ class HierDDLpm:
         Args:
             input_dim (int): Input vector dimension
             model_dims (list): Output dimensions for each layer
-            num_basis_list (list): Number of basis functions for each layer
             input_seq_len (int): Fixed input sequence length
             linker_dims (list): Output sequence lengths for each layer
             linker_trainable (bool or list): Trainability of Linker matrices
         """
         self.input_dim = input_dim
         self.model_dims = model_dims
-        self.num_basis_list = num_basis_list
         self.input_seq_len = input_seq_len
         self.linker_dims = linker_dims
         self.num_layers = len(model_dims)
@@ -44,8 +43,6 @@ class HierDDLpm:
         # Validate dimensions
         if len(linker_dims) != self.num_layers:
             raise ValueError("linker_dims must have same length as model_dims")
-        if len(num_basis_list) != self.num_layers:
-            raise ValueError("num_basis_list must have same length as model_dims")
         
         # Process linker_trainable parameter
         if isinstance(linker_trainable, bool):
@@ -75,15 +72,12 @@ class HierDDLpm:
             M = [[random.uniform(-0.5, 0.5) for _ in range(in_dim)] 
                  for _ in range(out_dim)]
             
-            # Initialize P tensor (out_dim x out_dim x num_basis)
-            P = [[[random.uniform(-0.1, 0.1) for _ in range(num_basis_list[l])]
-                  for _ in range(out_dim)]
+            # Initialize P matrix (out_dim x out_dim) - simplified to 2D
+            P = [[random.uniform(-0.1, 0.1) for _ in range(out_dim)]
                  for _ in range(out_dim)]
             
-            # Precompute periods tensor
-            periods = [[[ i*(out_dim*num_basis_list[l]) + j*num_basis_list[l] + g + 2
-                         for g in range(num_basis_list[l])]
-                        for j in range(out_dim)]
+            # Precompute periods matrix (2D instead of 3D)
+            periods = [[i * out_dim + j + 2 for j in range(out_dim)]
                        for i in range(out_dim)]
             
             # Initialize Linker matrix (in_seq x out_seq)
@@ -150,17 +144,16 @@ class HierDDLpm:
             # Apply linear transformation to each vector
             linear_out = [self._mat_vec(layer['M'], vec) for vec in current]
             
-            # Apply position-dependent transformation
+            # Apply position-dependent transformation with simplified P matrix
             T_matrix = []
             for k, vec in enumerate(linear_out):
                 out_dim = len(layer['P'])
                 Tk = [0.0] * out_dim
                 for i in range(out_dim):
                     for j in range(out_dim):
-                        for g in range(len(layer['P'][i][j])):
-                            period = layer['periods'][i][j][g]
-                            phi = math.cos(2 * math.pi * k / period)
-                            Tk[i] += layer['P'][i][j][g] * vec[j] * phi
+                        period = layer['periods'][i][j]
+                        phi = math.cos(2 * math.pi * k / period)
+                        Tk[i] += layer['P'][i][j] * vec[j] * phi
                 T_matrix.append(Tk)
             
             # Convert to matrix form: rows=features, columns=time steps
@@ -201,13 +194,13 @@ class HierDDLpm:
         """
         if not continued:
             # Reinitialize with small random values
-            self.__init__(self.input_dim, self.model_dims, self.num_basis_list,
+            self.__init__(self.input_dim, self.model_dims,
                           self.input_seq_len, self.linker_dims, self.linker_trainable)
             
         history = []
         D_prev = float('inf')
         total_positions = sum(len(seq) for seq in seqs)
-        epsilon = 1e-8  # Small constant for numerical stability in normalization
+        epsilon = 1e-88  # Small constant for numerical stability in normalization
         
         # Initialize gradient storage for all layers
         grad_P_list = []
@@ -215,11 +208,9 @@ class HierDDLpm:
         grad_Linker_list = []
         for l in range(self.num_layers):
             out_dim = self.model_dims[l]
-            num_basis = self.num_basis_list[l]
             
-            # Gradients for P tensor
-            grad_P = [[[0.0] * num_basis for _ in range(out_dim)] 
-                      for _ in range(out_dim)]
+            # Gradients for P matrix (2D instead of 3D)
+            grad_P = [[0.0] * out_dim for _ in range(out_dim)]
             grad_P_list.append(grad_P)
             
             # Gradients for M matrix
@@ -242,11 +233,10 @@ class HierDDLpm:
         for it in range(max_iters):
             # Reset gradients
             for l in range(self.num_layers):
-                # Reset P gradients
+                # Reset P gradients (2D matrix)
                 for i in range(len(grad_P_list[l])):
                     for j in range(len(grad_P_list[l][i])):
-                        for g in range(len(grad_P_list[l][i][j])):
-                            grad_P_list[l][i][j][g] = 0.0
+                        grad_P_list[l][i][j] = 0.0
                 
                 # Reset M gradients
                 for i in range(len(grad_M_list[l])):
@@ -306,11 +296,10 @@ class HierDDLpm:
                         phi_vals = {}
                         for i in range(out_dim):
                             for j in range(out_dim):
-                                for g in range(len(layer['P'][i][j])):
-                                    period = layer['periods'][i][j][g]
-                                    phi = math.cos(2 * math.pi * k / period)
-                                    phi_vals[(i, j, g)] = phi
-                                    Tk[i] += layer['P'][i][j][g] * vec[j] * phi
+                                period = layer['periods'][i][j]
+                                phi = math.cos(2 * math.pi * k / period)
+                                phi_vals[(i, j)] = phi
+                                Tk[i] += layer['P'][i][j] * vec[j] * phi
                         T_matrix.append(Tk)
                         phi_vals_list.append(phi_vals)
                     
@@ -385,16 +374,15 @@ class HierDDLpm:
                         # Compute gradients for P and normalized linear output
                         for i in range(len(dTk)):
                             for j in range(len(layer['P'][i])):
-                                for g in range(len(layer['P'][i][j])):
-                                    # Gradient for P[i][j][g]
-                                    grad_P_list[l][i][j][g] += (
-                                        dTk[i] * vec[j] * phi_vals[(i, j, g)]
-                                    )
-                                    
-                                    # Gradient for normalized linear output
-                                    d_normalized[k][j] += (
-                                        dTk[i] * layer['P'][i][j][g] * phi_vals[(i, j, g)]
-                                    )
+                                # Gradient for P[i][j] (simplified to 2D)
+                                grad_P_list[l][i][j] += (
+                                    dTk[i] * vec[j] * phi_vals[(i, j)]
+                                )
+                                
+                                # Gradient for normalized linear output
+                                d_normalized[k][j] += (
+                                    dTk[i] * layer['P'][i][j] * phi_vals[(i, j)]
+                                )
                     
                     # Backpropagate through Layer Normalization
                     d_linear = [[0.0] * len(linear_out[0]) for _ in range(len(linear_out))]
@@ -462,11 +450,10 @@ class HierDDLpm:
             for l in range(self.num_layers):
                 layer = self.layers[l]
                 
-                # Update P tensor
+                # Update P matrix (2D)
                 for i in range(len(layer['P'])):
                     for j in range(len(layer['P'][i])):
-                        for g in range(len(layer['P'][i][j])):
-                            layer['P'][i][j][g] -= learning_rate * grad_P_list[l][i][j][g]
+                        layer['P'][i][j] -= learning_rate * grad_P_list[l][i][j]
                 
                 # Update M matrix
                 for i in range(len(layer['M'])):
@@ -542,7 +529,6 @@ class HierDDLpm:
                 print(f"{'Input dim:':<20} {self.input_dim}")
                 print(f"{'Input seq len:':<20} {self.input_seq_len}")
                 print(f"{'Layer dims:':<20} {self.model_dims}")
-                print(f"{'Num basis:':<20} {self.num_basis_list}")
                 print(f"{'Linker dims:':<20} {self.linker_dims}")
                 print(f"{'Linker trainable:':<20} {self.linker_trainable}")
                 print(f"{'Trained:':<20} {self.trained}")
@@ -561,18 +547,17 @@ class HierDDLpm:
                                   (f", ...]" if len(M[i]) > first_num else "]"))
                     
                     elif attr in ['P', 'periods']:
-                        tensor = self.layers[l][attr]
-                        print(f"    Shape: {len(tensor)}×{len(tensor[0])}×{len(tensor[0][0])}")
-                        print("    Sample slices:")
-                        for i in range(min(first_num, len(tensor))):
-                            for j in range(min(first_num, len(tensor[i]))):
-                                vals = tensor[i][j][:min(first_num, len(tensor[i][j]))]
-                                if attr == 'P':
-                                    formatted = [f"{v:.6f}" for v in vals]
-                                else:
-                                    formatted = [str(int(v)) for v in vals]
-                                print(f"      {attr}[{i}][{j}][:]: [{', '.join(formatted)}" + 
-                                      (f", ...]" if len(tensor[i][j]) > first_num else "]"))
+                        matrix = self.layers[l][attr]
+                        print(f"    Shape: {len(matrix)}×{len(matrix[0])}")
+                        print("    Sample values:")
+                        for i in range(min(first_num, len(matrix))):
+                            vals = matrix[i][:min(first_num, len(matrix[i]))]
+                            if attr == 'P':
+                                formatted = [f"{v:.6f}" for v in vals]
+                            else:
+                                formatted = [str(int(v)) for v in vals]
+                            print(f"      Row {i}: [{', '.join(formatted)}" + 
+                                  (f", ...]" if len(matrix[i]) > first_num else "]"))
                     
                     elif attr == 'Linker':
                         Linker = self.layers[l]['Linker']
@@ -590,7 +575,7 @@ class HierDDLpm:
         print("=" * 50)
 
     def count_parameters(self):
-        """Count learnable parameters (P tensors, M matrices, and Linker matrices)"""
+        """Count learnable parameters (P matrices, M matrices, and Linker matrices)"""
         total_params = 0
         trainable_params = 0
         print("Parameter Count:")
@@ -601,7 +586,7 @@ class HierDDLpm:
             Linker = self.layers[l]['Linker']
             
             M_params = len(M) * len(M[0])
-            P_params = len(P) * len(P[0]) * len(P[0][0])
+            P_params = len(P) * len(P[0])  # Now 2D matrix
             Linker_params = len(Linker) * len(Linker[0])
             
             layer_params = M_params + P_params + Linker_params
@@ -615,7 +600,7 @@ class HierDDLpm:
             
             print(f"  Layer {l}:")
             print(f"    M matrix: {len(M)}×{len(M[0])} = {M_params} parameters")
-            print(f"    P tensor: {len(P)}×{len(P[0])}×{len(P[0][0])} = {P_params} parameters")
+            print(f"    P matrix: {len(P)}×{len(P[0])} = {P_params} parameters")  # Updated description
             print(f"    Linker matrix: {len(Linker)}×{len(Linker[0])} = {Linker_params} parameters")
             print(f"    Linker trainable: {self.layers[l]['linker_trainable']}")
             print(f"    Layer total: {layer_params} (trainable: {layer_trainable})")
@@ -649,12 +634,11 @@ if __name__=="__main__":
 
     from statistics import correlation, mean
     
-    #random.seed(3)
+    random.seed(3)
     
     # Hierarchical configuration
     input_dim = 10          # Input vector dimension
     model_dims = [8, 6, 3]  # Output dimensions for each layer
-    num_basis_list = [5, 4, 3]  # Basis functions per layer
     input_seq_len = 100     # Fixed input sequence length
     linker_dims = [50, 20, 10]  # Output sequence lengths for each layer
     num_seqs = 10           # Number of training sequences
@@ -677,7 +661,6 @@ if __name__=="__main__":
     hndd_trainable = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
-        num_basis_list=num_basis_list,
         input_seq_len=input_seq_len,
         linker_dims=linker_dims,
         linker_trainable=True  # All Linker matrices trainable
@@ -721,7 +704,6 @@ if __name__=="__main__":
     hndd_mixed = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
-        num_basis_list=num_basis_list,
         input_seq_len=input_seq_len,
         linker_dims=linker_dims,
         linker_trainable=[False, True, False]  # Per-layer control
@@ -757,7 +739,6 @@ if __name__=="__main__":
     hndd_fixed = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
-        num_basis_list=num_basis_list,
         input_seq_len=input_seq_len,
         linker_dims=linker_dims,
         linker_trainable=False  # No Linker matrices trainable
