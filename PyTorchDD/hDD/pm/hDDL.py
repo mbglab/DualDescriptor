@@ -1,20 +1,19 @@
 # Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Numeric Dual Descriptor class (Tensor form) with hierarchical structure
+# The Numeric Dual Descriptor class (P matrix form) with hierarchical structure
 # Modified to support sequence length transformation between layers using Linker matrices
 # PyTorch implementation of Hierarchical Numeric Dual Descriptor with GPU support
-# Author: Bin-Guang Ma; Date: 2025-7-15
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-15
 
 import math
 import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import pickle
 
 class Layer(nn.Module):
     """Single layer of Hierarchical Numeric Dual Descriptor"""
-    def __init__(self, in_dim, out_dim, in_seq, out_seq, num_basis, linker_trainable, use_residual, device):
+    def __init__(self, in_dim, out_dim, in_seq, out_seq, linker_trainable, use_residual, device):
         """
         Initialize a hierarchical layer
         
@@ -23,7 +22,6 @@ class Layer(nn.Module):
             out_dim (int): Output dimension
             in_seq (int): Input sequence length
             out_seq (int): Output sequence length
-            num_basis (int): Number of basis functions
             linker_trainable (bool): Whether Linker matrix is trainable
             use_residual (str or None): Residual connection type. Options are:
                 - 'separate': use separate projection and Linker for residual
@@ -37,21 +35,20 @@ class Layer(nn.Module):
         self.out_dim = out_dim
         self.in_seq = in_seq
         self.out_seq = out_seq
-        self.num_basis = num_basis
         self.use_residual = use_residual
         
         # Linear transformation matrix
-        self.M = nn.Parameter(torch.randn(out_dim, in_dim) * 0.1)
+        self.M = nn.Parameter(torch.randn(out_dim, in_dim) * 0.5)
         
-        # Position-dependent transformation tensor
-        self.P = nn.Parameter(torch.randn(out_dim, out_dim, num_basis) * 0.1)
+        # Position-dependent transformation matrix (simplified to 2D)
+        self.P = nn.Parameter(torch.randn(out_dim, out_dim) * 0.1)
         
-        # Precompute periods tensor (fixed, not trainable)
-        periods = torch.zeros(out_dim, out_dim, num_basis, dtype=torch.float32)
+        # Precompute periods matrix (fixed, not trainable)
+        periods = torch.zeros(out_dim, out_dim, dtype=torch.float32)
         for i in range(out_dim):
             for j in range(out_dim):
-                for g in range(num_basis):
-                    periods[i, j, g] = i*(out_dim*num_basis) + j*num_basis + g + 2
+                # Simplified period calculation without basis dimension
+                periods[i, j] = i * out_dim + j + 2
         self.register_buffer('periods', periods)
         
         # Sequence length transformation matrix
@@ -73,37 +70,37 @@ class Layer(nn.Module):
             )
     
     def position_transform(self, Z):
-        """Position-dependent transformation with basis functions (vectorized)"""
+        """Position-dependent transformation with simplified matrix form"""
         seq_len, _ = Z.shape
         
         # Create position indices [seq_len]
         k = torch.arange(seq_len, device=self.device).float()
         
-        # Reshape for broadcasting: [seq_len, 1, 1, 1]
-        k = k.view(seq_len, 1, 1, 1)
+        # Reshape for broadcasting: [seq_len, 1, 1]
+        k = k.view(seq_len, 1, 1)
         
-        # Get periods and reshape for broadcasting: [1, out_dim, out_dim, num_basis]
+        # Get periods and reshape for broadcasting: [1, out_dim, out_dim]
         periods = self.periods.unsqueeze(0)
         
-        # Compute basis functions: cos(2πk/period) -> [seq_len, out_dim, out_dim, num_basis]
+        # Compute basis function: cos(2πk/period) -> [seq_len, out_dim, out_dim]
         phi = torch.cos(2 * math.pi * k / periods)
         
-        # Prepare Z for broadcasting: [seq_len, 1, out_dim, 1]
-        Z_exp = Z.unsqueeze(1).unsqueeze(-1)
+        # Prepare Z for broadcasting: [seq_len, 1, out_dim]
+        Z_exp = Z.unsqueeze(1)
         
-        # Prepare P for broadcasting: [1, out_dim, out_dim, num_basis]
+        # Prepare P for broadcasting: [1, out_dim, out_dim]
         P_exp = self.P.unsqueeze(0)
         
         # Compute position transformation: Z * P * phi
         # Dimensions: 
-        #   Z_exp: [seq_len, 1, out_dim, 1]
-        #   P_exp: [1, out_dim, out_dim, num_basis]
-        #   phi:   [seq_len, out_dim, out_dim, num_basis]
-        # Result: [seq_len, out_dim, out_dim, num_basis]
+        #   Z_exp: [seq_len, 1, out_dim]
+        #   P_exp: [1, out_dim, out_dim]
+        #   phi:   [seq_len, out_dim, out_dim]
+        # Result: [seq_len, out_dim, out_dim]
         M = Z_exp * P_exp * phi
         
-        # Sum over j (dim=2) and g (dim=3) -> [seq_len, out_dim]
-        T = torch.sum(M, dim=(2, 3))
+        # Sum over j (dim=2) -> [seq_len, out_dim]
+        T = torch.sum(M, dim=2)
         
         return T
     
@@ -147,7 +144,7 @@ class Layer(nn.Module):
        
         return out 
 
-class HierDDLpmTorch(nn.Module):
+class HierDDLpm(nn.Module):
     """
     Hierarchical Numeric Dual Descriptor with PyTorch implementation
     Features:
@@ -158,7 +155,7 @@ class HierDDLpmTorch(nn.Module):
     - Configurable trainable parameters
     """
     
-    def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5],
+    def __init__(self, input_dim=2, model_dims=[2],
                  input_seq_len=100, linker_dims=[50], linker_trainable=False,
                  use_residual_list=None, device=None):
         super().__init__()
@@ -171,7 +168,6 @@ class HierDDLpmTorch(nn.Module):
         # Model configuration
         self.input_dim = input_dim
         self.model_dims = model_dims
-        self.num_basis_list = num_basis_list
         self.input_seq_len = input_seq_len
         self.linker_dims = linker_dims
         self.num_layers = len(model_dims)
@@ -180,8 +176,6 @@ class HierDDLpmTorch(nn.Module):
         # Validate dimensions
         if len(linker_dims) != self.num_layers:
             raise ValueError("linker_dims must have same length as model_dims")
-        if len(num_basis_list) != self.num_layers:
-            raise ValueError("num_basis_list must have same length as model_dims")
         
         # Process linker_trainable parameter
         if isinstance(linker_trainable, bool):
@@ -211,13 +205,12 @@ class HierDDLpmTorch(nn.Module):
             in_seq = input_seq_len if l == 0 else linker_dims[l-1]
             out_dim = model_dims[l]
             out_seq = linker_dims[l]
-            num_basis = num_basis_list[l]
             use_residual = self.use_residual_list[l]
             
             # Initialize layer
             layer = Layer(
                 in_dim, out_dim, in_seq, out_seq, 
-                num_basis, self.linker_trainable[l], 
+                self.linker_trainable[l], 
                 use_residual, self.device
             )
             self.layers.append(layer)
@@ -280,8 +273,8 @@ class HierDDLpmTorch(nn.Module):
         
         return total_loss / count if count else 0.0
     
-    def train_model(self, seqs, t_list, max_iters=1000, lr=0.01, 
-                   decay_rate=1.0, tol=1e-88, print_every=10):
+    def train_model(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
+                   decay_rate=1.0, print_every=10):
         """
         Train model using Adam optimizer
         Args:
@@ -335,16 +328,16 @@ class HierDDLpmTorch(nn.Module):
             
             # Average loss for this epoch
             avg_loss = total_loss / n_batches
-            history.append(avg_loss)
-            
-            # Update learning rate
-            scheduler.step()
+            history.append(avg_loss) 
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
-            
+
+            # Update learning rate
+            scheduler.step()            
+
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
@@ -367,8 +360,294 @@ class HierDDLpmTorch(nn.Module):
         output = self.describe(seq)
         
         # Average output vectors
-        return np.mean(output, axis=0)       
+        return np.mean(output, axis=0)      
     
+    def auto_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
+                  continued=False, auto_mode='gap', decay_rate=1.0, print_every=10):
+        """
+        Self-training for the ENTIRE hierarchical model with two modes:
+          - 'gap': Predicts current input vector (self-consistency)
+          - 'reg': Predicts next input vector (auto-regressive) with causal masking
+        
+        Now trains ALL layers of the hierarchical model, not just the first layer.
+        Stores statistical information for reconstruction and generation.
+        
+        Args:
+            seqs: List of input sequences
+            max_iters: Maximum training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate
+            continued: Whether to continue from existing parameters
+            auto_mode: Training mode ('gap' or 'reg')
+            decay_rate: Learning rate decay rate
+            print_every: Print interval
+        
+        Returns:
+            Training loss history
+        """
+        if auto_mode not in ('gap', 'reg'):
+            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        
+        # Validate input sequences
+        for seq in seqs:
+            if len(seq) != self.input_seq_len:
+                raise ValueError(f"All sequences must have length {self.input_seq_len}")
+        
+        # Convert sequences to tensors
+        seqs_tensor = [torch.tensor(seq, dtype=torch.float32, device=self.device) for seq in seqs]
+        
+        # Initialize all layers if not continuing training
+        if not continued:
+            for l, layer in enumerate(self.layers):
+                # Reinitialize parameters with small random values
+                nn.init.uniform_(layer.M, -0.5, 0.5)
+                nn.init.uniform_(layer.P, -0.1, 0.1)
+                
+                if layer.Linker.requires_grad:
+                    nn.init.uniform_(layer.Linker, -0.1, 0.1)
+                
+                # Reinitialize residual components if using 'separate' mode
+                if layer.use_residual == 'separate':
+                    nn.init.uniform_(layer.residual_proj.weight, -0.1, 0.1)
+                    if hasattr(layer, 'residual_linker') and layer.residual_linker.requires_grad:
+                        nn.init.uniform_(layer.residual_linker, -0.1, 0.1)
+            
+            # Calculate global mean vector of input sequences
+            total = torch.zeros(self.input_dim, device=self.device)
+            total_vectors = 0
+            for seq in seqs_tensor:
+                total += torch.sum(seq, dim=0)
+                total_vectors += seq.size(0)
+            self.mean_t = (total / total_vectors).cpu().numpy()            
+        
+        # Calculate total training samples
+        total_samples = 0
+        for seq in seqs_tensor:
+            if auto_mode == 'gap':
+                total_samples += seq.size(0)  # All positions are samples
+            else:  # 'reg' mode
+                total_samples += max(0, seq.size(0) - 1)  # All except last position
+        
+        if total_samples == 0:
+            raise ValueError("No training samples found")
+        
+        # Setup optimizer
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        history = []
+        prev_loss = float('inf')
+        
+        for it in range(max_iters):
+            total_loss = 0.0
+            
+            for seq in seqs_tensor:
+                optimizer.zero_grad()
+                
+                # Forward pass
+                current = seq
+                intermediates = []
+                
+                for l, layer in enumerate(self.layers):
+                    # Apply linear transformation
+                    linear_out = torch.mm(current, layer.M.t())
+                    
+                    # Apply layer normalization with causal masking for reg mode
+                    if auto_mode == 'reg':
+                        normalized_out = []
+                        for k in range(linear_out.size(0)):
+                            # Use only historical positions for normalization
+                            historical = linear_out[:k+1]
+                            normalized = layer.ln(historical)
+                            normalized_out.append(normalized[-1:])  # Take only the last position
+                        normalized_out = torch.cat(normalized_out, dim=0)
+                    else:
+                        normalized_out = layer.ln(linear_out)
+                    
+                    # Position-dependent transformation
+                    T = layer.position_transform(normalized_out)
+                    
+                    # Apply causal masking for Linker matrix in reg mode
+                    if auto_mode == 'reg' and layer.Linker.requires_grad:
+                        # Create causal mask
+                        causal_mask = torch.tril(torch.ones_like(layer.Linker))
+                        used_linker = layer.Linker * causal_mask
+                    else:
+                        used_linker = layer.Linker
+                    
+                    # Sequence transformation
+                    U = torch.mm(used_linker.t(), T)
+                    
+                    # Handle residual connections
+                    if layer.use_residual == 'separate':
+                        residual_feat = layer.residual_proj(current)
+                        if auto_mode == 'reg' and hasattr(layer, 'residual_linker'):
+                            causal_mask_residual = torch.tril(torch.ones_like(layer.residual_linker))
+                            residual = torch.mm(layer.residual_linker.t() * causal_mask_residual, residual_feat)
+                        else:
+                            residual = torch.mm(layer.residual_linker.t(), residual_feat)
+                        current = U + residual
+                    elif layer.use_residual == 'shared':
+                        residual_feat = torch.mm(current, layer.M.t())
+                        residual = torch.mm(used_linker.t(), residual_feat)
+                        current = U + residual
+                    else:
+                        if current.shape == U.shape:
+                            residual = torch.mm(used_linker.t(), current)
+                            current = U + residual
+                        else:
+                            current = U
+                    
+                    intermediates.append({
+                        'linear_out': linear_out,
+                        'normalized_out': normalized_out,
+                        'T': T,
+                        'U': U,
+                        'used_linker': used_linker
+                    })
+                
+                # Calculate loss based on auto_mode
+                loss = 0.0
+                valid_positions = 0
+                
+                for k in range(current.size(0)):
+                    # Skip last position in 'reg' mode
+                    if auto_mode == 'reg' and k == seq.size(0) - 1:
+                        continue
+                    
+                    # Determine target based on mode
+                    if auto_mode == 'gap':
+                        target = seq[k]
+                    else:  # 'reg' mode
+                        target = seq[k + 1]
+                    
+                    # Calculate MSE loss
+                    loss += torch.sum((current[k] - target) ** 2)
+                    valid_positions += 1
+                
+                if valid_positions > 0:
+                    loss = loss / valid_positions
+                    total_loss += loss.item()
+                    loss.backward()
+                    optimizer.step()
+            
+            # Average loss
+            avg_loss = total_loss / len(seqs_tensor)
+            history.append(avg_loss)            
+            
+            # Print progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+
+            # Update learning rate
+            if it % 5 == 0:  # Decay every 5 iterations
+                scheduler.step()
+            
+            # Check convergence
+            if prev_loss - avg_loss < tol:
+                print(f"Converged after {it+1} iterations")
+                break
+            prev_loss = avg_loss
+        
+        self.trained = True
+        return history    
+
+    def generate(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
+        """
+        Generate sequence of vectors with temperature-controlled randomness.
+        Supports both continuous and discrete generation modes.
+        
+        Args:
+            L (int): Number of vectors to generate
+            tau (float): Temperature parameter
+            discrete_mode (bool): If True, use discrete sampling
+            vocab_size (int): Required for discrete mode
+        
+        Returns:
+            Generated sequence as numpy array
+        """
+        assert self.trained and hasattr(self, 'mean_t'), "Model must be auto-trained first"
+        if tau < 0:
+            raise ValueError("Temperature must be non-negative")
+        if discrete_mode and vocab_size is None:
+            raise ValueError("vocab_size must be specified for discrete mode")
+
+        # Set model to evaluation mode
+        self.eval()
+        
+        generated = []
+        # Create initial sequence with proper shape and values
+        current_seq = torch.normal(
+            mean=0.0,  # Use float mean instead of tensor
+            std=0.1,
+            size=(self.input_seq_len, self.input_dim),
+            device=self.device
+        )
+        # Add the learned mean vector to the initial sequence
+        mean_tensor = torch.tensor(self.mean_t, device=self.device, dtype=torch.float32)
+        current_seq = current_seq + mean_tensor.unsqueeze(0)  # Broadcast mean to all positions
+        
+        with torch.no_grad():
+            for _ in range(L):
+                # Forward pass
+                current = current_seq
+                for layer in self.layers:
+                    linear_out = torch.mm(current, layer.M.t())
+                    normalized_out = layer.ln(linear_out)
+                    T = layer.position_transform(normalized_out)
+                    U = torch.mm(layer.Linker.t(), T)
+                    
+                    if layer.use_residual == 'separate':
+                        residual_feat = layer.residual_proj(current)
+                        residual = torch.mm(layer.residual_linker.t(), residual_feat)
+                        current = U + residual
+                    elif layer.use_residual == 'shared':
+                        residual_feat = torch.mm(current, layer.M.t())
+                        residual = torch.mm(layer.Linker.t(), residual_feat)
+                        current = U + residual
+                    else:
+                        if current.shape == U.shape:
+                            residual = torch.mm(layer.Linker.t(), current)
+                            current = U + residual
+                        else:
+                            current = U
+                
+                # Get the last output vector
+                output_vector = current[-1]
+                
+                if discrete_mode:
+                    # Discrete generation mode
+                    discrete_vector = []
+                    for value in output_vector:
+                        # Create logits and sample
+                        logits = torch.full((vocab_size,), value.item())
+                        if tau > 0:
+                            logits += torch.normal(0, tau, size=(vocab_size,))
+                        
+                        if tau == 0:
+                            sampled_index = torch.argmax(logits)
+                        else:
+                            probs = torch.softmax(logits / tau, dim=0)
+                            sampled_index = torch.multinomial(probs, 1)
+                        
+                        discrete_vector.append(sampled_index.item())
+                    
+                    output_vector = torch.tensor(discrete_vector, device=self.device).float()
+                else:
+                    # Continuous generation mode
+                    if tau > 0:
+                        noise = torch.normal(0, tau * torch.abs(output_vector) + 0.01)
+                        output_vector = output_vector + noise
+                
+                generated.append(output_vector.cpu().numpy())
+                
+                # Update current sequence (shift window)
+                current_seq = torch.cat([current_seq[1:], output_vector.unsqueeze(0)])
+        
+        return np.array(generated)
+
     def count_parameters(self):
         """Count learnable parameters"""
         total_params = 0
@@ -401,7 +680,7 @@ class HierDDLpmTorch(nn.Module):
             
             print(f"  Layer {l}:")
             print(f"    M matrix: {list(layer.M.shape)} = {M_params} parameters")
-            print(f"    P tensor: {list(layer.P.shape)} = {P_params} parameters")
+            print(f"    P matrix: {list(layer.P.shape)} = {P_params} parameters")
             print(f"    Linker matrix: {list(layer.Linker.shape)} = {Linker_params} parameters")
             if layer.use_residual == 'separate':
                 print(f"    Residual proj: {list(layer.residual_proj.weight.shape)} = {residual_proj_params} parameters")
@@ -411,8 +690,8 @@ class HierDDLpmTorch(nn.Module):
         
         print(f"Total parameters: {total_params}")
         print(f"Trainable parameters: {trainable_params}")
-        return total_params, trainable_params
-    
+        return total_params, trainable_params   
+
     def save(self, filename):
         """Save model state to file"""
         torch.save({
@@ -420,12 +699,13 @@ class HierDDLpmTorch(nn.Module):
             'config': {
                 'input_dim': self.input_dim,
                 'model_dims': self.model_dims,
-                'num_basis_list': self.num_basis_list,
+                'num_basis_list': self.num_basis_list if hasattr(self, 'num_basis_list') else None,
                 'input_seq_len': self.input_seq_len,
                 'linker_dims': self.linker_dims,
                 'linker_trainable': self.linker_trainable,
                 'use_residual_list': self.use_residual_list
-            }
+            },
+            'mean_t': self.mean_t if hasattr(self, 'mean_t') else None            
         }, filename)
         print(f"Model saved to {filename}")
     
@@ -438,27 +718,30 @@ class HierDDLpmTorch(nn.Module):
         )
         
         # Load checkpoint
-        checkpoint = torch.load(filename, map_location=device)
+        checkpoint = torch.load(filename, map_location=device, weights_only=False)
         config = checkpoint['config']
         
         # Create model instance
         model = cls(
             input_dim=config['input_dim'],
             model_dims=config['model_dims'],
-            num_basis_list=config['num_basis_list'],
             input_seq_len=config['input_seq_len'],
             linker_dims=config['linker_dims'],
             linker_trainable=config['linker_trainable'],
-            use_residual_list=config.get('use_residual_list', None),  # Backward compatibility
+            use_residual_list=config.get('use_residual_list', None),
             device=device
         )
         
         # Load state
         model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load additional attributes
+        if 'mean_t' in checkpoint:
+            model.mean_t = checkpoint['mean_t']
+        
         model.trained = True
         print(f"Model loaded from {filename}")
         return model
-
 
 # === Example Usage ===
 if __name__ == "__main__":
@@ -473,10 +756,9 @@ if __name__ == "__main__":
     # Configuration
     input_dim = 10          # Input vector dimension
     model_dims = [8, 6, 3]  # Output dimensions for each layer
-    num_basis_list = [5, 4, 3]  # Basis functions per layer
     input_seq_len = 100     # Fixed input sequence length
     linker_dims = [100, 50, 20]  # Output sequence lengths for each layer
-    num_seqs = 300          # Number of training sequences
+    num_seqs = 100          # Number of training sequences
     
     # Generate synthetic training data
     print(f"Generating {num_seqs} sequences...")
@@ -493,15 +775,13 @@ if __name__ == "__main__":
 
     # Test Case 1: Mixed residual strategies
     print("\n=== Test Case 1: Mixed Residual Strategies ===")
-    model_mixed = HierDDLpmTorch(
+    model_mixed = HierDDLpm(
         input_dim=input_dim,
         model_dims=model_dims,
-        num_basis_list=num_basis_list,
         input_seq_len=input_seq_len,
         linker_dims=linker_dims,
         linker_trainable=[True, False, True],
         use_residual_list=['separate', 'shared', None]  # Different residual for each layer
-        #use_residual_list=[None] * 3
     )
     
     # Parameter count
@@ -534,7 +814,7 @@ if __name__ == "__main__":
     # Test Case 2: Save and load model
     print("\nTesting save/load functionality...")
     model_mixed.save("hddlpm_model_residual.pth")
-    loaded_model = HierDDLpmTorch.load("hddlpm_model_residual.pth")
+    loaded_model = HierDDLpm.load("hddlpm_model_residual.pth")
     
     # Check parameter equality
     param_match = True
@@ -556,3 +836,81 @@ if __name__ == "__main__":
         print("Predictions differ after loading")
         print(f"Original: {orig_pred}")
         print(f"Loaded: {loaded_pred}")
+    
+    # Test Case 4: Auto-training functionality
+    print("\n=== Test Case 4: Auto-training ===")
+    # Create a new model for auto-training
+    model_auto = HierDDLpm(
+        input_dim=input_dim,
+        model_dims=[10, 20, 10],
+        input_seq_len=input_seq_len,
+        linker_dims=linker_dims,
+        linker_trainable=[True, True, True],
+        use_residual_list=['separate', 'shared', None]
+    )
+    
+    # Auto-train in gap mode (self-consistency)
+    print("\nAuto-training in gap mode...")
+    auto_history_gap = model_auto.auto_train(
+        seqs[:10],  # Use subset for faster training
+        max_iters=20,
+        learning_rate=0.01,
+        auto_mode='gap',
+        print_every=5
+    )
+    
+    # Generate sequences using the auto-trained model
+    print("\nGenerating sequences with auto-trained model...")
+    generated_seq = model_auto.generate(
+        L=50,
+        tau=0.1,
+        discrete_mode=False
+    )
+    print(f"Generated sequence shape: {generated_seq.shape}")
+    print(f"First few vectors:\n{generated_seq[:3]}")
+    
+    # Test Case 5: Auto-training in regression mode
+    print("\n=== Test Case 5: Auto-training in regression mode ===")
+    model_auto_reg = HierDDLpm(
+        input_dim=input_dim,
+        model_dims=[10, 20, 10],
+        input_seq_len=input_seq_len,
+        linker_dims=linker_dims,
+        linker_trainable=[True, True, True],
+        use_residual_list=['separate', 'shared', None]
+    )
+    
+    print("\nAuto-training in regression mode...")
+    auto_history_reg = model_auto_reg.auto_train(
+        seqs[:10],  # Use subset for faster training
+        max_iters=20,
+        learning_rate=0.01,
+        auto_mode='reg',
+        print_every=5
+    )
+    
+    # Generate sequences using regression-trained model
+    print("\nGenerating sequences with regression-trained model...")
+    generated_seq_reg = model_auto_reg.generate(
+        L=30,
+        tau=0.05,
+        discrete_mode=False
+    )
+    print(f"Generated sequence shape: {generated_seq_reg.shape}")
+    print(f"First few vectors:\n{generated_seq_reg[:3]}")
+    
+    # Test Case 6: Save and load auto-trained model
+    print("\n=== Test Case 6: Save/Load Auto-trained Model ===")
+    model_auto.save("hddlpm_auto_model.pth")
+    loaded_auto_model = HierDDLpm.load("hddlpm_auto_model.pth")
+    
+    # Test generation consistency
+    orig_gen = model_auto.generate(L=10, tau=0.0)
+    loaded_gen = loaded_auto_model.generate(L=10, tau=0.0)
+    
+    if np.allclose(orig_gen, loaded_gen, atol=1e-5):
+        print("Generation consistent after loading auto-trained model")
+    else:
+        print("Generation differs after loading")
+        print(f"Original mean: {np.mean(orig_gen):.4f}, std: {np.std(orig_gen):.4f}")
+        print(f"Loaded mean: {np.mean(loaded_gen):.4f}, std: {np.std(loaded_gen):.4f}")
