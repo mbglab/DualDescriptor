@@ -1,14 +1,11 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Numeric Dual Descriptor class (Tensor form) with hierarchical structure mixed with transformer encoder
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# A Dual Descriptor Network class demo: hDD (Tensor form) mixed with Transformer encoder
+# This program is for the demonstration of methodology and not fully refined.
 # Author: Bin-Guang Ma (assisted by ChatGPT); Date: 2025-8-12
-#
-# Pure Python implementation (no numpy/pytorch). Use for experimentation / debugging.
-
 
 import math
 import random
 import pickle
-
 
 class DDNet:
     """
@@ -97,7 +94,6 @@ class DDNet:
         out_dim = model_dims[-1]
         self.read_W = [[random.uniform(-0.1, 0.1) for _ in range(out_dim)] for _ in range(self.input_dim)]
         self.read_b = [0.0] * self.input_dim
-
 
     # ---------------------
     # basic helpers
@@ -754,6 +750,17 @@ class DDNet:
         self.trained = True
         return history
 
+    # predict average
+    def predict_t(self, seq):
+        outputs = self.describe(seq)
+        if not outputs:
+            return [0.0]*self.model_dims[-1]
+        t_pred = [0.0]*len(outputs[0])
+        for vec in outputs:
+            for i in range(len(vec)):
+                t_pred[i] += vec[i]
+        return [x/len(outputs) for x in t_pred]
+
     def auto_train(self, seqs, mode='gap', max_iters=200, learning_rate=0.5, decay_rate=0.995,
                print_every=10, tol=1e-9, continued=False):
         """
@@ -1253,18 +1260,6 @@ class DDNet:
 
         self.trained = True
         return history
-
-
-    # predict average
-    def predict_t(self, seq):
-        outputs = self.describe(seq)
-        if not outputs:
-            return [0.0]*self.model_dims[-1]
-        t_pred = [0.0]*len(outputs[0])
-        for vec in outputs:
-            for i in range(len(vec)):
-                t_pred[i] += vec[i]
-        return [x/len(outputs) for x in t_pred]
 
     def generate(self, L, tau=0.0):
         """
