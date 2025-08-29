@@ -1,7 +1,8 @@
-# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Hierarchical Numeric Dual Descriptor class (AB matrix form) for Vector Sequences
-# PyTorch implementation of Hierarchical Numeric Dual Descriptor with GPU support 
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-7
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Hierarchical Numeric Dual Descriptor (AB matrix form) implemented with PyTorch
+# With layer normalization and residual connections and generation capability
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26
 
 import math
 import random
