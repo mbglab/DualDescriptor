@@ -1,3 +1,8 @@
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# A Dual Descriptor Network class demo: hDD (Tensor form) mixed with Transformer encoder
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by ChatGPT & DeepSeek); Date: 2025-8-25
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -309,6 +314,15 @@ class DDNet(nn.Module):
         
         self.trained = True
         return history
+
+    def predict_t(self, seq):
+        """Predict target vector for a sequence"""
+        self.eval()
+        with torch.no_grad():
+            seq_tensor = torch.tensor(seq, dtype=torch.float32, device=self.device).unsqueeze(0)
+            outputs = self(seq_tensor)
+            t_pred = outputs.mean(dim=1).squeeze(0).cpu().numpy()
+        return t_pred
     
     def auto_train(self, seqs, mode='gap', max_iters=200, lr=0.5, decay_rate=0.995,
                    print_every=10, tol=1e-9):
@@ -393,16 +407,7 @@ class DDNet(nn.Module):
                 break
         
         self.trained = True
-        return history
-    
-    def predict_t(self, seq):
-        """Predict target vector for a sequence"""
-        self.eval()
-        with torch.no_grad():
-            seq_tensor = torch.tensor(seq, dtype=torch.float32, device=self.device).unsqueeze(0)
-            outputs = self(seq_tensor)
-            t_pred = outputs.mean(dim=1).squeeze(0).cpu().numpy()
-        return t_pred
+        return history     
     
     def generate(self, L, tau=0.0, start_vec=None):
         """

@@ -1,7 +1,7 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# Hybrid Descriptor-Transformer Network (DDNet) implementation
-# PyTorch implementation with GPU support
-# Author: Bin-Guang Ma; Date: 2025-8-16
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# A Dual Descriptor Network class demo: hDD (Tensor form) mixed with Transformer encoder
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-25
 
 import math
 import random
@@ -219,27 +219,7 @@ class DDNet(nn.Module):
             # Transformer layer processing (no padding mask needed for full sequences)
             x = trans_layer(x_desc)
         
-        return x
-    
-    def predict_t(self, seq):
-        """
-        Predict target vector for a sequence
-        Returns the average of all output vectors in the sequence
-        
-        Args:
-            seq (Tensor): Input sequence of shape (batch_size, seq_len, input_dim)
-        
-        Returns:
-            Tensor: Predicted target vector of shape (batch_size, target_dim)
-        """
-        # Get final sequence representation
-        outputs = self.forward(seq)
-        
-        # Average pooling over sequence length
-        pooled = outputs.mean(dim=1)
-        
-        # Project to target dimension
-        return self.output_layer(pooled)
+        return x  
     
     def deviation(self, seqs, t_list):
         """
@@ -337,6 +317,26 @@ class DDNet(nn.Module):
                 print(f"Iter {it:4d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
         
         return history
+
+    def predict_t(self, seq):
+        """
+        Predict target vector for a sequence
+        Returns the average of all output vectors in the sequence
+        
+        Args:
+            seq (Tensor): Input sequence of shape (batch_size, seq_len, input_dim)
+        
+        Returns:
+            Tensor: Predicted target vector of shape (batch_size, target_dim)
+        """
+        # Get final sequence representation
+        outputs = self.forward(seq)
+        
+        # Average pooling over sequence length
+        pooled = outputs.mean(dim=1)
+        
+        # Project to target dimension
+        return self.output_layer(pooled)
     
     def count_parameters(self):
         """Count and print learnable parameters in the model by layer and parameter type"""
