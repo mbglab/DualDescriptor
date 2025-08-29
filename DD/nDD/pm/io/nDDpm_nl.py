@@ -1,9 +1,8 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Numeric Dual Descriptor class (Tensor form) with n-dim input and l-dim output
-# Author: Bin-Guang Ma; Date: 2025-6-4
-
-# The program is provided as it is and without warranty of any kind,
-# either expressed or implied.
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Numeric Dual Descriptor Vector class (P Matrix form) implemented with pure Python
+# Modified to support n-dimensional input and l-dimensional output
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-20
 
 import math
 import random
