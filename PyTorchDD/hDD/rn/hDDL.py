@@ -1,8 +1,8 @@
-# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Hierarchical Numeric Dual Descriptor class (Random AB matrix form) with Linker Matrices for Sequence Length Transformation
-# Modified to support hierarchical structure with multiple layers and sequence length transformation
-# PyTorch GPU Accelerated Version
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-7
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Hierarchical Numeric Dual Descriptor (Random AB matrix form) with Linker matrices in PyTorch
+# With layer normalization and residual connections and generation capability
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-22
 
 import random
 import numpy as np
