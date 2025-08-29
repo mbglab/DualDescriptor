@@ -1,8 +1,7 @@
-# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Dual Descriptor Vector class (AB matrix form) - PyTorch GPU Accelerated Version
-# Modified for m-dimensional real vector sequences
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-5
-# Optimized for GPU acceleration with batch processing
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Numeric Dual Descriptor Vector class (AB matrix form) implemented with PyTorch
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28
 
 import math
 import itertools
@@ -299,6 +298,13 @@ class DualDescriptorVectorAB(nn.Module):
         
         return history
 
+    def predict_t(self, vec_seq):
+        """Predict target vector as average of N(k) vectors"""
+        Nk = self.describe(vec_seq)
+        if Nk.shape[0] == 0:
+            return np.zeros(self.m)
+        return torch.mean(Nk, dim=0).detach().cpu().numpy()
+
     def auto_train(self, vec_seqs, auto_mode='gap', max_iters=1000, tol=1e-8, 
                    learning_rate=0.01, continued=False, decay_rate=1.0, 
                    print_every=10, batch_size=1024):
@@ -422,13 +428,6 @@ class DualDescriptorVectorAB(nn.Module):
         self.trained = True
         
         return history
-
-    def predict_t(self, vec_seq):
-        """Predict target vector as average of N(k) vectors"""
-        Nk = self.describe(vec_seq)
-        if Nk.shape[0] == 0:
-            return np.zeros(self.m)
-        return torch.mean(Nk, dim=0).detach().cpu().numpy()
 
     def reconstruct(self):
         """Reconstruct representative vector sequence"""

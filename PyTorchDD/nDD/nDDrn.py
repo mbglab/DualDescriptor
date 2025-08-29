@@ -1,8 +1,7 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Dual Descriptor Vector class (Random AB matrix form) - PyTorch GPU Version
-# Modified for m-dimensional vector sequences instead of character sequences
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-6
-# Optimized for GPU acceleration with batch processing and layer normalization
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Numeric Dual Descriptor Vector class (Random AB matrix form) implemented with PyTorch
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28
 
 import math
 import random
