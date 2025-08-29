@@ -1,7 +1,7 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Dual Descriptor Vector class (Tensor form) - PyTorch GPU Accelerated Version
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-4
-# Optimized for GPU acceleration with batch processing
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Dual Descriptor Vector class (Tensor form) implemented with PyTorch
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-29
 
 import math
 import random
