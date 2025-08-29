@@ -1,6 +1,7 @@
-# Copyright (C) Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Numeric Dual Descriptor class (Tensor form) with hierarchical structure
-# Author: Bin-Guang Ma; Date: 2025-6-4
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Hierarchical Numeric Dual Descriptor (Tensor form) implemented with pure Python
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-22
 
 import math
 import random
