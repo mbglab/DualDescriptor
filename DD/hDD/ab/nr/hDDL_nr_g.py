@@ -1,8 +1,8 @@
-# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn). All rights reserved.
-# The Hierarchical Numeric Dual Descriptor class with Linker Matrices for Sequence Length Transformation
-# Modified to support hierarchical structure with multiple layers and sequence length transformation
-# Added layer normalization and residual connections similar to hDDLts.py implementation
-# Author: Bin-Guang Ma; Date: 2025-7-7
+# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# The Hierarchical Numeric Dual Descriptor (AB matrix form) with Linker matrices in pure Python
+# Added layer normalization and residual connections and generation capability
+# This program is for the demonstration of methodology and not fully refined.
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-6-24
 
 import math
 import random
