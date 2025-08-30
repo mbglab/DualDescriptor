@@ -10,9 +10,9 @@ import pickle
 
 class DualDescriptorRN:
     """
-    Dual Descriptor with:
+    Vector Dual Descriptor with:
       - learnable coefficient matrix Acoeff ∈ R^{m×L}
-      - learnable basis matrix Bbasis ∈ R^{L×m} (now trainable with random initialization)
+      - learnable basis matrix Bbasis ∈ R^{L×m} (trainable with random initialization)
       - learnable token embeddings M: token → R^m
     """
     def __init__(self, charset, vec_dim=4, bas_dim=50, rank=1, rank_mode='drop', mode='linear', user_step=None):

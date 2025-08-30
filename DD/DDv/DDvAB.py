@@ -10,9 +10,9 @@ import pickle
 
 class DualDescriptorAB:
     """
-    Dual Descriptor with:
+    Vector Dual Descriptor with:
       - learnable coefficient matrix Acoeff ∈ R^{m×L}
-      - fixed basis matrix Bbasis ∈ R^{L×m}, Bbasis[k][i] = cos(2π*(k+1)/(i+1))
+      - fixed basis matrix Bbasis ∈ R^{L×m}, Bbasis[k][i] = cos(2π*(k+1)/(i+2))
       - learnable token embeddings x_map: token → R^m
     """
     def __init__(self, charset, vec_dim=4, bas_dim=50, rank=1, rank_mode='drop', mode='linear', user_step=None):
@@ -46,7 +46,7 @@ class DualDescriptorAB:
         self.Acoeff = [[random.uniform(-0.1,0.1) for _ in range(self.L)]
                        for _ in range(self.m)]
         # build fixed basis Bbasis: L×m
-        self.Bbasis = [[math.cos(2*math.pi*(k+1)/(i+1))
+        self.Bbasis = [[math.cos(2*math.pi*(k+1)/(i+2))
                         for i in range(self.m)]
                        for k in range(self.L)]        
         # cache its transpose: m×L
@@ -1187,7 +1187,7 @@ if __name__ == "__main__":
 
     from statistics import correlation
     
-    random.seed(55)
+    random.seed(5)
     charset = ['A','C','G','T']
     dd = DualDescriptorAB(charset, rank=1, vec_dim=2, bas_dim=150, mode='linear', user_step=None)
 
@@ -1274,7 +1274,7 @@ if __name__ == "__main__":
 
     # === Auto-Training Example ===
     # Set random seed for reproducible results
-    random.seed(42)
+    random.seed(2)
     
     # Define character set and model parameters
     charset = ['A','C','G','T']
