@@ -249,7 +249,7 @@ class DDNet(nn.Module):
         
         return total_loss / count if count else 0.0
     
-    def train_model(self, seqs, t_list, max_iters=1000, lr=0.001, 
+    def grad_train(self, seqs, t_list, max_iters=1000, lr=0.001, 
                     batch_size=8, decay_rate=0.998, print_every=10):
         """
         Train model using Adam optimizer with batch processing
@@ -570,7 +570,7 @@ if __name__ == "__main__":
     
     # Train model with improved settings
     print("\nTraining model with improved settings...")
-    history = model.train_model(
+    history = model.grad_train(
         seqs, 
         t_list,
         max_iters=50,
