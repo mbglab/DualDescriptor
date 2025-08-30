@@ -189,7 +189,7 @@ class HierDDpm(nn.Module):
         
         return total_loss / count if count else 0.0
     
-    def train_model(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
                     decay_rate=0.999, print_every=10):
         """
         Train model using Adam optimizer
@@ -480,6 +480,48 @@ class HierDDpm(nn.Module):
                 current_seq = torch.cat([current_seq[1:], output_vector.unsqueeze(0)])
         
         return np.array(generated)
+
+    def count_parameters(self):
+        """Count and print learnable parameters in the model by layer and parameter type"""
+        total_params = 0
+        layer_params = []
+        
+        # Print header
+        print("="*60)
+        print(f"{'Layer':<10} | {'Param Type':<20} | {'Count':<15} | {'Shape':<20}")
+        print("-"*60)
+        
+        # Iterate through each layer
+        for i, layer in enumerate(self.layers):
+            layer_total = 0
+            layer_name = f"Layer {i}"
+            
+            # Count parameters in this layer
+            for name, param in layer.named_parameters():
+                if param.requires_grad:
+                    num = param.numel()
+                    shape = str(tuple(param.shape))
+                    
+                    # Print parameter details
+                    print(f"{layer_name:<10} | {name:<20} | {num:<15} | {shape:<20}")
+                    
+                    layer_total += num
+                    total_params += num
+            
+            # Store layer summary
+            layer_params.append((layer_name, layer_total))
+        
+        # Print summary by layer
+        print("-"*60)
+        for name, count in layer_params:
+            print(f"{name} total parameters: {count}")
+        
+        # Print grand total
+        print("="*60)
+        print(f"Total trainable parameters: {total_params}")
+        print("="*60)
+        
+        return total_params
     
     def save(self, filename):
         """Save model state to file"""
@@ -525,54 +567,13 @@ class HierDDpm(nn.Module):
             model.trained = checkpoint['trained']
             
         print(f"Model loaded from {filename}")
-        return model
+        return model   
     
-    def count_parameters(self):
-        """Count and print learnable parameters in the model by layer and parameter type"""
-        total_params = 0
-        layer_params = []
-        
-        # Print header
-        print("="*60)
-        print(f"{'Layer':<10} | {'Param Type':<20} | {'Count':<15} | {'Shape':<20}")
-        print("-"*60)
-        
-        # Iterate through each layer
-        for i, layer in enumerate(self.layers):
-            layer_total = 0
-            layer_name = f"Layer {i}"
-            
-            # Count parameters in this layer
-            for name, param in layer.named_parameters():
-                if param.requires_grad:
-                    num = param.numel()
-                    shape = str(tuple(param.shape))
-                    
-                    # Print parameter details
-                    print(f"{layer_name:<10} | {name:<20} | {num:<15} | {shape:<20}")
-                    
-                    layer_total += num
-                    total_params += num
-            
-            # Store layer summary
-            layer_params.append((layer_name, layer_total))
-        
-        # Print summary by layer
-        print("-"*60)
-        for name, count in layer_params:
-            print(f"{name} total parameters: {count}")
-        
-        # Print grand total
-        print("="*60)
-        print(f"Total trainable parameters: {total_params}")
-        print("="*60)
-        
-        return total_params
 
 # === Example Usage ===
 if __name__ == "__main__":
 
-    from scipy.stats import pearsonr
+    from statistics import correlation
     
     # Set random seeds for reproducibility
     torch.manual_seed(0)
@@ -613,7 +614,7 @@ if __name__ == "__main__":
     
     # Train model
     print("\nTraining model...")
-    history = model.train_model(
+    history = model.grad_train(
         seqs, 
         t_list,
         max_iters=100,
@@ -647,9 +648,9 @@ if __name__ == "__main__":
     for i in range(output_dim):
         actual = [t[i] for t in t_list]
         predicted = [p[i] for p in all_preds]
-        corr, p_value = pearsonr(actual, predicted)
+        corr = correlation(actual, predicted)
         correlations.append(corr)
-        print(f"Output dim {i} correlation: {corr:.4f} (p={p_value:.4e})")
+        print(f"Output dim {i} correlation: {corr:.4f}")
     
     avg_corr = np.mean(correlations)
     print(f"\nAverage correlation: {avg_corr:.4f}")      
