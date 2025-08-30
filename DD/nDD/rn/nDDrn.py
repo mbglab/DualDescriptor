@@ -7,7 +7,7 @@ import math
 import random
 import pickle
 
-class NumDualDescriptorAB:
+class NumDualDescriptorRN:
     """
     Numeric Dual Descriptor for vector sequences with:
       - learnable coefficient matrix Acoeff ∈ R^{m×L}
@@ -22,6 +22,7 @@ class NumDualDescriptorAB:
             vec_dim (int): Dimension m of input vectors
             bas_dim (int): Basis dimension L
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
@@ -837,7 +838,7 @@ class NumDualDescriptorAB:
         if 'all' in what:
             what = ['params', 'Acoeff', 'Bbasis', 'M', 'stats']
         
-        print("NumDualDescriptorAB Model Status:")
+        print("NumDualDescriptorRN Model Status:")
         print("-" * 50)
         
         # 1. Configuration parameters
@@ -975,8 +976,8 @@ if __name__ == "__main__":
         print(f"Sequence {i+1}: length={length}, target={[round(t,2) for t in target]}")
     
     # Initialize model
-    print("\nInitializing NumDualDescriptorAB model...")
-    dd = NumDualDescriptorAB(
+    print("\nInitializing NumDualDescriptorRN model...")
+    dd = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=150,  # Basis dimension
         rank=1,       # Window size
@@ -1017,7 +1018,7 @@ if __name__ == "__main__":
     
     # Train with gradient descent
     print("\nTraining with Gradient Descent...")
-    dd_grad = NumDualDescriptorAB(
+    dd_grad = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=150,
         rank=1,
@@ -1050,7 +1051,7 @@ if __name__ == "__main__":
     
     # Self-supervised training
     print("\nSelf-supervised training (auto-regressive)...")
-    dd_auto = NumDualDescriptorAB(
+    dd_auto = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=100,
         rank=1,
@@ -1090,7 +1091,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     dd_auto.save("vector_model.pkl")
-    dd_loaded = NumDualDescriptorAB.load("vector_model.pkl")
+    dd_loaded = NumDualDescriptorRN.load("vector_model.pkl")
     print("Loaded model prediction for first sequence:")
     pred = dd_loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
