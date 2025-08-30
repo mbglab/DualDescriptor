@@ -22,7 +22,7 @@ class NumDualDescriptorPM:
         self.n = in_dim     # input vector dimension (n)
         self.m = out_dim    # output vector dimension (m)
         self.rank = rank    # window size for vector aggregation
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode # 'pad' or 'drop'
         assert mode in ('linear','nonlinear')
         self.mode = mode

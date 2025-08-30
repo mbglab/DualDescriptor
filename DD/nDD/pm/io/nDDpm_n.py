@@ -27,6 +27,7 @@ class NumDualDescriptorPM:
             input_dim (int): Dimension of input vectors (n)
             model_dim (int): Dimension of internal representation (m)
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             mode (str): 'linear' or 'nonlinear' processing mode
             user_step (int): Custom step size for nonlinear mode
@@ -34,7 +35,7 @@ class NumDualDescriptorPM:
         self.n = input_dim    # Input dimension (n)
         self.m = model_dim    # Internal dimension (m)
         self.rank = rank
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode
         assert mode in ('linear','nonlinear')
         self.mode = mode
