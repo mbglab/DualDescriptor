@@ -11,19 +11,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from statistics import correlation
 
-class DualDescriptorVectorTS(nn.Module):
+class NumDualDescriptorTS(nn.Module):
     """
-    Vector Dual Descriptor with GPU acceleration using PyTorch:
+    Numeric Dual Descriptor with GPU acceleration using PyTorch:
       - tensor P ∈ R^{m×m×o} of basis coefficients
       - mapping matrix M ∈ R^{m×m} for vector transformation
       - indexed periods: period[i,j,g] = i*(m*o) + j*o + g + 2
       - basis function phi_{i,j,g}(k) = cos(2π * k / period[i,j,g])
       - supports 'linear' or 'nonlinear' (step-by-rank) vector extraction
-      - Added Layer Normalization for stable training
     """
-    def __init__(self, vec_dim=2, rank=1, rank_op='avg', rank_mode='drop', num_basis=5, mode='linear', user_step=None, device='cuda', use_norm=True):
+    def __init__(self, vec_dim=2, rank=1, rank_op='avg', rank_mode='drop', num_basis=5, mode='linear', user_step=None, device='cuda'):
         super().__init__()
         self.m = vec_dim    # vector dimension
         self.o = num_basis  # number of basis terms        
@@ -35,7 +33,6 @@ class DualDescriptorVectorTS(nn.Module):
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm  # whether to use layer normalization
         
         # Mapping matrix M (m×m) for vector transformation
         self.M = nn.Parameter(torch.empty(self.m, self.m))
@@ -51,10 +48,6 @@ class DualDescriptorVectorTS(nn.Module):
                     periods[i, j, g] = i*(self.m*self.o) + j*self.o + g + 2
         self.register_buffer('periods', periods)
 
-        # Add Layer Normalization for stable training
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
-        
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -63,9 +56,6 @@ class DualDescriptorVectorTS(nn.Module):
         """Initialize model parameters"""
         nn.init.uniform_(self.M, -0.5, 0.5)
         nn.init.uniform_(self.P, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)  
     
     def extract_vectors(self, seq_vectors):
         """
@@ -159,10 +149,6 @@ class DualDescriptorVectorTS(nn.Module):
         
         # Optimized computation using einsum
         Nk = torch.einsum('bj,ijg,bijg->bi', x, self.P, phi)
-        
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
             
         return Nk
 
@@ -554,6 +540,9 @@ class DualDescriptorVectorTS(nn.Module):
 
 # === Example Usage ===
 if __name__=="__main__":
+
+    from statistics import correlation
+    
     print("="*50)
     print("Dual Descriptor Vector TS - PyTorch GPU Accelerated Version")
     print("Modified for processing m-dimensional real vector sequences")
@@ -581,25 +570,23 @@ if __name__=="__main__":
         t_list.append(np.random.uniform(-1.0, 1.0, vec_dim).astype(np.float32))
 
     # Initialize the model
-    dd = DualDescriptorVectorTS(
+    dd = NumDualDescriptorTS(
         vec_dim=vec_dim, 
         rank=rank,
         rank_op=rank_op,
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=False  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Vector dimension: {dd.m}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
 
     # Training model
     print("\n" + "="*50)
-    print("Starting Gradient Descent Training with LayerNorm")
+    print("Starting Gradient Descent Training")
     print("="*50)
     dd.grad_train(seqs_vectors, t_list, max_iters=100, tol=1e-6, learning_rate=0.1, decay_rate=0.99, batch_size=1024)  
    
@@ -640,18 +627,17 @@ if __name__=="__main__":
    
     # === Combined self-training examples ===
     print("\n" + "="*50)
-    print("Combined Auto-Training Example with LayerNorm")
+    print("Combined Auto-Training Example")
     print("="*50)
     
-    # Create a new model with normalization
-    dd_gap = DualDescriptorVectorTS(
+    # Create a new model
+    dd_gap = NumDualDescriptorTS(
         vec_dim=vec_dim, 
         rank=rank, 
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Generate sample vector sequences
@@ -661,7 +647,7 @@ if __name__=="__main__":
         auto_seqs.append(np.random.randn(L, vec_dim).astype(np.float32))
     
     # Conduct self-consistenty training (gap mode)
-    print("\nTraining in 'gap' mode (self-consistency) with LayerNorm:")
+    print("\nTraining in 'gap' mode (self-consistency):")
     gap_history = dd_gap.auto_train(
         auto_seqs, 
         max_iters=50, 
@@ -672,7 +658,7 @@ if __name__=="__main__":
     )
     
     # Generate vector sequences
-    print("\nGenerated vector sequences from 'gap' model with LayerNorm:")
+    print("\nGenerated vector sequences from 'gap' model:")
     for i in range(2):
         gen_vectors = dd_gap.generate(5, tau=0.2)
         print(f"Sequence {i+1} (first 3 vectors):")

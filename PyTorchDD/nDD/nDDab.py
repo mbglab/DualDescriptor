@@ -11,11 +11,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from statistics import correlation
 
-class DualDescriptorVectorAB(nn.Module):
+class NumDualDescriptorAB(nn.Module):
     """
-    Dual Descriptor for m-dimensional real vector sequences with GPU acceleration using PyTorch:
+    Numeric Dual Descriptor with GPU acceleration using PyTorch:
       - learnable coefficient matrix Acoeff ∈ R^{m×L}
       - fixed basis matrix Bbasis ∈ R^{L×m}, Bbasis[k][i] = cos(2π*(k+1)/(i+1))
       - learnable mapping matrix M ∈ R^{m×m} for vector transformation
@@ -23,7 +22,7 @@ class DualDescriptorVectorAB(nn.Module):
       - Batch processing for GPU acceleration
     """
     def __init__(self, vec_dim=4, bas_dim=50, rank=1, rank_op='avg', rank_mode='drop', 
-                 mode='linear', user_step=None, device='cuda', use_norm=True):
+                 mode='linear', user_step=None, device='cuda'):
         """
         Initialize the Dual Descriptor for vector sequences.
         
@@ -36,7 +35,6 @@ class DualDescriptorVectorAB(nn.Module):
             mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
             device (str): 'cuda' or 'cpu'
-            use_norm (bool): Whether to use layer normalization
         """
         super().__init__()
         self.m = vec_dim
@@ -49,7 +47,6 @@ class DualDescriptorVectorAB(nn.Module):
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm  # whether to use layer normalization
         
         # Learnable mapping matrix M (m x m)
         self.M = nn.Parameter(torch.empty(self.m, self.m))
@@ -64,10 +61,6 @@ class DualDescriptorVectorAB(nn.Module):
                 Bbasis[k, i] = math.cos(2 * math.pi * (k+1) / (i+1))
         self.register_buffer('Bbasis', Bbasis)
 
-        # Add Layer Normalization for stable training
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
-        
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -76,9 +69,6 @@ class DualDescriptorVectorAB(nn.Module):
         """Initialize model parameters"""        
         nn.init.uniform_(self.M, -0.5, 0.5)
         nn.init.uniform_(self.Acoeff, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)
     
     def extract_vectors(self, vec_seq):
         """
@@ -172,10 +162,6 @@ class DualDescriptorVectorAB(nn.Module):
         
         # Compute Nk = scalar * A_cols
         Nk = A_cols * scalar.unsqueeze(1)  # [seq_len, m]
-
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
         
         return Nk
     
@@ -550,6 +536,9 @@ class DualDescriptorVectorAB(nn.Module):
 
 # === Example Usage ===
 if __name__ == "__main__":
+
+    from statistics import correlation
+    
     print("="*50)
     print("Dual Descriptor Vector AB - PyTorch GPU Accelerated Version")
     print("Modified for m-dimensional real vector sequences")
@@ -575,21 +564,19 @@ if __name__ == "__main__":
         t_list.append(np.random.uniform(-1, 1, vec_dim))
     
     # Create model
-    dd = DualDescriptorVectorAB(
+    dd = NumDualDescriptorAB(
         vec_dim=vec_dim, 
         bas_dim=bas_dim, 
         rank=1,
         rank_op='avg',
         rank_mode='drop',
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=False
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Vector dimension: {dd.m}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
     
     # === Gradient Descent Training ===
     print("\n" + "="*50)
@@ -663,14 +650,13 @@ if __name__ == "__main__":
     
     # Create model for gap filling
     print("\n=== Creating Dual Descriptor Model for Gap Filling ===")
-    dd_gap = DualDescriptorVectorAB(
+    dd_gap = NumDualDescriptorAB(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=2,
         rank_mode='drop',
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Train in gap filling mode
@@ -687,14 +673,13 @@ if __name__ == "__main__":
     
     # Create model for auto-regressive training
     print("\n=== Creating Dual Descriptor Model for Auto-Regressive Training ===")
-    dd_reg = DualDescriptorVectorAB(
+    dd_reg = NumDualDescriptorAB(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=2,
         rank_mode='drop',
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Train in auto-regressive mode
@@ -727,7 +712,7 @@ if __name__ == "__main__":
     dd_reg.save("auto_trained_vector_model.pkl")
     
     # Load model
-    dd_loaded = DualDescriptorVectorAB(
+    dd_loaded = NumDualDescriptorAB(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=2,

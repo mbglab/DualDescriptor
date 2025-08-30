@@ -11,18 +11,17 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 
-class DualDescriptorRN(nn.Module):
+class NumDualDescriptorRN(nn.Module):
     """
-    Dual Descriptor with GPU acceleration using PyTorch:
+    Numeric Dual Descriptor with GPU acceleration using PyTorch:
       - Learnable coefficient matrix Acoeff ∈ R^{m×L}
       - Learnable basis matrix Bbasis ∈ R^{L×m}
       - Learnable transformation matrix M: R^m → R^m
-      - Added Layer Normalization for stable training
       - Optimized with batch processing for GPU acceleration
       - Modified to handle m-dimensional vector sequences
     """
     def __init__(self, vec_dim=4, bas_dim=50, rank=1, rank_op='avg', rank_mode='drop', 
-                 mode='linear', user_step=None, device='cuda', use_norm=True):
+                 mode='linear', user_step=None, device='cuda'):
         """
         Initialize the Dual Descriptor for vector sequences.
         
@@ -35,7 +34,6 @@ class DualDescriptorRN(nn.Module):
             mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
             device (str): 'cuda' or 'cpu'
-            use_norm (bool): Whether to use layer normalization
         """
         super().__init__()
         self.m = vec_dim
@@ -48,7 +46,6 @@ class DualDescriptorRN(nn.Module):
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm
         
         # Learnable transformation matrix M (m×m)
         self.M = nn.Parameter(torch.empty(self.m, self.m))
@@ -59,10 +56,6 @@ class DualDescriptorRN(nn.Module):
         # Basis matrix Bbasis: L×m
         self.Bbasis = nn.Parameter(torch.empty(self.L, self.m))
         
-        # Layer normalization
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
-        
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -72,9 +65,6 @@ class DualDescriptorRN(nn.Module):
         nn.init.uniform_(self.M, -0.5, 0.5)
         nn.init.uniform_(self.Acoeff, -0.1, 0.1)
         nn.init.uniform_(self.Bbasis, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)   
 
     def extract_vectors(self, vec_seq):
         """
@@ -167,10 +157,6 @@ class DualDescriptorRN(nn.Module):
         
         # Compute Nk = scalar * A_j [batch_size, m]
         Nk = scalar * A_j
-        
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
             
         return Nk
 
@@ -499,7 +485,8 @@ class DualDescriptorRN(nn.Module):
             errors = torch.sum((Nk_all - mean_t_tensor) ** 2, dim=1)
             min_idx = torch.argmin(errors).item()
             best_vector = candidate_vectors[min_idx]
-            reconstructed_vectors.append(best_vector.detach().cpu().numpy())
+            
+            reconstructed_vectors.append(best_vector.detach().cpu().numpy().tolist())
             
         return reconstructed_vectors
 
@@ -532,7 +519,7 @@ class DualDescriptorRN(nn.Module):
                 probs = torch.softmax(scores / tau, dim=0).detach().cpu().numpy()
                 chosen_idx = random.choices(range(len(candidate_vectors)), weights=probs, k=1)[0]
                 chosen_vector = candidate_vectors[chosen_idx]
-                generated_vectors.append(chosen_vector.detach().cpu().numpy())
+                generated_vectors.append(chosen_vector.detach().cpu().numpy().tolist())
                 
         return generated_vectors
 
@@ -566,11 +553,10 @@ class DualDescriptorRN(nn.Module):
 if __name__ == "__main__":
 
     from statistics import correlation
-    from scipy.stats import pearsonr
     
     print("="*50)
     print("Dual Descriptor RN - Modified for Vector Sequences")
-    print("Optimized with batch processing and Layer Normalization")
+    print("Optimized with batch processing")
     print("="*50)
     
     # Set random seeds to ensure reproducibility
@@ -596,21 +582,19 @@ if __name__ == "__main__":
     print("Testing Gradient Descent Training with Vector Sequences")
     print("="*50)
 
-    # Create new model instance with GPU acceleration and normalization
-    dd = DualDescriptorRN(
+    # Create new model instance with GPU acceleration
+    dd = NumDualDescriptorRN(
         vec_dim=vec_dim, 
         bas_dim=bas_dim, 
         rank=1,
         rank_op='avg',
         mode='linear', 
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=False
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Vector dimension: {dd.m}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
 
     # Train using gradient descent
     print("\nStarting gradient descent training...")
@@ -628,7 +612,7 @@ if __name__ == "__main__":
     # Predict target vector for first sequence
     aseq = vec_seqs[0]
     t_pred = dd.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x, 4) for x in t_pred]}")    
+    print(f"\nPredicted t for first sequence: {[round(x.item(), 4) for x in t_pred]}")    
     
     # Calculate correlation between predicted and actual targets
     pred_t_list = [dd.predict_t(seq) for seq in vec_seqs]
@@ -638,7 +622,7 @@ if __name__ == "__main__":
     for i in range(dd.m):
         actu_t = [t_vec[i] for t_vec in t_list]
         pred_t = [t_vec[i] for t_vec in pred_t_list]
-        corr, _ = pearsonr(actu_t, pred_t)
+        corr = correlation(actu_t, pred_t)
         print(f"Prediction correlation for dimension {i}: {corr:.4f}")
         corr_sum += corr
     corr_avg = corr_sum / dd.m
@@ -655,7 +639,7 @@ if __name__ == "__main__":
     seq_det = dd.generate(n_groups=5, tau=0.0)
     print(f"Deterministic (tau=0) generation:")
     for i, vec in enumerate(seq_det):
-        print(f"Vector {i}: {[round(x, 4) for x in vec]}")
+        print(f"Vector {i}: {[round(x.item(), 4) for x in vec]}")
 
     # === Auto-Training Example ===
     # Set random seed for reproducible results
@@ -666,7 +650,6 @@ if __name__ == "__main__":
     vec_dim = 3   # Vector dimension
     bas_dim = 100 # Base matrix dimension
     seq_num = 30  # Number of sequences
-    #seq_length = 150  # Length of each sequence
 
     # Generate training sequences of vectors
     print("\n=== Generating Training Sequences ===")
@@ -676,16 +659,15 @@ if __name__ == "__main__":
         L = random.randint(50, 100)
         vec_seq = [np.random.uniform(-1, 1, vec_dim) for _ in range(L)]
         vec_seqs.append(vec_seq)
-        print(f"Generated sequence {i+1}: length={len(vec_seq)}, first vector: {[round(x, 4) for x in vec_seq[0]]}")
+        print(f"Generated sequence {i+1}: length={len(vec_seq)}, first vector: {[round(x.item(), 4) for x in vec_seq[0]]}")
     
     print("=== Creating Dual Descriptor Model ===")
-    dd_auto_gap = DualDescriptorRN(
+    dd_auto_gap = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=1,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )    
     
     # Run self-supervised training (Gap Filling mode)
@@ -701,13 +683,12 @@ if __name__ == "__main__":
     )
 
     print("=== Creating Dual Descriptor Model ===")
-    dd_auto_reg = DualDescriptorRN(
+    dd_auto_reg = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=1,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Run self-supervised training (Auto-Regressive mode)
@@ -729,7 +710,7 @@ if __name__ == "__main__":
     seq_det = dd_auto_gap.generate(n_groups=5, tau=0.0)
     print(f"Deterministic Generation (tau=0.0):")
     for i, vec in enumerate(seq_det):
-        print(f"Vector {i}: {[round(x, 4) for x in vec]}")
+        print(f"Vector {i}: {[round(x.item(), 4) for x in vec]}")
     
     # Temperature=0.5 (moderate randomness)
     seq_sto = dd_auto_reg.generate(n_groups=5, tau=0.5)
@@ -742,18 +723,17 @@ if __name__ == "__main__":
     dd_auto_reg.save("auto_trained_model_rn.pt")
     
     # Load model
-    dd_loaded = DualDescriptorRN(
+    dd_loaded = NumDualDescriptorRN(
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         rank=1,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     dd_loaded.load("auto_trained_model_rn.pt")
     print("Model loaded successfully. Generating with loaded model:")
     generated = dd_loaded.generate(n_groups=3, tau=0.0)
     for i, vec in enumerate(generated):
-        print(f"Vector {i}: {[round(x, 4) for x in vec]}")
+        print(f"Vector {i}: {[round(x.item(), 4) for x in vec]}")
     
     print("\n=== Auto-Training Demo Completed ===")
