@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class NumDualDescriptorAB:
+class NumDualDescriptorRN:
     """
     Numeric Dual Descriptor for n-dimensional vector sequences with m-dimensional internal representation.
     Supports n-dimensional input and l-dimensional output.
@@ -30,6 +30,7 @@ class NumDualDescriptorAB:
             model_dim (int): Dimension m of internal representation
             bas_dim (int): Basis dimension L
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
@@ -812,7 +813,7 @@ class NumDualDescriptorAB:
         if 'all' in what:
             what = ['params', 'Acoeff', 'Bbasis', 'M', 'stats']
         
-        print("NumDualDescriptorAB Model Status:")
+        print("NumDualDescriptorRN Model Status:")
         print("-" * 50)
         
         # 1. Configuration parameters
@@ -953,8 +954,8 @@ if __name__ == "__main__":
         print(f"Sequence {i+1}: length={length}, input_dim={n_dim}, output_dim={l_dim}")
 
     # Initialize model with input_dim=5, output_dim=3, model_dim=10, L=150
-    print("\nInitializing NumDualDescriptorAB model...")
-    dd = NumDualDescriptorAB(
+    print("\nInitializing NumDualDescriptorRN model...")
+    dd = NumDualDescriptorRN(
         input_dim=n_dim,
         output_dim=l_dim,
         model_dim=m_dim,
@@ -994,7 +995,7 @@ if __name__ == "__main__":
     
     # Train with gradient descent
     print("\nTraining with Gradient Descent...")
-    dd_grad = NumDualDescriptorAB(
+    dd_grad = NumDualDescriptorRN(
         input_dim=n_dim,
         output_dim=l_dim,
         model_dim=m_dim,
@@ -1028,7 +1029,7 @@ if __name__ == "__main__":
     
     # Self-supervised training
     print("\nSelf-supervised training (auto-regressive)...")
-    dd_auto = NumDualDescriptorAB(
+    dd_auto = NumDualDescriptorRN(
         input_dim=n_dim,
         output_dim=l_dim,
         model_dim=m_dim,
@@ -1067,7 +1068,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     dd_auto.save("nDDAB_model.pkl")
-    dd_loaded = NumDualDescriptorAB.load("nDDAB_model.pkl")
+    dd_loaded = NumDualDescriptorRN.load("nDDAB_model.pkl")
     print("Loaded model prediction for first sequence:")
     pred = dd_loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
