@@ -7,7 +7,7 @@ import math
 import random
 import pickle
 
-class NumDualDescriptorPM:
+class NumDualDescriptorTS:
     """
     Numeric Dual Descriptor for vector sequences with:
       - tensor P ∈ R^{m×m×o} of basis coefficients
@@ -21,7 +21,7 @@ class NumDualDescriptorPM:
         self.m = vec_dim    # vector dimension
         self.o = num_basis  # number of basis terms  
         self.rank = rank    # window size for vector aggregation
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode # 'pad' or 'drop'               
         assert mode in ('linear','nonlinear')
         self.mode = mode
@@ -708,7 +708,7 @@ class NumDualDescriptorPM:
         else:
             attrs = what
             
-        print("NumDualDescriptorPM Status")
+        print("NumDualDescriptorTS Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -803,7 +803,7 @@ if __name__=="__main__":
     num_basis = 7 # Number of basis functions
     
     # Create descriptor for vector sequences
-    dd = NumDualDescriptorPM(vec_dim=vec_dim, rank=rank, rank_op='avg', 
+    dd = NumDualDescriptorTS(vec_dim=vec_dim, rank=rank, rank_op='avg', 
                             num_basis=num_basis, mode='linear')
     
     # Generate synthetic training data
@@ -864,7 +864,7 @@ if __name__=="__main__":
     
     # Gradient Descent Training
     print("\nTraining with Gradient Descent...")
-    dd_grad = NumDualDescriptorPM(vec_dim=vec_dim, num_basis=num_basis, rank=rank, rank_op='avg')
+    dd_grad = NumDualDescriptorTS(vec_dim=vec_dim, num_basis=num_basis, rank=rank, rank_op='avg')
     grad_history = dd_grad.grad_train(seqs, t_list, max_iters=300, learning_rate=1.0)
 
     # Calculate prediction correlations
@@ -880,13 +880,13 @@ if __name__=="__main__":
     
     # Auto-Training Example
     print("\nAuto-Training in 'reg' mode...")
-    dd_auto = NumDualDescriptorPM(vec_dim=vec_dim, rank=rank, num_basis=num_basis)
+    dd_auto = NumDualDescriptorTS(vec_dim=vec_dim, rank=rank, num_basis=num_basis)
     auto_history = dd_auto.auto_train(seqs, auto_mode='reg', max_iters=20, learning_rate=0.05)
     
     # Save and load model
     print("\nSaving and loading model...")
     dd.save("vector_model.pkl")
-    dd_loaded = NumDualDescriptorPM.load("vector_model.pkl")
+    dd_loaded = NumDualDescriptorTS.load("vector_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = dd_loaded.predict_t(seqs[0])
