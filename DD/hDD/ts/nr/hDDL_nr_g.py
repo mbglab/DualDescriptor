@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class HierDDLpm:
+class HierDDts:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
@@ -26,7 +26,7 @@ class HierDDLpm:
                  input_seq_len=100, linker_dims=[50], linker_trainable=False,
                  use_residual_list=None):
         """
-        Initialize hierarchical HierDDLpm with sequence length transformation
+        Initialize hierarchical HierDDts with sequence length transformation
         
         Args:
             input_dim (int): Input vector dimension
@@ -1794,7 +1794,7 @@ class HierDDLpm:
         else:
             attrs = what
             
-        print("Hierarchical HierDDLpm Status")
+        print("Hierarchical HierDDts Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -1973,7 +1973,7 @@ if __name__=="__main__":
 
     # Test Case 1: Mixed residual strategies
     print("\n=== Test Case 1: Mixed Residual Strategies ===")
-    hndd_mixed = HierDDLpm(
+    hndd_mixed = HierDDts(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -2019,7 +2019,7 @@ if __name__=="__main__":
     # Test Case 2: Save and load model
     print("\nTesting save/load functionality:")
     hndd_mixed.save("hierarchical_ndd_model_residual.pkl")
-    loaded = HierDDLpm.load("hierarchical_ndd_model_residual.pkl")
+    loaded = HierDDts.load("hierarchical_ndd_model_residual.pkl")
     
     # Verify loaded model
     t_pred_loaded = loaded.predict_t(seqs[0])
@@ -2031,7 +2031,7 @@ if __name__=="__main__":
     print("\n=== Test Case 3: Auto-training and Sequence Generation ===")
     
     # Create a new model with compatible dimensions for auto-training
-    hndd_auto = HierDDLpm(
+    hndd_auto = HierDDts(
         input_dim=input_dim,
         model_dims=[input_dim],  # Output dim must match input dim for reconstruction
         num_basis_list=[5],

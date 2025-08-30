@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class HierDDpm:
+class HierDDts:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
@@ -20,7 +20,7 @@ class HierDDpm:
     """
     def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5], use_residual_list=None):
         """
-        Initialize hierarchical HierDDpm
+        Initialize hierarchical HierDDts
         
         Args:
             input_dim (int): Input vector dimension
@@ -463,7 +463,7 @@ class HierDDpm:
         else:
             attrs = what
             
-        print("Hierarchical HierDDpm Status")
+        print("Hierarchical HierDDts Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -602,8 +602,8 @@ if __name__=="__main__":
         t_list.append([random.uniform(-1,1) for _ in range(model_dims[-1])])
 
     # Create and train hierarchical model
-    print("\nTraining Hierarchical HierDDpm with LayerNorm and Residual Connections...")
-    hndd = HierDDpm(
+    print("\nTraining Hierarchical HierDDts with LayerNorm and Residual Connections...")
+    hndd = HierDDts(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -654,7 +654,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nTesting save/load functionality:")
     hndd.save("hierarchical_ndd_model.pkl")
-    loaded = HierDDpm.load("hierarchical_ndd_model.pkl")
+    loaded = HierDDts.load("hierarchical_ndd_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = loaded.predict_t(seqs[0])
