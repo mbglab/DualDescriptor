@@ -22,6 +22,7 @@ class NumDualDescriptorAB:
             vec_dim (int): Dimension m of input vectors
             bas_dim (int): Basis dimension L
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             mode (str): 'linear' (sliding window) or 'nonlinear' (stepped window)
             user_step (int): Custom step size for nonlinear mode
