@@ -7,7 +7,7 @@ import math
 import random
 import pickle
 
-class HierDDLab:
+class HierDDrn:
     """
     Hierarchical Numeric Dual Descriptor with Linker for vector sequences with:
       - input_dim: dimension of input vectors
@@ -627,7 +627,7 @@ class HierDDLab:
         elif isinstance(what, str):
             what = ['params', 'stats'] if what == 'all' else [what]
         
-        print("Hierarchical HierDDLab with Linker Matrices - Model Status:")
+        print("Hierarchical HierDDrn with Linker Matrices - Model Status:")
         print("=" * 70)
         
         # Configuration parameters
@@ -785,7 +785,7 @@ if __name__ == "__main__":
     
     # Create models with different Linker trainability settings
     print("\n=== Test Case 1: All Linker Matrices Trainable ===")
-    hdd_trainable = HierDDLab(
+    hdd_trainable = HierDDrn(
         input_dim=input_dim,
         model_dims=model_dims,
         basis_dims=basis_dims,
@@ -826,7 +826,7 @@ if __name__ == "__main__":
     
     # Test Case 2: Mixed Linker trainability
     print("\n\n=== Test Case 2: Mixed Linker Trainability ===")
-    hdd_mixed = HierDDLab(
+    hdd_mixed = HierDDrn(
         input_dim=input_dim,
         model_dims=model_dims,
         basis_dims=basis_dims,
@@ -861,7 +861,7 @@ if __name__ == "__main__":
     
     # Test Case 3: No Linker matrices trainable
     print("\n\n=== Test Case 3: No Linker Matrices Trainable ===")
-    hdd_fixed = HierDDLab(
+    hdd_fixed = HierDDrn(
         input_dim=input_dim,
         model_dims=model_dims,
         basis_dims=basis_dims,
@@ -897,7 +897,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     hdd_trainable.save("hierarchical_vector_model_linker.pkl")
-    loaded = HierDDLab.load("hierarchical_vector_model_linker.pkl")
+    loaded = HierDDrn.load("hierarchical_vector_model_linker.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")

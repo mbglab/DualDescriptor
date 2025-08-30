@@ -7,7 +7,7 @@ import math
 import random
 import pickle
 
-class HierDDab:
+class HierDDrn:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - input_dim: dimension of input vectors
@@ -440,7 +440,7 @@ class HierDDab:
         elif isinstance(what, str):
             what = ['params', 'stats'] if what == 'all' else [what]
         
-        print("Hierarchical HierDDab Model Status:")
+        print("Hierarchical HierDDrn Model Status:")
         print("=" * 50)
         
         # Configuration parameters
@@ -572,8 +572,8 @@ if __name__ == "__main__":
         print(f"Sequence {i+1}: length={length}, target={[round(t,2) for t in target]}")
     
     # Create and train the hierarchical model
-    print("\nCreating Hierarchical HierDDab...")
-    hdd = HierDDab(
+    print("\nCreating Hierarchical HierDDrn...")
+    hdd = HierDDrn(
         input_dim=input_dim,
         model_dims=model_dims,
         basis_dims=basis_dims
@@ -617,7 +617,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     hdd.save("hierarchical_vector_model.pkl")
-    loaded = HierDDab.load("hierarchical_vector_model.pkl")
+    loaded = HierDDrn.load("hierarchical_vector_model.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
