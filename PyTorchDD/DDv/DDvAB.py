@@ -16,13 +16,13 @@ class DualDescriptorAB(nn.Module):
     """
     Dual Descriptor with GPU acceleration using PyTorch:
       - learnable coefficient matrix Acoeff ∈ R^{m×L}
-      - fixed basis matrix Bbasis ∈ R^{L×m}, Bbasis[k][i] = cos(2π*(k+1)/(i+1))
+      - fixed basis matrix Bbasis ∈ R^{L×m}, Bbasis[k][i] = cos(2π*(k+1)/(i+2))
       - learnable token embeddings via nn.Embedding
       - Supports both linear and nonlinear tokenization
       - Batch processing for GPU acceleration
     """
     def __init__(self, charset, vec_dim=4, bas_dim=50, rank=1, rank_mode='drop', 
-                 mode='linear', user_step=None, device='cuda', use_norm=True):
+                 mode='linear', user_step=None, device='cuda'):
         super().__init__()
         self.charset = list(charset)
         self.m = vec_dim
@@ -36,7 +36,6 @@ class DualDescriptorAB(nn.Module):
         self.mean_t = None  
         self.mean_L = None
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm  # whether to use layer normalization
         
         # Generate tokens
         toks = []
@@ -62,12 +61,8 @@ class DualDescriptorAB(nn.Module):
         Bbasis = torch.empty(self.L, self.m)
         for k in range(self.L):
             for i in range(self.m):
-                Bbasis[k, i] = math.cos(2 * math.pi * (k+1) / (i+1))
+                Bbasis[k, i] = math.cos(2 * math.pi * (k+1) / (i+2))
         self.register_buffer('Bbasis', Bbasis)
-
-        # Add Layer Normalization for stable training
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
         
         # Initialize parameters
         self.reset_parameters()
@@ -77,9 +72,6 @@ class DualDescriptorAB(nn.Module):
         """Initialize model parameters"""
         nn.init.uniform_(self.embedding.weight, -0.5, 0.5)
         nn.init.uniform_(self.Acoeff, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)
         
     def token_to_indices(self, token_list):
         """Convert list of tokens to tensor of indices"""
@@ -152,10 +144,6 @@ class DualDescriptorAB(nn.Module):
         
         # Compute Nk = scalar * A_cols
         Nk = A_cols * scalar.unsqueeze(1)  # [seq_len, m]
-
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
         
         return Nk.detach().cpu().numpy()
     
@@ -547,16 +535,14 @@ if __name__ == "__main__":
         charset, 
         vec_dim=vec_dim, 
         bas_dim=bas_dim, 
-        rank=1, 
+        rank=3, 
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=False  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Number of tokens: {len(dd.tokens)}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
     
     # === Gradient Descent Training ===
     print("\n" + "="*50)
@@ -579,7 +565,7 @@ if __name__ == "__main__":
     # Predict target for first sequence
     aseq = seqs[0]
     t_pred = dd.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x, 4) for x in t_pred]}")
+    print(f"\nPredicted t for first sequence: {[round(x.item(), 4) for x in t_pred]}")
     
     # Calculate prediction correlation
     pred_t_list = [dd.predict_t(seq) for seq in seqs]
@@ -605,8 +591,8 @@ if __name__ == "__main__":
     
     # === Auto-Training Example ===
     # Set random seeds
-    torch.manual_seed(42)
-    random.seed(42)
+    torch.manual_seed(2)
+    random.seed(2)
     
     # Define parameters
     charset = ['A','C','G','T']
@@ -630,8 +616,7 @@ if __name__ == "__main__":
         bas_dim=bas_dim,
         rank=1,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Train in gap filling mode
@@ -654,8 +639,7 @@ if __name__ == "__main__":
         bas_dim=bas_dim,
         rank=1,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Train in auto-regressive mode

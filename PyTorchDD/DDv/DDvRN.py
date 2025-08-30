@@ -17,11 +17,10 @@ class DualDescriptorRN(nn.Module):
       - Learnable coefficient matrix Acoeff ∈ R^{m×L}
       - Learnable basis matrix Bbasis ∈ R^{L×m}
       - Token embeddings M: token → R^m
-      - Added Layer Normalization for stable training
       - Optimized with batch processing for GPU acceleration
     """
     def __init__(self, charset, vec_dim=4, bas_dim=50, rank=1, rank_mode='drop', 
-                 mode='linear', user_step=None, device='cuda', use_norm=True):
+                 mode='linear', user_step=None, device='cuda'):
         super().__init__()
         self.charset = list(charset)
         self.m = vec_dim
@@ -33,7 +32,6 @@ class DualDescriptorRN(nn.Module):
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm
         
         # Generate all possible tokens (k-mers + right-padded with '_')
         toks = []
@@ -57,10 +55,6 @@ class DualDescriptorRN(nn.Module):
         # Basis matrix Bbasis: L×m
         self.Bbasis = nn.Parameter(torch.empty(self.L, self.m))
         
-        # Layer normalization
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
-        
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -70,9 +64,6 @@ class DualDescriptorRN(nn.Module):
         nn.init.uniform_(self.embedding.weight, -0.5, 0.5)
         nn.init.uniform_(self.Acoeff, -0.1, 0.1)
         nn.init.uniform_(self.Bbasis, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)
     
     def token_to_indices(self, token_list):
         """Convert list of tokens to tensor of indices"""
@@ -145,10 +136,6 @@ class DualDescriptorRN(nn.Module):
         
         # Compute Nk = scalar * A_j [batch_size, m]
         Nk = scalar * A_j
-        
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
             
         return Nk
 
@@ -554,7 +541,7 @@ if __name__ == "__main__":
     
     print("="*50)
     print("Dual Descriptor RN - PyTorch GPU Accelerated Version")
-    print("Optimized with batch processing and Layer Normalization")
+    print("Optimized with batch processing")
     print("="*50)
     
     # Set random seeds to ensure reproducibility
@@ -579,21 +566,19 @@ if __name__ == "__main__":
     print("Testing Gradient Descent Training")
     print("="*50)
 
-    # Create new model instance with GPU acceleration and normalization
+    # Create new model instance with GPU acceleration
     dd = DualDescriptorRN(
         charset, 
         rank=3, 
         vec_dim=vec_dim, 
         bas_dim=bas_dim, 
         mode='linear', 
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=False
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Number of tokens: {len(dd.tokens)}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
 
     # Train using gradient descent
     print("\nStarting gradient descent training...")
@@ -661,8 +646,7 @@ if __name__ == "__main__":
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )    
     
     # Run self-supervised training (Gap Filling mode)
@@ -684,8 +668,7 @@ if __name__ == "__main__":
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Run self-supervised training (Auto-Regressive mode)
@@ -722,8 +705,7 @@ if __name__ == "__main__":
         vec_dim=vec_dim,
         bas_dim=bas_dim,
         mode='linear',
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     dd_loaded.load("auto_trained_model_rn.pt")
     print("Model loaded successfully. Generating with loaded model:")

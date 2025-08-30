@@ -20,9 +20,8 @@ class DualDescriptorPM(nn.Module):
       - indexed periods: period[i,j] = i*m + j + 2
       - basis function phi_{i,j}(k) = cos(2π * k / period[i,j])
       - supports 'linear' or 'nonlinear' (step-by-rank) k-mer extraction
-      - Added Layer Normalization for stable training
     """
-    def __init__(self, charset, rank=1, rank_mode='drop', vec_dim=2, mode='linear', user_step=None, device='cuda', use_norm=True):
+    def __init__(self, charset, rank=1, rank_mode='drop', vec_dim=2, mode='linear', user_step=None, device='cuda'):
         super().__init__()
         self.charset = list(charset)
         self.rank = rank    # r-per/k-mer length
@@ -33,7 +32,6 @@ class DualDescriptorPM(nn.Module):
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.use_norm = use_norm  # whether to use layer normalization
         
         # 1) Generate all possible tokens (k-mers + right-padded with '_')
         toks = []
@@ -62,10 +60,6 @@ class DualDescriptorPM(nn.Module):
                 periods[i, j] = i * self.m + j + 2
         self.register_buffer('periods', periods)
 
-        # Add Layer Normalization for stable training
-        if self.use_norm:
-            self.norm = nn.LayerNorm(self.m)
-        
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -74,9 +68,6 @@ class DualDescriptorPM(nn.Module):
         """Initialize model parameters"""
         nn.init.uniform_(self.embedding.weight, -0.5, 0.5)
         nn.init.uniform_(self.P, -0.1, 0.1)
-        if self.use_norm:
-            nn.init.constant_(self.norm.weight, 1.0)
-            nn.init.constant_(self.norm.bias, 0.0)
         
     def token_to_indices(self, token_list):
         """Convert list of tokens to tensor of indices"""
@@ -143,10 +134,6 @@ class DualDescriptorPM(nn.Module):
         # Optimized computation using einsum
         # P: [m, m], x: [batch_size, m], phi: [batch_size, m, m]
         Nk = torch.einsum('bj,ij,bij->bi', x, self.P, phi)
-        
-        # Apply Layer Normalization if enabled
-        if self.use_norm:
-            Nk = self.norm(Nk)
             
         return Nk
 
@@ -549,7 +536,7 @@ if __name__=="__main__":
     
     print("="*50)
     print("Dual Descriptor PM - PyTorch GPU Accelerated Version")
-    print("Optimized with batch processing and Layer Normalization")
+    print("Optimized with batch processing")
     print("="*50)
     
     # Set random seeds to ensure reproducibility
@@ -570,25 +557,23 @@ if __name__=="__main__":
         # Create a random vector target
         t_list.append([random.uniform(-1.0, 1.0) for _ in range(vec_dim)])
 
-    # Initialize the model with normalization
+    # Initialize the model
     dd = DualDescriptorPM(
         charset, 
         rank=rank, 
         vec_dim=vec_dim, 
         mode='nonlinear', 
         user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Display device information
     print(f"\nUsing device: {dd.device}")
     print(f"Number of tokens: {len(dd.tokens)}")
-    print(f"Using Layer Normalization: {dd.use_norm}")
 
     # Training model
     print("\n" + "="*50)
-    print("Starting Gradient Descent Training with LayerNorm")
+    print("Starting Gradient Descent Training")
     print("="*50)
     dd.grad_train(seqs, t_list, max_iters=100, tol=1e-199, learning_rate=0.1, decay_rate = 0.999, batch_size=2048)    
    
@@ -623,18 +608,17 @@ if __name__=="__main__":
     
     # === Combined self-training examples ===
     print("\n" + "="*50)
-    print("Combined Auto-Training Example with LayerNorm")
+    print("Combined Auto-Training Example")
     print("="*50)
     
-    # Create a new model with normalization
+    # Create a new model
     dd_gap = DualDescriptorPM(
         charset, 
         rank=rank, 
         vec_dim=vec_dim, 
         mode='nonlinear', 
         user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu',
-        use_norm=True  # Enable layer normalization
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
     # Generate sample sequences
@@ -644,7 +628,7 @@ if __name__=="__main__":
         auto_seqs.append(''.join(random.choices(charset, k=L)))
     
     # Conduct self-consistenty training (gap mode)
-    print("\nTraining in 'gap' mode (self-consistency) with LayerNorm:")
+    print("\nTraining in 'gap' mode (self-consistency):")
     gap_history = dd_gap.auto_train(
         auto_seqs, 
         max_iters=50, 
@@ -655,9 +639,9 @@ if __name__=="__main__":
     )
     
     # Generate sequences
-    print("\nGenerated sequences from 'gap' model with LayerNorm:")
+    print("\nGenerated sequences from 'gap' model:")
     for i in range(2):
         gen_seq = dd_gap.generate(100, tau=0.2)
         print(f"Sequence {i+1}: {gen_seq[:50]}...")  
     
-    print("\nAll tests completed successfully with Layer Normalization!")
+    print("\nAll tests completed successfully!")
