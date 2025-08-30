@@ -7,7 +7,7 @@ import math
 import random
 import pickle
 
-class HierDDLpm:
+class HierDDts:
     """
     Hierarchical Numeric Dual Descriptor for vector sequences with:
       - Multiple layers with linear transformation M and tensor P
@@ -22,7 +22,7 @@ class HierDDLpm:
     def __init__(self, input_dim=2, model_dims=[2], num_basis_list=[5],
                  input_seq_len=100, linker_dims=[50], linker_trainable=False):
         """
-        Initialize hierarchical HierDDLpm with sequence length transformation
+        Initialize hierarchical HierDDts with sequence length transformation
         
         Args:
             input_dim (int): Input vector dimension
@@ -531,7 +531,7 @@ class HierDDLpm:
         else:
             attrs = what
             
-        print("Hierarchical HierDDLpm Status")
+        print("Hierarchical HierDDts Status")
         print("=" * 50)
         
         # Display each requested attribute
@@ -673,7 +673,7 @@ if __name__=="__main__":
 
     # Test Case 1: All Linker matrices trainable
     print("\n=== Test Case 1: All Linker Matrices Trainable ===")
-    hndd_trainable = HierDDLpm(
+    hndd_trainable = HierDDts(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -717,7 +717,7 @@ if __name__=="__main__":
     
     # Test Case 2: Mixed trainability (first layer trainable, others not)
     print("\n\n=== Test Case 2: Mixed Linker Trainability ===")
-    hndd_mixed = HierDDLpm(
+    hndd_mixed = HierDDts(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -753,7 +753,7 @@ if __name__=="__main__":
     
     # Test Case 3: No Linker matrices trainable
     print("\n\n=== Test Case 3: No Linker Matrices Trainable ===")
-    hndd_fixed = HierDDLpm(
+    hndd_fixed = HierDDts(
         input_dim=input_dim,
         model_dims=model_dims,
         num_basis_list=num_basis_list,
@@ -790,7 +790,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nTesting save/load functionality:")
     hndd_trainable.save("hierarchical_ndd_model.pkl")
-    loaded = HierDDLpm.load("hierarchical_ndd_model.pkl")
+    loaded = HierDDts.load("hierarchical_ndd_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = loaded.predict_t(seqs[0])
