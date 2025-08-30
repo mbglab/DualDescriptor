@@ -20,10 +20,10 @@ class NumDualDescriptorPM:
     def __init__(self, vec_dim=2, rank=1, rank_op='avg', rank_mode='drop', mode='linear', user_step=None):
         self.m = vec_dim    # vector dimension
         self.rank = rank    # window size for vector aggregation
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode # 'pad' or 'drop'               
         assert mode in ('linear','nonlinear')
-        self.mode = mode
+        self.mode = mode 
         self.step = user_step
         self.trained = False
 
