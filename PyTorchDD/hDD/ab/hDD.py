@@ -44,11 +44,11 @@ class Layer(nn.Module):
         self.Acoeff = nn.Parameter(torch.Tensor(out_dim, basis_dim))
         
         # Fixed basis matrix B (basis_dim x out_dim) calculated with:
-        #   Bbasis[k, i] = cos(2π*(k+1)/(i+1))
+        #   Bbasis[k, i] = cos(2π*(k+1)/(i+2))
         Bbasis = torch.empty(basis_dim, out_dim)
         for k in range(basis_dim):
             for i in range(out_dim):
-                Bbasis[k, i] = math.cos(2 * math.pi * (k+1) / (i+1))
+                Bbasis[k, i] = math.cos(2 * math.pi * (k+1) / (i+2))
         self.register_buffer('Bbasis', Bbasis)  # Fixed, non-trainable buffer
         
         # Initialize parameters
@@ -225,7 +225,7 @@ class HierDDab(nn.Module):
         
         return total_loss / total_positions if total_positions > 0 else 0.0
     
-    def train_model(self, seqs, t_list, max_iters=1000, tol=1e-18,
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-18,
                     learning_rate=0.01, decay_rate=1.0, print_every=10):
         """
         Train the model using Adam optimizer with learning rate decay and early stopping
@@ -597,12 +597,12 @@ class HierDDab(nn.Module):
 # === Example Usage ===
 if __name__ == "__main__":
 
-    from statistics import mean, correlation
+    from statistics import correlation
     
     # Set random seeds for reproducibility
-    torch.manual_seed(2)
-    np.random.seed(2)
-    random.seed(2)
+    torch.manual_seed(1)
+    np.random.seed(1)
+    random.seed(1)
     
     # Configuration
     input_dim = 10            # Input vector dimension
@@ -649,7 +649,7 @@ if __name__ == "__main__":
     
     # Train model
     print("\nTraining model...")
-    history = model.train_model(
+    history = model.grad_train(
         seqs,
         t_list,
         learning_rate=0.01,
@@ -672,7 +672,7 @@ if __name__ == "__main__":
         corrs.append(corr)
         print(f"  Dim {d}: correlation = {corr:.4f}")
     
-    print(f"Average correlation: {mean(corrs):.4f}")     
+    print(f"Average correlation: {np.mean(corrs):.4f}")     
     
     # Save and load demonstration
     print("\n Save and load demonstration:")
