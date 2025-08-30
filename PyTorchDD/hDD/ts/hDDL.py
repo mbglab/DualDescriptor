@@ -280,7 +280,7 @@ class HierDDLts(nn.Module):
         
         return total_loss / count if count else 0.0
     
-    def train_model(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
                    decay_rate=1.0, print_every=10):
         """
         Train model using Adam optimizer
@@ -755,7 +755,7 @@ class HierDDLts(nn.Module):
 # === Example Usage ===
 if __name__ == "__main__":
 
-    from scipy.stats import pearsonr
+    from statistics import correlation
 
     # Set random seeds for reproducibility
     torch.manual_seed(1)
@@ -801,7 +801,7 @@ if __name__ == "__main__":
     
     # Training
     print("\nTraining model...")
-    history = model_mixed.train_model(
+    history = model_mixed.grad_train(
         seqs, 
         t_list, 
         max_iters=50,
@@ -817,9 +817,9 @@ if __name__ == "__main__":
     for i in range(model_dims[-1]):
         actual = [t[i] for t in t_list]
         predicted = [p[i] for p in all_preds]
-        corr, p_value = pearsonr(actual, predicted)
+        corr = correlation(actual, predicted)
         correlations.append(corr)
-        print(f"Output dim {i} correlation: {corr:.4f} (p={p_value:.4e})")
+        print(f"Output dim {i} correlation: {corr:.4f}")
     print(f"Average correlation: {np.mean(correlations):.4f}")    
     
     # Test Case 2: Auto-training and sequence generation
