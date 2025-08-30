@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class NumDualDescriptorPM:
+class NumDualDescriptorTS:
     """
     Numeric Dual Descriptor for vector sequences with:
       - input_dim: dimension of input vectors (n)
@@ -32,6 +32,7 @@ class NumDualDescriptorPM:
             output_dim (int): Dimensionality of target vectors (l)
             m (int): Internal representation dimension
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             num_basis (int): Number of basis functions (o)
             mode (str): 'linear' or 'nonlinear' processing mode
@@ -39,10 +40,10 @@ class NumDualDescriptorPM:
         """        
         self.n = input_dim   # Input vector dimension
         self.l = output_dim  # Output vector dimension
-        self.m = model_dim           # Internal representation dimension
+        self.m = model_dim   # Internal representation dimension
         self.o = num_basis   # Number of basis functions
         self.rank = rank
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode
         assert mode in ('linear','nonlinear')
         self.mode = mode
@@ -670,7 +671,7 @@ class NumDualDescriptorPM:
 
     def show(self):
         """Display model configuration."""
-        print("NumDualDescriptorPM Status:")
+        print("NumDualDescriptorTS Status:")
         print(f"  Input dimension n = {self.n}")
         print(f"  Output dimension l = {self.l}")
         print(f"  Internal dimension m = {self.m}")
@@ -731,7 +732,7 @@ if __name__=="__main__":
 
     # Create model
     print("Creating model...")
-    dd = NumDualDescriptorPM(
+    dd = NumDualDescriptorTS(
         input_dim=input_dim,
         output_dim=output_dim,
         model_dim=model_dim,        
@@ -774,7 +775,7 @@ if __name__=="__main__":
     
     # Train with Gradient Descent
     print("\nTraining with Gradient Descent...")
-    dd_grad = NumDualDescriptorPM(
+    dd_grad = NumDualDescriptorTS(
         input_dim=input_dim,
         output_dim=output_dim,
         model_dim=model_dim,        
@@ -811,7 +812,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nSaving and loading model...")
     dd.save("nddpm_model.pkl")
-    loaded_model = NumDualDescriptorPM.load("nddpm_model.pkl")
+    loaded_model = NumDualDescriptorTS.load("nddpm_model.pkl")
     
     # Verify loaded model
     test_pred = loaded_model.predict_t(seqs[0])

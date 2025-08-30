@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class NumDualDescriptorPM:
+class NumDualDescriptorTS:
     """
     Numeric Dual Descriptor for sequences of n-dimensional vectors with m-dimensional internal representation.
     - input_dim: dimension of input vectors (n)
@@ -28,6 +28,7 @@ class NumDualDescriptorPM:
             input_dim (int): Dimension of input vectors (n)
             model_dim (int): Dimension of internal representation (m)
             rank (int): Window size for vector aggregation
+            rank_op (str or callable): Rank operation for vector aggregation
             rank_mode (str): 'pad' or 'drop' for handling incomplete windows
             num_basis (int): Number of basis functions (o)
             mode (str): 'linear' or 'nonlinear' processing mode
@@ -37,7 +38,7 @@ class NumDualDescriptorPM:
         self.m = model_dim    # Internal dimension (m)
         self.o = num_basis    # Number of basis functions (o)
         self.rank = rank
-        self.rank_op = rank_op
+        self.rank_op = rank_op # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode
         assert mode in ('linear','nonlinear')
         self.mode = mode
@@ -645,7 +646,7 @@ class NumDualDescriptorPM:
 
     def show(self):
         """Display model status"""
-        print("NumDualDescriptorPM Status:")
+        print("NumDualDescriptorTS Status:")
         print(f"  Input dimension n = {self.n}")
         print(f"  Internal dimension m = {self.m}")
         print(f"  Basis functions o = {self.o}")
@@ -708,7 +709,7 @@ if __name__=="__main__":
         t_list.append([random.uniform(-1,1) for _ in range(n_dim)])  # n-dim targets
 
     # Create model with n=5, m=3
-    dd = NumDualDescriptorPM(input_dim=n_dim, model_dim=m_dim, 
+    dd = NumDualDescriptorTS(input_dim=n_dim, model_dim=m_dim, 
                             rank=3, num_basis=num_basis, 
                             mode='nonlinear', user_step=2)
     
@@ -741,7 +742,7 @@ if __name__=="__main__":
     
     # Gradient Descent Training
     print("\nTraining with Gradient Descent...")
-    dd_grad = NumDualDescriptorPM(input_dim=n_dim, model_dim=m_dim,
+    dd_grad = NumDualDescriptorTS(input_dim=n_dim, model_dim=m_dim,
                                  rank=3, num_basis=num_basis)
     grad_history = dd_grad.grad_train(
         seqs, 
@@ -765,7 +766,7 @@ if __name__=="__main__":
     
     # Auto-Training Example (next-vector prediction)
     print("\nAuto-Training in 'reg' mode (next-vector prediction)...")
-    dd_auto = NumDualDescriptorPM(input_dim=n_dim, model_dim=m_dim,
+    dd_auto = NumDualDescriptorTS(input_dim=n_dim, model_dim=m_dim,
                                  rank=3, num_basis=num_basis)
     auto_history = dd_auto.auto_train(
         seqs, 
@@ -790,7 +791,7 @@ if __name__=="__main__":
     # Save and load model
     print("\nSaving and loading model...")
     dd_auto.save("n_vector_model.pkl")
-    dd_loaded = NumDualDescriptorPM.load("n_vector_model.pkl")
+    dd_loaded = NumDualDescriptorTS.load("n_vector_model.pkl")
     
     # Verify loaded model
     t_pred_loaded = dd_loaded.predict_t(seqs[0])
