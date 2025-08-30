@@ -8,7 +8,7 @@ import math
 import random
 import pickle
 
-class HierDDLab:
+class HierDDrn:
     """
     Hierarchical Numeric Dual Descriptor with Linker for vector sequences with:
       - input_dim: dimension of input vectors
@@ -2031,7 +2031,7 @@ class HierDDLab:
         elif isinstance(what, str):
             what = ['params', 'stats'] if what == 'all' else [what]
         
-        print("Hierarchical HierDDLab with Linker Matrices - Model Status:")
+        print("Hierarchical HierDDrn with Linker Matrices - Model Status:")
         print("=" * 70)
         
         # Configuration parameters
@@ -2228,7 +2228,7 @@ if __name__ == "__main__":
     
     # Create model with residual connections
     print("\n=== Test Case: Residual Connections ===")
-    hdd_residual = HierDDLab(
+    hdd_residual = HierDDrn(
         input_dim=input_dim,
         model_dims=model_dims,
         basis_dims=basis_dims,
@@ -2271,7 +2271,7 @@ if __name__ == "__main__":
     # Save and load model
     print("\nTesting model persistence...")
     hdd_residual.save("hierarchical_vector_model_linker_residual.pkl")
-    loaded = HierDDLab.load("hierarchical_vector_model_linker_residual.pkl")
+    loaded = HierDDrn.load("hierarchical_vector_model_linker_residual.pkl")
     print("Loaded model prediction for first sequence:")
     pred = loaded.predict_t(seqs[0])
     print(f"  Predicted target: {[round(p, 4) for p in pred]}")
@@ -2282,7 +2282,7 @@ if __name__ == "__main__":
     print("\n=== Test Case 3: Auto-training and Sequence Generation ===")
     
     # Create a new model with compatible dimensions for auto-training
-    hdd_auto = HierDDLab(
+    hdd_auto = HierDDrn(
         input_dim=input_dim,
         model_dims=[input_dim],  # Output dim must match input dim for reconstruction
         basis_dims=[50],
