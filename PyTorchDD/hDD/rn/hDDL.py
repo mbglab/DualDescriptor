@@ -299,7 +299,7 @@ class HierDDLrn(nn.Module):
         loss = nn.functional.mse_loss(avg_vectors, targets)
         return loss   
     
-    def train_model(self, seqs, t_list, max_iters=1000, tol=1e-88, 
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-88, 
                    learning_rate=0.01, decay_rate=1.0, print_every=10):
         """
         Train the model using Adam optimizer
@@ -760,7 +760,7 @@ if __name__ == "__main__":
     
     # Train model
     print("\nTraining model...")
-    history = model_mixed.train_model(
+    history = model_mixed.grad_train(
         seqs, 
         t_list,
         learning_rate=0.01,
