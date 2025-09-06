@@ -270,56 +270,82 @@ class NumDualDescriptorPM:
                 self.P[i][j] = sol[j]
 
     def update_M(self, seqs, t_list):
-        """Closed-form update of transformation matrix M (m×n)"""
-        # Initialize gradient accumulation
-        M_grad = [[0.0] * self.n for _ in range(self.m)]
-        total_positions = 0
+        """
+        Closed-form update of transformation matrix M (m×n) using least squares solution.
         
+        We minimize the squared error between the predicted N(k) vectors and target vectors t.
+        For each sequence and each position k, we have:
+            Nk[i] = sum_j [ P[i][j] * (M * vec)[j] * phi_{ij}(k) ]
+        
+        This can be rewritten as a linear system with respect to the elements of M.
+        We construct a linear system A * m_vec = b, where m_vec is the flattened M matrix.
+        """
+        # Initialize the linear system components
+        dim = self.m * self.n  # Number of elements in M (m×n matrix)
+        A = [[0.0] * dim for _ in range(dim)]  # Coefficient matrix
+        b = [0.0] * dim  # Right-hand side vector
+        
+        # Precompute basis function values to avoid redundant calculations
+        basis_cache = {}
+        max_k = 0
+        for seq in seqs:
+            windows = self.extract_windows(seq)
+            max_k = max(max_k, len(windows))
+        
+        # Precompute basis functions for all (i,j) pairs and all k positions
+        for i in range(self.n):  # Output dimension
+            for j in range(self.m):  # Internal dimension
+                period = self.periods[i][j]
+                # Precompute phi values for all possible k positions
+                phi_vals = [math.cos(2 * math.pi * k / period) for k in range(max_k)]
+                basis_cache[(i, j)] = phi_vals
+
         # Accumulate data from all sequences and positions
         for seq, t in zip(seqs, t_list):
             windows = self.extract_windows(seq)
-            total_positions += len(windows)
-            for pos, vec in enumerate(windows):
-                # Precompute basis-parameter products
-                psi = [0.0] * self.m  # ψ_j = P[i][j] * φ_{ij}(pos) summed over i
+            for k, vec in enumerate(windows):
+                # Precompute the product of P and basis functions
+                psi = [0.0] * self.m  # ψ_j = Σ_i P[i][j] * φ_{ij}(k)
                 for j in range(self.m):
                     s = 0.0
                     for i in range(self.n):
-                        period = self.periods[i][j]
-                        phi = math.cos(2 * math.pi * pos / period)
-                        s += self.P[i][j] * phi
+                        phi_val = basis_cache[(i, j)][k]
+                        s += self.P[i][j] * phi_val
                     psi[j] = s
                 
-                # Compute current transformed vector: z = M * vec
-                z = self._mat_vec(self.M, vec)
-                
-                # Compute error terms (n-dimensional)
-                error = [0.0] * self.n
-                for i in range(self.n):
-                    # Compute predicted Nk[i]
-                    pred = 0.0
-                    for j in range(self.m):
-                        period = self.periods[i][j]
-                        phi = math.cos(2 * math.pi * pos / period)
-                        pred += self.P[i][j] * phi * z[j]
-                    error[i] = pred - t[i]
-                
-                # Update gradient for M
-                for row in range(self.m):    # M row index
-                    for col in range(self.n):  # M column index
-                        grad = 0.0
+                # Construct the linear system for the current (k, vec) pair
+                for d1 in range(self.m):  # Row index in M
+                    for d2 in range(self.n):  # Column index in M
+                        idx1 = d1 * self.n + d2  # Linear index in flattened M
+                        
+                        # Contribution to the right-hand side vector b
+                        b_contrib = 0.0
                         for i in range(self.n):
-                            period = self.periods[i][row]
-                            phi = math.cos(2 * math.pi * pos / period)
-                            grad += error[i] * self.P[i][row] * phi * vec[col]
-                        M_grad[row][col] += grad
-        
-        # Normalize gradient and update M
-        lr = 0.01  # Learning rate
-        if total_positions > 0:
-            for i in range(self.m):
-                for j in range(self.n):
-                    self.M[i][j] -= lr * M_grad[i][j] / total_positions
+                            b_contrib += t[i] * psi[d1] * vec[d2]
+                        b[idx1] += b_contrib
+                        
+                        # Contribution to the coefficient matrix A
+                        for e1 in range(self.m):
+                            for e2 in range(self.n):
+                                idx2 = e1 * self.n + e2  # Linear index in flattened M
+                                a_contrib = 0.0
+                                for i in range(self.n):
+                                    a_contrib += psi[d1] * psi[e1] * vec[d2] * vec[e2]
+                                A[idx1][idx2] += a_contrib
+
+        # Solve the linear system A * m_vec = b
+        try:
+            A_inv = self._invert(A)
+            m_vec = [sum(A_inv[r][c] * b[c] for c in range(dim)) for r in range(dim)]
+        except Exception as e:
+            print(f"Warning: Matrix inversion failed in update_M, using identity approximation. Error: {str(e)}")
+            # Fallback: use the right-hand side as solution (equivalent to assuming A is identity)
+            m_vec = b
+
+        # Reshape the solution vector back into the M matrix
+        for i in range(self.m):
+            for j in range(self.n):
+                self.M[i][j] = m_vec[i * self.n + j]
 
     def train(self, seqs, t_list, max_iters=10, tol=1e-8, print_every=1):
         """Alternate closed-form updates for P and M"""        
@@ -673,13 +699,13 @@ if __name__=="__main__":
 
     from statistics import correlation, mean
     
-    random.seed(2)
+    random.seed(1)
     
     # Configuration: n=5 input dim, m=3 internal dim
     n_dim = 5   # Input vector dimension
     m_dim = 3   # Internal model dimension
     num_seqs = 10
-    min_len, max_len = 50, 100
+    min_len, max_len = 100, 200
 
     # Generate synthetic training data (n-dimensional)
     seqs = []
