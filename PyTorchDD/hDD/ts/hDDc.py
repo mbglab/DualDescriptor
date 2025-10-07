@@ -2,7 +2,7 @@
 # Hierarchical Dual Descriptor with Character Sequence Input (HierDDtsC)
 # Combines character-level processing and hierarchical vector processing
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-6
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-7
 
 import math
 import random
@@ -619,24 +619,39 @@ class HierDDtsC(nn.Module):
         
         return history
     
-    def _compute_training_statistics(self, seqs):
+    def _compute_training_statistics(self, seqs, batch_size=50):
         """Compute and store statistics for reconstruction and generation"""
         total_token_count = 0
         total_vec_sum = torch.zeros(self.vec_dim, device=self.device)
         
-        for seq in seqs:
-            toks = self.extract_tokens(seq)
-            total_token_count += len(toks)
-            
-            # Compute average vector through char layer
-            if toks:
-                tensor_seq = self.char_sequence_to_tensor(seq)
-                total_vec_sum += tensor_seq.sum(dim=(0, 1))
+        with torch.no_grad():
+            for i in range(0, len(seqs), batch_size):
+                batch_seqs = seqs[i:i+batch_size]
+                batch_token_count = 0
+                batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
+                
+                for seq in batch_seqs:
+                    toks = self.extract_tokens(seq)
+                    if not toks:
+                        continue
+                        
+                    batch_token_count += len(toks)
+                    token_indices = self.token_to_indices(toks)
+                    k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
+                    
+                    Nk_batch = self.char_batch_compute_Nk(k_positions, token_indices)
+                    batch_vec_sum += Nk_batch.sum(dim=0)
+                
+                total_token_count += batch_token_count
+                total_vec_sum += batch_vec_sum
+                
+                # Clean batch
+                del batch_vec_sum
         
-        self.mean_token_count = total_token_count / len(seqs)
-        self.mean_t = (total_vec_sum / total_token_count).detach().cpu().numpy()
-    
-    def _compute_hierarchical_mean_target(self, seqs):
+        self.mean_token_count = total_token_count / len(seqs) if seqs else 0
+        self.mean_t = (total_vec_sum / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.vec_dim)
+
+    def _compute_hierarchical_mean_target(self, seqs, batch_size=32):
         """
         Compute the mean target vector in the final hierarchical layer output space
         This represents the average pattern learned by the entire hierarchical model
@@ -645,19 +660,47 @@ class HierDDtsC(nn.Module):
             self.mean_target = None
             return
             
+        final_dim = self.model_dims[-1] if self.model_dims else self.vec_dim
+        total_output = torch.zeros(final_dim, device=self.device)
+        total_sequences = 0
+        
         with torch.no_grad():
-            training_outputs = []
-            for seq in seqs:
-                output = self.forward(seq)
-                seq_output = output.mean(dim=1)  # Average over sequence length
-                training_outputs.append(seq_output)
-            
-            if training_outputs:
-                # Stack all outputs and compute mean
-                all_outputs = torch.cat(training_outputs, dim=0)
-                self.mean_target = all_outputs.mean(dim=0)
-            else:
-                self.mean_target = None
+            # Batch processing sequences
+            for i in range(0, len(seqs), batch_size):
+                batch_seqs = seqs[i:i+batch_size]
+                batch_outputs = []
+                
+                for seq in batch_seqs:
+                    try:
+                        output = self.forward(seq)
+                        if output.numel() > 0:
+                            seq_output = output.mean(dim=1).squeeze(0)
+                            batch_outputs.append(seq_output)
+                    except RuntimeError as e:
+                        # Handle the situation of insufficient memory
+                        if "out of memory" in str(e):
+                            print(f"Warning: The sequence is too long, resulting in insufficient memory. Skip the sequence: {seq[:50]}...")
+                            continue
+                        else:
+                            raise e
+                
+                if batch_outputs:
+                    # Immediately accumulate and release the batch memory
+                    batch_tensor = torch.stack(batch_outputs)
+                    total_output += batch_tensor.sum(dim=0)
+                    total_sequences += len(batch_outputs)
+                    
+                    # Clean batches
+                    del batch_tensor, batch_outputs
+                
+                # Optional: Regularly clean the GPU cache
+                if torch.cuda.is_available() and (i // batch_size) % 10 == 0:
+                    torch.cuda.empty_cache()
+        
+        if total_sequences > 0:
+            self.mean_target = total_output / total_sequences
+        else:
+            self.mean_target = None
     
     def reconstruct(self):
         """
