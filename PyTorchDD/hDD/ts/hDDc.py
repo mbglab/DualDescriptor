@@ -525,9 +525,10 @@ class HierDDtsC(nn.Module):
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
                 # Restore the best model state before breaking
-                if best_model_state is not None:
+                if best_model_state is not None and avg_loss > prev_loss:
                     self.load_state_dict(best_model_state)                    
                     print(f"Restored best model state with loss = {best_loss:.6e}")
+                    history[-1] = best_loss
                 break
             prev_loss = avg_loss
 
@@ -538,7 +539,7 @@ class HierDDtsC(nn.Module):
         if best_model_state is not None and best_loss < history[-1]:
             self.load_state_dict(best_model_state)  
             print(f"Training ended. Restored best model state with loss = {best_loss:.6e}")
-            history.pop()
+            history[-1] = best_loss
         
         # Store training statistics and compute mean target
         self._compute_training_statistics(seqs)
@@ -675,9 +676,10 @@ class HierDDtsC(nn.Module):
             if prev_loss - avg_loss < tol:
                 print(f"Converged after {it+1} iterations")
                 # Restore the best model state before breaking
-                if best_model_state is not None:
+                if best_model_state is not None and avg_loss > prev_loss:
                     self.load_state_dict(best_model_state)
                     print(f"Restored best model state with loss = {best_loss:.6f}")
+                    history.pop()
                 break
             prev_loss = avg_loss
 
