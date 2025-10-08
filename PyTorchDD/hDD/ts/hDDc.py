@@ -2,7 +2,7 @@
 # Hierarchical Dual Descriptor with Character Sequence Input (HierDDtsC)
 # Combines character-level processing and hierarchical vector processing
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-7
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-8
 
 import math
 import random
@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import copy, os
 
 class Layer(nn.Module):
     """Single layer of Hierarchical Dual Descriptor"""
@@ -153,10 +154,7 @@ class HierDDtsC(nn.Module):
         self.step = user_step
         self.model_dims = model_dims
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.trained = False
-        
-        # Store training sequences for reconstruction and generation
-        self.training_seqs = []
+        self.trained = False        
         
         # Character-level processing components (formerly DualDescriptorTS)
         # 1) Generate all possible tokens (k-mers + right-padded with '_')
@@ -419,7 +417,8 @@ class HierDDtsC(nn.Module):
             return target.squeeze(0).cpu().numpy()
     
     def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-                   continued=False, decay_rate=1.0, print_every=10, batch_size=1024):
+                   continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
+                   checkpoint_file=None, checkpoint_interval=10):
         """
         Train the model using gradient descent with target vectors
         
@@ -433,15 +432,29 @@ class HierDDtsC(nn.Module):
             decay_rate: Learning rate decay rate
             print_every: Print interval
             batch_size: Batch size for training
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
         """
-        if not continued:
-            self.reset_parameters()
-            
-        # Store training sequences for reconstruction and generation
-        self.training_seqs = seqs.copy()
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6e}")
+        else:
+            if not continued:
+                self.reset_parameters() 
+            history = []
         
         # Convert target vectors to tensor
         t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
@@ -450,10 +463,14 @@ class HierDDtsC(nn.Module):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
             total_sequences = 0
             
@@ -488,19 +505,40 @@ class HierDDtsC(nn.Module):
             
             # Average loss over epoch
             avg_loss = total_loss / total_sequences
-            history.append(avg_loss)            
+            history.append(avg_loss)
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             if it % print_every == 0 or it == max_iters - 1:
                 print(f"GD Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {scheduler.get_last_lr()[0]:.6f}")
             
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
+            
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
+                # Restore the best model state before breaking
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)                    
+                    print(f"Restored best model state with loss = {best_loss:.6e}")
                 break
             prev_loss = avg_loss
 
             #if it % 5 == 0:  # Decay every 5 iterations
             scheduler.step()
+
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)  
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6e}")
+            history.pop()
         
         # Store training statistics and compute mean target
         self._compute_training_statistics(seqs)
@@ -510,7 +548,8 @@ class HierDDtsC(nn.Module):
         return history
     
     def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10):
+                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
+                   checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training method for the hierarchical model
         
@@ -523,6 +562,8 @@ class HierDDtsC(nn.Module):
             auto_mode: 'gap' or 'reg' training mode
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
@@ -530,20 +571,36 @@ class HierDDtsC(nn.Module):
         if auto_mode not in ('gap', 'reg'):
             raise ValueError("auto_mode must be either 'gap' or 'reg'")
         
-        if not continued:
-            self.reset_parameters()
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
         
-        # Store training sequences for reconstruction and generation
-        self.training_seqs = seqs.copy()
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+        else:
+            if not continued:
+                self.reset_parameters()   
+            history = []
         
         # Set up optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
             total_samples = 0
             
@@ -596,21 +653,42 @@ class HierDDtsC(nn.Module):
             else:
                 avg_loss = total_loss / total_samples
                 
-            history.append(avg_loss)             
+            history.append(avg_loss)
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
                 mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
             
             # Check convergence
             if prev_loss - avg_loss < tol:
                 print(f"Converged after {it+1} iterations")
+                # Restore the best model state before breaking
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                    print(f"Restored best model state with loss = {best_loss:.6f}")
                 break
             prev_loss = avg_loss
 
             if it % 5 == 0:  # Decay every 5 iterations
                 scheduler.step()
+
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6f}")
+            history.pop()
         
         # Store training statistics and compute mean target
         self._compute_training_statistics(seqs)
@@ -618,7 +696,52 @@ class HierDDtsC(nn.Module):
         self.trained = True
         
         return history
-    
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint with complete training state
+        
+        Args:
+            checkpoint_file: Path to save checkpoint file
+            iteration: Current training iteration
+            history: Training loss history
+            optimizer: Optimizer instance
+            scheduler: Learning rate scheduler instance
+            best_loss: Best loss achieved so far
+        """
+        # Convert mean_target to numpy for saving
+        mean_target_np = self.mean_target.cpu().numpy() if self.mean_target is not None else None
+        
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'config': {
+                'charset': self.charset,
+                'rank': self.rank,
+                'vec_dim': self.vec_dim,
+                'model_dims': self.model_dims,                
+                'num_basis_list': [layer.num_basis for layer in self.hierarchical_layers],
+                'use_residual_list': [layer.use_residual for layer in self.hierarchical_layers],
+                'char_layer_config': {
+                    'rank_mode': self.rank_mode,
+                    'num_basis': self.char_num_basis,
+                    'mode': self.mode,
+                    'user_step': self.step
+                }
+            },
+            'training_stats': {
+                'mean_t': self.mean_t,
+                'mean_token_count': self.mean_token_count,
+                'mean_target': mean_target_np
+            }
+        }
+        torch.save(checkpoint, checkpoint_file)
+        #print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
+
     def _compute_training_statistics(self, seqs, batch_size=50):
         """Compute and store statistics for reconstruction and generation"""
         total_token_count = 0
@@ -868,8 +991,7 @@ class HierDDtsC(nn.Module):
             if hasattr(layer, 'residual_proj') and isinstance(layer.residual_proj, nn.Linear):
                 nn.init.uniform_(layer.residual_proj.weight, -0.1, 0.1)
         
-        # Reset training state
-        self.training_seqs = []
+        # Reset training state        
         self.mean_target = None
         self.trained = False
         self.mean_token_count = None
@@ -948,8 +1070,7 @@ class HierDDtsC(nn.Module):
             'training_stats': {
                 'mean_t': self.mean_t,
                 'mean_token_count': self.mean_token_count,
-                'mean_target': mean_target_np,
-                'training_seqs': self.training_seqs
+                'mean_target': mean_target_np
             }
         }, filename)
         print(f"Model saved to {filename}")
@@ -994,8 +1115,6 @@ class HierDDtsC(nn.Module):
                 model.mean_token_count = stats['mean_token_count']
             if stats['mean_target'] is not None:
                 model.mean_target = torch.tensor(stats['mean_target'], device=device)
-            if 'training_seqs' in stats:
-                model.training_seqs = stats['training_seqs']
             model.trained = True
         
         print(f"Model loaded from {filename}")
@@ -1070,7 +1189,9 @@ if __name__ == "__main__":
         learning_rate=0.1,
         decay_rate=0.98,
         print_every=5,
-        batch_size=32
+        batch_size=32,
+        checkpoint_file='gd_checkpoint.pth',
+        checkpoint_interval=10
     )
     
     # Predictions and correlation analysis
@@ -1145,7 +1266,9 @@ if __name__ == "__main__":
         max_iters=30,
         learning_rate=0.01,
         auto_mode='gap',
-        print_every=5
+        print_every=5,
+        checkpoint_file='auto_checkpoint.pth',
+        checkpoint_interval=5
     )
     
     # Generate from auto-trained model
