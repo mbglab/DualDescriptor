@@ -1,5 +1,5 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
-# Hierarchical Dual Descriptor (Random AB matrix form) and Character Sequence Input (HierDDLrnC)
+# Hierarchical Dual Descriptor (Random AB matrix form) with Character Sequence Input (HierDDLrnC)
 # Combines character-level processing and hierarchical vector processing with Linker matrices
 # This program is for the demonstration of methodology and not fully refined.
 # Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-12
