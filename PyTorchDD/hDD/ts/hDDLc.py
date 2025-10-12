@@ -1,5 +1,5 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
-# Hierarchical Dual Descriptor with Character Sequence Input and Linker Matrices (HierDDLtsC)
+# Hierarchical Dual Descriptor (Tensor form) with Character Sequence Input (HierDDLtsC)
 # Combines character-level processing and hierarchical vector processing with Linker matrices
 # This program is for the demonstration of methodology and not fully refined.
 # Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-10
@@ -210,7 +210,7 @@ class HierDDLtsC(nn.Module):
             num_basis: Number of basis functions for character layer
             mode: 'linear' or 'nonlinear' tokenization
             user_step: Step size for nonlinear tokenization
-            input_seq_len: Fixed input sequence length (after tokenization)
+            input_seq_len: Fixed input sequence length (character sequence length)
             model_dims: Output dimensions for hierarchical layers
             num_basis_list: Number of basis functions for each hierarchical layer
             linker_dims: Output sequence lengths for each hierarchical layer
@@ -226,21 +226,36 @@ class HierDDLtsC(nn.Module):
         self.char_num_basis = num_basis  # number of basis terms for character layer        
         self.mode = mode
         self.step = user_step
-        self.input_seq_len = input_seq_len  # Fixed input sequence length
+        self.input_seq_len = input_seq_len  # Fixed input character sequence length
         self.model_dims = model_dims
         self.linker_dims = linker_dims
+        self.num_layers = len(model_dims)
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.trained = False        
         
+        # Validate dimensions
+        if len(linker_dims) != self.num_layers:
+            raise ValueError("linker_dims must have same length as model_dims")
+        
         # Process linker_trainable parameter
         if isinstance(linker_trainable, bool):
-            self.linker_trainable = [linker_trainable] * len(model_dims)
+            self.linker_trainable = [linker_trainable] * self.num_layers
         elif isinstance(linker_trainable, list):
-            if len(linker_trainable) != len(model_dims):
+            if len(linker_trainable) != self.num_layers:
                 raise ValueError("linker_trainable list length must match number of layers")
             self.linker_trainable = linker_trainable
         else:
             raise TypeError("linker_trainable must be bool or list of bools")
+        
+        # Process use_residual_list
+        if use_residual_list is None:
+            self.use_residual_list = [None] * self.num_layers
+        elif isinstance(use_residual_list, list):
+            if len(use_residual_list) != self.num_layers:
+                raise ValueError("use_residual_list length must match number of layers")
+            self.use_residual_list = use_residual_list
+        else:
+            raise TypeError("use_residual_list must be list or None")
         
         # Character-level processing components
         # 1) Generate all possible tokens (k-mers + right-padded with '_')
@@ -255,6 +270,9 @@ class HierDDLtsC(nn.Module):
         self.tokens = sorted(set(toks))
         self.token_to_idx = {token: idx for idx, token in enumerate(self.tokens)}
         self.idx_to_token = {idx: token for idx, token in enumerate(self.tokens)}
+        
+        # Calculate token sequence length from character sequence length
+        self.token_seq_len = self._calculate_token_seq_len(input_seq_len)
         
         # Embedding layer for tokens
         self.char_embedding = nn.Embedding(len(self.tokens), self.vec_dim)
@@ -274,26 +292,25 @@ class HierDDLtsC(nn.Module):
         self.mean_token_count = None
         self.mean_t = None
         
-        # Hierarchical layers with Linker matrices
+        # Hierarchical layers with Linker matrices (starting from Layer 1)
         self.hierarchical_layers = nn.ModuleList()
-        in_dim = vec_dim  # Input to first hierarchical layer is output from char layer
-        in_seq = input_seq_len  # Input sequence length to first hierarchical layer
-        
-        if use_residual_list is None:
-            use_residual_list = [None] * len(model_dims)
+        for l in range(self.num_layers):
+            # Determine input dimensions for this layer
+            in_dim = vec_dim if l == 0 else model_dims[l-1]
+            in_seq = self.token_seq_len if l == 0 else linker_dims[l-1]  # 使用token_seq_len而不是input_seq_len
+            out_dim = model_dims[l]
+            out_seq = linker_dims[l]
+            num_basis = num_basis_list[l]
+            use_residual = self.use_residual_list[l]
+            linker_trainable = self.linker_trainable[l]
             
-        for i, (out_dim, num_basis, use_residual, linker_trainable) in enumerate(
-            zip(model_dims, num_basis_list, use_residual_list, self.linker_trainable)):
-            
-            out_seq = linker_dims[i]  # Output sequence length for this layer
-            
+            # Initialize layer
             layer = Layer(
                 in_dim, out_dim, in_seq, out_seq, 
-                num_basis, linker_trainable, use_residual, self.device
+                num_basis, linker_trainable, 
+                use_residual, self.device
             )
             self.hierarchical_layers.append(layer)
-            in_dim = out_dim  # Next layer input is current layer output
-            in_seq = out_seq  # Next layer input sequence length is current layer output sequence length
         
         # Mean target vector for the final hierarchical layer output
         self.mean_target = None
@@ -301,6 +318,29 @@ class HierDDLtsC(nn.Module):
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
+    
+    def _calculate_token_seq_len(self, char_seq_len):
+        """
+        Calculate token sequence length from character sequence length based on tokenization mode
+        
+        Args:
+            char_seq_len (int): Character sequence length
+            
+        Returns:
+            int: Token sequence length
+        """
+        if self.mode == 'linear':
+            # Linear mode: sliding window with step=1
+            return char_seq_len - self.rank + 1
+        else:
+            # Nonlinear mode: stepping with custom step size
+            step = self.step or self.rank
+            if self.rank_mode == 'pad':
+                # Always pad to get full tokens
+                return (char_seq_len + step - 1) // step
+            else:
+                # Drop incomplete tokens
+                return max(0, (char_seq_len - self.rank + step) // step)
     
     def token_to_indices(self, token_list):
         """Convert list of tokens to tensor of indices"""
@@ -326,50 +366,25 @@ class HierDDLtsC(nn.Module):
         L = len(seq)
         # Linear mode: sliding window with step=1
         if self.mode == 'linear':
-            tokens = [seq[i:i+self.rank] for i in range(L - self.rank + 1)]
-        else:
-            # Nonlinear mode: stepping with custom step size
-            tokens = []
-            step = self.step or self.rank  # Use custom step if defined, else use rank length
+            return [seq[i:i+self.rank] for i in range(L - self.rank + 1)]
+        
+        # Nonlinear mode: stepping with custom step size
+        toks = []
+        step = self.step or self.rank  # Use custom step if defined, else use rank length
+        
+        for i in range(0, L, step):
+            frag = seq[i:i+self.rank]
+            frag_len = len(frag)
             
-            for i in range(0, L, step):
-                frag = seq[i:i+self.rank]
-                frag_len = len(frag)
-                
-                # Pad or drop based on rank_mode setting
-                if self.rank_mode == 'pad':
-                    # Pad fragment with '_' if shorter than rank
-                    tokens.append(frag if frag_len == self.rank else frag.ljust(self.rank, '_'))
-                elif self.rank_mode == 'drop':
-                    # Only add fragments that match full rank length
-                    if frag_len == self.rank:
-                        tokens.append(frag)
-        
-        # Ensure fixed sequence length by padding or truncating
-        if len(tokens) > self.input_seq_len:
-            tokens = tokens[:self.input_seq_len]  # Truncate
-        elif len(tokens) < self.input_seq_len:
-            # Pad based on rank_mode
+            # Pad or drop based on rank_mode setting
             if self.rank_mode == 'pad':
-                # Pad with empty tokens (represented as padding character)
-                padding = ['_' * self.rank] * (self.input_seq_len - len(tokens))
-                tokens.extend(padding)
-            else:  # drop mode - use valid tokens from the beginning of the sequence
-                # For drop mode, we need to ensure we don't use padding characters
-                # We'll use a different strategy: repeat valid tokens or use special handling
-                if tokens:  # If we have at least one valid token
-                    # Repeat the sequence to fill the required length
-                    while len(tokens) < self.input_seq_len:
-                        tokens.extend(tokens[:min(len(tokens), self.input_seq_len - len(tokens))])
-                else:
-                    # If no valid tokens, use the first character repeated (fallback)
-                    if seq:
-                        base_char = seq[0] if seq[0] in self.charset else self.charset[0]
-                        tokens = [base_char * self.rank] * self.input_seq_len
-                    else:
-                        tokens = [self.charset[0] * self.rank] * self.input_seq_len
-        
-        return tokens
+                # Pad fragment with '_' if shorter than rank
+                toks.append(frag if frag_len == self.rank else frag.ljust(self.rank, '_'))
+            elif self.rank_mode == 'drop':
+                # Only add fragments that match full rank length
+                if frag_len == self.rank:
+                    toks.append(frag)
+        return toks
 
     def char_batch_compute_Nk(self, k_tensor, token_indices):
         """
@@ -397,12 +412,12 @@ class HierDDLtsC(nn.Module):
 
     def char_describe(self, seq):
         """Compute N(k) vectors for each k-mer in sequence (character-level processing)"""
-        tokens = self.extract_tokens(seq)
-        if not tokens:
+        toks = self.extract_tokens(seq)
+        if not toks:
             return []
         
-        token_indices = self.token_to_indices(tokens)
-        k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+        token_indices = self.token_to_indices(toks)
+        k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
         
         # Batch compute all Nk vectors
         N_batch = self.char_batch_compute_Nk(k_positions, token_indices)
@@ -471,30 +486,38 @@ class HierDDLtsC(nn.Module):
         Convert character sequence to tensor representation through char layer
         
         Args:
-            seq (str): Input character sequence
+            seq (str): Input character sequence (must have length = input_seq_len)
             
         Returns:
-            Tensor: Sequence tensor of shape [1, seq_len, vec_dim]
+            Tensor: Sequence tensor of shape [1, token_seq_len, vec_dim]
         """
-        tokens = self.extract_tokens(seq)
-        if not tokens:
+        # Validate sequence length
+        if len(seq) != self.input_seq_len:
+            raise ValueError(f"Input sequence length must be {self.input_seq_len}, got {len(seq)}")
+        
+        toks = self.extract_tokens(seq)
+        if not toks:
             return torch.zeros((1, 0, self.vec_dim), device=self.device)
         
-        token_indices = self.token_to_indices(tokens)
-        k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+        # Validate token sequence length
+        if len(toks) != self.token_seq_len:
+            raise ValueError(f"Token sequence length mismatch: expected {self.token_seq_len}, got {len(toks)}")
+        
+        token_indices = self.token_to_indices(toks)
+        k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
         
         # Compute N(k) vectors through char layer
         Nk_batch = self.char_batch_compute_Nk(k_positions, token_indices)
         
         # Add batch dimension
-        return Nk_batch.unsqueeze(0)  # [1, seq_len, vec_dim]
+        return Nk_batch.unsqueeze(0)  # [1, token_seq_len, vec_dim]
     
     def forward(self, seq):
         """
         Forward pass through entire hierarchical model with Linker matrices
         
         Args:
-            seq (str or list): Input character sequence(s)
+            seq (str or list): Input character sequence(s) of fixed length input_seq_len
             
         Returns:
             Tensor: Output of shape [batch_size, final_seq_len, final_dim]
@@ -508,7 +531,7 @@ class HierDDLtsC(nn.Module):
             for s in seq:
                 tensor_seq = self.char_sequence_to_tensor(s)
                 batch_tensors.append(tensor_seq.squeeze(0))
-            x = torch.stack(batch_tensors)  # [batch_size, seq_len, vec_dim]
+            x = torch.stack(batch_tensors)  # [batch_size, token_seq_len, vec_dim]
         
         # Pass through hierarchical layers with Linker matrices
         for layer in self.hierarchical_layers:
@@ -522,7 +545,7 @@ class HierDDLtsC(nn.Module):
         Returns the average of all output vectors in the sequence
         
         Args:
-            seq (str): Input character sequence
+            seq (str): Input character sequence of fixed length input_seq_len
             
         Returns:
             numpy.array: Predicted target vector
@@ -539,7 +562,7 @@ class HierDDLtsC(nn.Module):
         Train the model using gradient descent with target vectors
         
         Args:
-            seqs: List of character sequences
+            seqs: List of character sequences (all must have length = input_seq_len)
             t_list: List of target vectors
             max_iters: Maximum training iterations
             tol: Convergence tolerance
@@ -554,6 +577,11 @@ class HierDDLtsC(nn.Module):
         Returns:
             list: Training loss history
         """
+        # Validate input sequences
+        for seq in seqs:
+            if len(seq) != self.input_seq_len:
+                raise ValueError(f"All sequences must have length {self.input_seq_len}")
+        
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
         best_loss = float('inf')
@@ -673,7 +701,7 @@ class HierDDLtsC(nn.Module):
         Self-training method for the hierarchical model with Linker matrices
         
         Args:
-            seqs: List of character sequences
+            seqs: List of character sequences (all must have length = input_seq_len)
             max_iters: Maximum training iterations
             tol: Convergence tolerance
             learning_rate: Initial learning rate
@@ -687,6 +715,11 @@ class HierDDLtsC(nn.Module):
         Returns:
             list: Training loss history
         """
+        # Validate input sequences
+        for seq in seqs:
+            if len(seq) != self.input_seq_len:
+                raise ValueError(f"All sequences must have length {self.input_seq_len}")
+                
         if auto_mode not in ('gap', 'reg'):
             raise ValueError("auto_mode must be either 'gap' or 'reg'")
         
@@ -727,37 +760,40 @@ class HierDDLtsC(nn.Module):
             # Process each sequence
             for seq in seqs:
                 # Convert to tensor through char layer
-                char_output = self.char_sequence_to_tensor(seq)  # [1, seq_len, vec_dim]
+                char_output = self.char_sequence_to_tensor(seq)  # [1, token_seq_len, vec_dim]
+                char_seq_len = char_output.shape[1]
+                
+                if char_seq_len <= 1 and auto_mode == 'reg':
+                    continue  # Skip sequences that are too short for reg mode
                 
                 # Forward pass through hierarchical layers with Linker matrices
                 hierarchical_output = char_output
                 for layer in self.hierarchical_layers:
                     hierarchical_output = layer(hierarchical_output)
                 
+                hier_seq_len = hierarchical_output.shape[1]
+                
                 # Compute loss based on auto_mode
                 seq_loss = 0.0
                 valid_positions = 0
                 
-                # For gap mode, compare with char layer output
-                # For reg mode, compare with next position's char layer output
-                if auto_mode == 'gap':
-                    # Self-consistency: output should match char layer output
-                    # Note: hierarchical_output might have different sequence length due to Linker
-                    # We need to handle sequence length mismatch
-                    min_len = min(char_output.shape[1], hierarchical_output.shape[1])
-                    for k in range(min_len):
+                # Use the minimum sequence length to avoid index errors
+                min_seq_len = min(char_seq_len, hier_seq_len)
+                
+                for k in range(min_seq_len):
+                    if auto_mode == 'gap':
+                        # Self-consistency: output should match char layer output
                         target = char_output[0, k]
                         pred = hierarchical_output[0, k]
                         seq_loss += torch.sum((pred - target) ** 2)
                         valid_positions += 1
-                else:  # 'reg' mode
-                    # Predict next position's char layer output
-                    min_len = min(char_output.shape[1] - 1, hierarchical_output.shape[1])
-                    for k in range(min_len):
-                        target = char_output[0, k + 1]
-                        pred = hierarchical_output[0, k]
-                        seq_loss += torch.sum((pred - target) ** 2)
-                        valid_positions += 1
+                    else:  # 'reg' mode
+                        if k < char_seq_len - 1 and k < hier_seq_len:
+                            # Predict next position's char layer output
+                            target = char_output[0, k + 1]
+                            pred = hierarchical_output[0, k]
+                            seq_loss += torch.sum((pred - target) ** 2)
+                            valid_positions += 1
                 
                 if valid_positions > 0:
                     seq_loss = seq_loss / valid_positions
@@ -851,7 +887,7 @@ class HierDDLtsC(nn.Module):
                 'linker_dims': self.linker_dims,
                 'num_basis_list': [layer.num_basis for layer in self.hierarchical_layers],
                 'linker_trainable': self.linker_trainable,
-                'use_residual_list': [layer.use_residual for layer in self.hierarchical_layers],
+                'use_residual_list': self.use_residual_list,
                 'char_layer_config': {
                     'rank_mode': self.rank_mode,
                     'num_basis': self.char_num_basis,
@@ -880,13 +916,13 @@ class HierDDLtsC(nn.Module):
                 batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
                 
                 for seq in batch_seqs:
-                    tokens = self.extract_tokens(seq)
-                    if not tokens:
+                    toks = self.extract_tokens(seq)
+                    if not toks:
                         continue
                         
-                    batch_token_count += len(tokens)
-                    token_indices = self.token_to_indices(tokens)
-                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    batch_token_count += len(toks)
+                    token_indices = self.token_to_indices(toks)
+                    k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
                     
                     Nk_batch = self.char_batch_compute_Nk(k_positions, token_indices)
                     batch_vec_sum += Nk_batch.sum(dim=0)
@@ -989,6 +1025,12 @@ class HierDDLtsC(nn.Module):
                 # Build candidate sequence
                 candidate_seq = current_sequence + token
                 
+                # Pad to fixed length if necessary
+                if len(candidate_seq) < self.input_seq_len:
+                    candidate_seq = candidate_seq.ljust(self.input_seq_len, 'A')  # Pad with 'A'
+                elif len(candidate_seq) > self.input_seq_len:
+                    candidate_seq = candidate_seq[:self.input_seq_len]
+                
                 # Process through entire hierarchical model
                 with torch.no_grad():
                     model_output = self.forward(candidate_seq)
@@ -1019,7 +1061,7 @@ class HierDDLtsC(nn.Module):
         if '_' in reconstructed_seq:
             reconstructed_seq = reconstructed_seq.replace('_', '')
         
-        return reconstructed_seq
+        return reconstructed_seq[:self.input_seq_len]  # Ensure fixed length
 
     def generate(self, L, tau=0.0):
         """
@@ -1029,7 +1071,7 @@ class HierDDLtsC(nn.Module):
         predictions, incorporating both character-level and hierarchical patterns with Linker matrices.
         
         Args:
-            L (int): Length of sequence to generate
+            L (int): Length of sequence to generate (must be <= input_seq_len)
             tau (float): Temperature parameter for stochastic sampling.
                         tau=0: deterministic (greedy) selection
                         tau>0: stochastic selection with temperature
@@ -1046,6 +1088,10 @@ class HierDDLtsC(nn.Module):
         if L <= 0:
             return ""
         
+        if L > self.input_seq_len:
+            print(f"Warning: Requested length {L} exceeds fixed input sequence length {self.input_seq_len}. Truncating.")
+            L = self.input_seq_len
+        
         generated_sequence = ""
         
         # Generate sequence token by token
@@ -1056,12 +1102,18 @@ class HierDDLtsC(nn.Module):
             for token in self.tokens:
                 candidate_seq = generated_sequence + token
                 
+                # Pad to fixed length if necessary for model input
+                if len(candidate_seq) < self.input_seq_len:
+                    padded_seq = candidate_seq.ljust(self.input_seq_len, 'A')
+                else:
+                    padded_seq = candidate_seq[:self.input_seq_len]
+                    
                 # Skip if candidate exceeds desired length
                 if len(candidate_seq) > L:
                     continue
                     
                 with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
+                    model_output = self.forward(padded_seq)
                     
                     if model_output.numel() > 0:
                         pred_target = model_output.mean(dim=1).squeeze(0)
@@ -1224,7 +1276,7 @@ class HierDDLtsC(nn.Module):
                 'linker_dims': self.linker_dims,
                 'num_basis_list': [layer.num_basis for layer in self.hierarchical_layers],
                 'linker_trainable': self.linker_trainable,
-                'use_residual_list': [layer.use_residual for layer in self.hierarchical_layers],
+                'use_residual_list': self.use_residual_list,
                 'char_layer_config': {
                     'rank_mode': self.rank_mode,
                     'num_basis': self.char_num_basis,
@@ -1305,14 +1357,13 @@ if __name__ == "__main__":
     
     # Configuration
     charset = ['A', 'C', 'G', 'T']
-    rank = 2
+    rank = 1
     vec_dim = 8
-    input_seq_len = 50  # Fixed input sequence length after tokenization
+    input_seq_len = 200  # Fixed input character sequence length
     model_dims = [16, 12, 8]  # Hierarchical layer dimensions
     num_basis_list = [6, 5, 4]  # Basis functions for each hierarchical layer
     linker_dims = [40, 30, 20]  # Output sequence lengths for each hierarchical layer
     num_seqs = 100
-    seq_length = 200  # Fixed input character sequence length
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -1320,7 +1371,7 @@ if __name__ == "__main__":
     print(f"Character set: {charset}")
     print(f"Rank (k-mer length): {rank}")
     print(f"Character layer output dim: {vec_dim}")
-    print(f"Input sequence length (after tokenization): {input_seq_len}")
+    print(f"Input sequence length: {input_seq_len}")
     print(f"Hierarchical layer dims: {model_dims}")
     print(f"Linker output sequence lengths: {linker_dims}")
     print(f"Number of basis functions: {num_basis_list}")
@@ -1330,7 +1381,7 @@ if __name__ == "__main__":
     seqs, t_list = [], []
     for _ in range(num_seqs):
         # Generate fixed-length sequences
-        seq = ''.join(random.choices(charset, k=seq_length))
+        seq = ''.join(random.choices(charset, k=input_seq_len))
         seqs.append(seq)
         # Create target vector (final layer dimension)
         t_list.append([random.uniform(-1.0, 1.0) for _ in range(model_dims[-1])])
@@ -1374,7 +1425,7 @@ if __name__ == "__main__":
     gd_history = model.grad_train(
         seqs, t_list,
         max_iters=100,
-        learning_rate=0.1,
+        learning_rate=0.01,
         decay_rate=0.98,
         print_every=5,
         batch_size=16,
