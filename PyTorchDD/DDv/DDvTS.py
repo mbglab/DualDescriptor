@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import copy, os
 
 class DualDescriptorTS(nn.Module):
     """
@@ -210,230 +211,364 @@ class DualDescriptorTS(nn.Module):
                 
         return total_loss / total_positions if total_positions else 0.0
 
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10, batch_size=1024):
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+               continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+               checkpoint_file=None, checkpoint_interval=10):
         """
-        Train the model using gradient descent with batch processing
-        GPU-accelerated with PyTorch.
+        Train the model using gradient descent with sequence-level batch processing.
+        Optimized for GPU memory efficiency by processing sequences individually.
+        
+        Args:
+            seqs: List of character sequences for training
+            t_list: List of target vectors corresponding to sequences
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            
+        Returns:
+            list: Training loss history
         """
+        
         if not continued:
             self.reset_parameters()
-            
-        # Precompute token indices for all sequences
-        all_tokens = []
-        for seq in seqs:
-            toks = self.extract_tokens(seq)
-            token_indices = self.token_to_indices(toks) if toks else torch.tensor([], dtype=torch.long, device=self.device)
-            all_tokens.append((toks, token_indices))
         
         # Convert target vectors to tensor
         t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
         
-        # Prepare all training samples (position, token_idx, target)
-        all_samples = []
-        for seq_idx, (toks, token_indices) in enumerate(all_tokens):
-            if not toks:
-                continue
-            for pos in range(len(toks)):
-                # Store as tuple: (position, seq_idx, token_index)
-                all_samples.append((pos, seq_idx, token_indices[pos].item()))
-        
-        total_samples = len(all_samples)
-        if total_samples == 0:
-            print("Warning: No training samples found")
-            return []
-        
-        # Set up optimizer
+        # Setup optimizer and scheduler
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
+        # Training state variables
         history = []
         prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
         
         for it in range(max_iters):
-            epoch_loss = 0.0
-            # Shuffle samples
-            random.shuffle(all_samples)
+            total_loss = 0.0
+            total_sequences = 0
             
-            # Process in batches
-            for batch_start in range(0, total_samples, batch_size):
-                batch_end = min(batch_start + batch_size, total_samples)
-                batch_samples = all_samples[batch_start:batch_end]
+            # Shuffle sequences for each epoch
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+            
+            # Process sequences in batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
+                batch_targets = [t_tensors[idx] for idx in batch_indices]
                 
                 optimizer.zero_grad()
+                batch_loss = 0.0
                 
-                # Prepare batch data directly as tensors
-                k_list = []
-                token_idx_list = []
-                target_list = []
+                # Process each sequence in the batch
+                for seq, target in zip(batch_seqs, batch_targets):
+                    # Extract tokens and convert to indices
+                    tokens = self.extract_tokens(seq)
+                    if not tokens:
+                        continue
+                        
+                    token_indices = self.token_to_indices(tokens)
+                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    
+                    # Compute N(k) vectors for all positions in the sequence
+                    Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                    
+                    # Compute sequence-level target: average of all N(k) vectors
+                    seq_pred = torch.mean(Nk_batch, dim=0)
+                    
+                    # Calculate loss for this sequence
+                    seq_loss = torch.sum((seq_pred - target) ** 2)
+                    batch_loss += seq_loss
+                    
+                    # Clean up intermediate tensors to free memory
+                    del Nk_batch, seq_pred, token_indices, k_positions
                 
-                for pos, seq_idx, token_idx in batch_samples:
-                    k_list.append(pos)
-                    token_idx_list.append(token_idx)
-                    target_list.append(t_tensors[seq_idx])
+                # Average loss over sequences in batch and backpropagate
+                if len(batch_seqs) > 0:
+                    batch_loss = batch_loss / len(batch_seqs)
+                    batch_loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += batch_loss.item() * len(batch_seqs)
+                    total_sequences += len(batch_seqs)
                 
-                # Create tensors directly on GPU
-                k_tensor = torch.tensor(k_list, dtype=torch.float32, device=self.device)
-                token_indices_tensor = torch.tensor(token_idx_list, device=self.device)
-                targets = torch.stack(target_list)
-                
-                # Compute Nk in batch
-                Nk_batch = self.batch_compute_Nk(k_tensor, token_indices_tensor)
-                
-                # Compute loss
-                loss = torch.mean(torch.sum((Nk_batch - targets) ** 2, dim=1))
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item() * len(batch_samples)
+                # Clear GPU cache periodically
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
-            # Average loss over epoch
-            avg_loss = epoch_loss / total_samples
+            # Calculate average loss for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+            else:
+                avg_loss = 0.0
+                
             history.append(avg_loss)
-            scheduler.step()
             
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
-                print(f"GD Iter {it:2d}: D = {avg_loss:.6e}, LR = {scheduler.get_last_lr()[0]:.6f}")
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"GD Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
             
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
                 break
+                
             prev_loss = avg_loss
-        
-        # Calculate statistics for reconstruction/generation
-        total_token_count = 0
-        total_t = torch.zeros(self.m, device=self.device)
-        for seq, t_vec in zip(seqs, t_tensors):
-            tokens = self.extract_tokens(seq)
-            total_token_count += len(tokens)
-            total_t += t_vec * len(tokens)
             
-        self.mean_token_count = total_token_count / len(seqs)
-        self.mean_t = (total_t / total_token_count).detach().cpu().numpy()
+            # Learning rate scheduling
+            scheduler.step()
+        
+        # Compute and store training statistics for reconstruction/generation
+        self._compute_training_statistics(seqs)
         self.trained = True
+        
         return history
 
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, continued=False, auto_mode='reg', decay_rate=1.0, print_every=10, batch_size=1024):
+    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
+                   batch_size=32, checkpoint_file=None, checkpoint_interval=5):
         """
-        Self-training method using gradient descent with batch processing
-        GPU-accelerated with PyTorch.
+        Self-training method with memory-efficient sequence processing.
+        Supports both gap (self-consistency) and reg (next-token prediction) modes.
+        
+        Args:
+            seqs: List of character sequences for training
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            auto_mode: Training mode - 'gap' for self-consistency, 'reg' for next-token prediction
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            
+        Returns:
+            list: Training loss history
         """
+        
         if auto_mode not in ('gap', 'reg'):
             raise ValueError("auto_mode must be either 'gap' or 'reg'")
-
+        
         if not continued:
             self.reset_parameters()
-            
-        # Precompute token indices for all sequences
-        all_sequences = []
-        for seq in seqs:
-            tokens = self.extract_tokens(seq)
-            token_indices = self.token_to_indices(tokens) if tokens else torch.tensor([], dtype=torch.long, device=self.device)
-            all_sequences.append((tokens, token_indices))
         
-        # Prepare all training samples
-        all_samples = []
-        for seq_idx, (tokens, token_indices) in enumerate(all_sequences):
-            if not tokens:
-                continue
-                
-            if auto_mode == 'gap':
-                # Each token is a sample (position k, token_idx)
-                for k, token_idx in enumerate(token_indices):
-                    all_samples.append((k, token_idx.item()))
-            else:  # 'reg' mode
-                # Each token except last is a sample (position k, current token, next token)
-                for k in range(len(tokens) - 1):
-                    all_samples.append((k, token_indices[k].item(), token_indices[k+1].item()))
-        
-        if not all_samples:
-            raise ValueError("No training samples found")
-            
-        # Set up optimizer
+        # Setup optimizer and scheduler
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
+        # Training state variables
         history = []
         prev_loss = float('inf')
-        total_samples = len(all_samples)
+        best_loss = float('inf')
+        best_model_state = None
         
         for it in range(max_iters):
-            epoch_loss = 0.0
-            # Shuffle samples
-            random.shuffle(all_samples)
+            total_loss = 0.0
+            total_samples = 0
             
-            # Process in batches
-            for batch_start in range(0, total_samples, batch_size):
-                batch_end = min(batch_start + batch_size, total_samples)
-                batch_samples = all_samples[batch_start:batch_end]
+            # Shuffle sequences for each epoch
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+            
+            # Process sequences in batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
                 
                 optimizer.zero_grad()
+                batch_loss = 0.0
+                batch_sample_count = 0
                 
-                # Prepare batch data directly as tensors
-                k_list = []
-                current_indices_list = []
-                target_indices_list = [] if auto_mode == 'reg' else None
+                # Process each sequence in the batch
+                for seq in batch_seqs:
+                    # Extract tokens and convert to indices
+                    tokens = self.extract_tokens(seq)
+                    if len(tokens) <= 1 and auto_mode == 'reg':
+                        continue  # Skip sequences too short for regression mode
+                        
+                    token_indices = self.token_to_indices(tokens)
+                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    
+                    # Compute N(k) vectors for all positions
+                    Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                    
+                    # Get token embeddings for target computation
+                    token_embeddings = self.embedding(token_indices)
+                    
+                    # Compute loss based on auto_mode
+                    seq_loss = 0.0
+                    valid_positions = 0
+                    
+                    for k in range(len(tokens)):
+                        if auto_mode == 'gap':
+                            # Self-consistency: N(k) should match token embedding at position k
+                            target = token_embeddings[k]
+                            pred = Nk_batch[k]
+                            seq_loss += torch.sum((pred - target) ** 2)
+                            valid_positions += 1
+                        else:  # 'reg' mode
+                            if k < len(tokens) - 1:
+                                # Predict next token's embedding
+                                target = token_embeddings[k + 1]
+                                pred = Nk_batch[k]
+                                seq_loss += torch.sum((pred - target) ** 2)
+                                valid_positions += 1
+                    
+                    if valid_positions > 0:
+                        seq_loss = seq_loss / valid_positions
+                        batch_loss += seq_loss
+                        batch_sample_count += 1
+                    
+                    # Clean up intermediate tensors
+                    del Nk_batch, token_embeddings, token_indices, k_positions
                 
-                for sample in batch_samples:
-                    if auto_mode == 'reg':
-                        k, current_idx, next_idx = sample
-                        k_list.append(k)
-                        current_indices_list.append(current_idx)
-                        target_indices_list.append(next_idx)
-                    else:  # 'gap' mode
-                        k, token_idx = sample
-                        k_list.append(k)
-                        current_indices_list.append(token_idx)
+                # Backpropagate batch loss
+                if batch_sample_count > 0:
+                    batch_loss = batch_loss / batch_sample_count
+                    batch_loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += batch_loss.item() * batch_sample_count
+                    total_samples += batch_sample_count
                 
-                # Create tensors directly on GPU
-                k_tensor = torch.tensor(k_list, dtype=torch.float32, device=self.device)
-                current_indices_tensor = torch.tensor(current_indices_list, device=self.device)
-                
-                # Compute Nk for current tokens
-                Nk_batch = self.batch_compute_Nk(k_tensor, current_indices_tensor)
-                
-                # Get target embeddings
-                if auto_mode == 'gap':
-                    targets = self.embedding(current_indices_tensor)
-                else:  # 'reg' mode
-                    target_indices_tensor = torch.tensor(target_indices_list, device=self.device)
-                    targets = self.embedding(target_indices_tensor)
-                
-                # Compute loss
-                loss = torch.mean(torch.sum((Nk_batch - targets) ** 2, dim=1))
-                loss.backward()
-                optimizer.step()
-                
-                epoch_loss += loss.item() * len(batch_samples)
+                # Clear GPU cache
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
-            # Average loss over epoch
-            avg_loss = epoch_loss / total_samples
+            # Calculate average loss for this iteration
+            if total_samples > 0:
+                avg_loss = total_loss / total_samples
+            else:
+                avg_loss = 0.0
+                
             history.append(avg_loss)
-            scheduler.step()
             
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
                 mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {scheduler.get_last_lr()[0]:.6f}")
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
             
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
                 break
+                
             prev_loss = avg_loss
+            
+            # Learning rate scheduling
+            scheduler.step()
         
-        # Compute and store statistics for reconstruction/generation
-        total_t = torch.zeros(self.m, device=self.device)
-        total_token_count = 0
-        for tokens, token_indices in all_sequences:
-            embeds = self.embedding(token_indices)
-            total_token_count += len(tokens)
-            total_t += embeds.sum(dim=0)
-        
-        self.mean_token_count = total_token_count / len(seqs)
-        self.mean_t = (total_t / total_token_count).detach().cpu().numpy()
+        # Compute and store training statistics
+        self._compute_training_statistics(seqs)
         self.trained = True
         
         return history
+
+    def _compute_training_statistics(self, seqs, batch_size=50):
+        """
+        Compute training statistics for reconstruction and generation.
+        Processes sequences in batches to manage memory usage.
+        
+        Args:
+            seqs: List of training sequences
+            batch_size: Number of sequences to process in each batch
+        """
+        total_token_count = 0
+        total_t = torch.zeros(self.m, device=self.device)
+        
+        with torch.no_grad():
+            for i in range(0, len(seqs), batch_size):
+                batch_seqs = seqs[i:i + batch_size]
+                batch_token_count = 0
+                batch_vec_sum = torch.zeros(self.m, device=self.device)
+                
+                for seq in batch_seqs:
+                    tokens = self.extract_tokens(seq)
+                    if not tokens:
+                        continue
+                        
+                    batch_token_count += len(tokens)
+                    token_indices = self.token_to_indices(tokens)
+                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    
+                    Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                    batch_vec_sum += Nk_batch.sum(dim=0)
+                    
+                    # Clean up
+                    del Nk_batch, token_indices, k_positions
+                
+                total_token_count += batch_token_count
+                total_t += batch_vec_sum
+                
+                # Clear GPU cache between batches
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        self.mean_token_count = total_token_count / len(seqs) if seqs else 0
+        self.mean_t = (total_t / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.m)
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint with complete training state.
+        
+        Args:
+            checkpoint_file: Path to save checkpoint file
+            iteration: Current training iteration
+            history: Training loss history
+            optimizer: Optimizer instance
+            scheduler: Learning rate scheduler instance
+            best_loss: Best loss achieved so far
+        """
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'training_stats': {
+                'mean_t': self.mean_t,
+                'mean_token_count': self.mean_token_count
+            }
+        }
+        torch.save(checkpoint, checkpoint_file)
+        print(f"Checkpoint saved at iteration {iteration}")
 
     def predict_t(self, seq):
         """

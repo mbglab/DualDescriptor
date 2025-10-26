@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import copy
 
 class DualDescriptorRN(nn.Module):
     """
@@ -200,31 +201,61 @@ class DualDescriptorRN(nn.Module):
         return total_loss / total_positions if total_positions else 0.0
 
     def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-                   continued=False, decay_rate=1.0, print_every=10, batch_size=1024):
+               continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
+               checkpoint_file=None, checkpoint_interval=10):
         """
-        Train the model using gradient descent with batch processing
-        GPU-accelerated with PyTorch.
-        """
-        if not continued:
-            self.reset_parameters()
+        Train the model using gradient descent with batch processing and memory optimization.
+        GPU-accelerated with PyTorch, featuring checkpoint saving and memory management.
+        
+        Args:
+            seqs: List of character sequences
+            t_list: List of target vectors
+            max_iters: Maximum training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate
+            continued: Whether to continue from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print interval
+            batch_size: Batch size for training
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
             
-        # Precompute token indices for all sequences
-        all_tokens = []
-        for seq in seqs:
-            toks = self.extract_tokens(seq)
-            token_indices = self.token_to_indices(toks) if toks else torch.tensor([], dtype=torch.long, device=self.device)
-            all_tokens.append((toks, token_indices))
+        Returns:
+            list: Training loss history
+        """
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
         
-        # Convert target vectors to tensor
-        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6e}")
+        else:
+            if not continued:
+                self.reset_parameters()
+            history = []
         
-        # Prepare all training samples (position, seq_idx, token_idx)
+        # Precompute token indices for all sequences (mimicking HierDDLrnC approach)
         all_samples = []
-        for seq_idx, (toks, token_indices) in enumerate(all_tokens):
+        total_token_count = 0
+        
+        for seq_idx, seq in enumerate(seqs):
+            toks = self.extract_tokens(seq)
             if not toks:
                 continue
+                
+            token_indices = self.token_to_indices(toks)
+            total_token_count += len(toks)
+            
+            # Store samples with position information
             for pos in range(len(toks)):
-                # Store as tuple: (position, seq_idx, token_index)
                 all_samples.append((pos, seq_idx, token_indices[pos].item()))
         
         total_samples = len(all_samples)
@@ -232,19 +263,28 @@ class DualDescriptorRN(nn.Module):
             print("Warning: No training samples found")
             return []
         
+        # Convert target vectors to tensor
+        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
+        
         # Set up optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             epoch_loss = 0.0
+            processed_samples = 0
+            
             # Shuffle samples
             random.shuffle(all_samples)
             
-            # Process in batches
+            # Process in batches with fixed batch size (like HierDDLrnC)
             for batch_start in range(0, total_samples, batch_size):
                 batch_end = min(batch_start + batch_size, total_samples)
                 batch_samples = all_samples[batch_start:batch_end]
@@ -274,64 +314,118 @@ class DualDescriptorRN(nn.Module):
                 loss.backward()
                 optimizer.step()
                 
-                epoch_loss += loss.item() * len(batch_samples)
+                batch_loss = loss.item() * len(batch_samples)
+                epoch_loss += batch_loss
+                processed_samples += len(batch_samples)
+                
+                # Clean up to free memory (like HierDDLrnC)
+                del k_tensor, token_indices_tensor, targets, Nk_batch, loss
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Average loss over epoch
-            avg_loss = epoch_loss / total_samples
+            avg_loss = epoch_loss / processed_samples if processed_samples > 0 else 0.0
             history.append(avg_loss)
-            scheduler.step()
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             if it % print_every == 0 or it == max_iters - 1:
-                print(f"GD Iter {it:2d}: D = {avg_loss:.6e}, LR = {scheduler.get_last_lr()[0]:.6f}")
+                print(f"GD Iter {it:3d}: D = {avg_loss:.6e}, LR = {scheduler.get_last_lr()[0]:.6f}")
+            
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
             
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > prev_loss:
+                    self.load_state_dict(best_model_state)
+                    print(f"Restored best model state with loss = {best_loss:.6e}")
+                    history[-1] = best_loss
                 break
             prev_loss = avg_loss
+            
+            scheduler.step()
+            
+            # Clean GPU memory at the end of each iteration
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6e}")
+            history[-1] = best_loss
         
         # Calculate statistics for reconstruction/generation
-        total_token_count = 0
-        total_t = torch.zeros(self.m, device=self.device)
-        for seq, t_vec in zip(seqs, t_tensors):
-            tokens = self.extract_tokens(seq)
-            total_token_count += len(tokens)
-            total_t += t_vec * len(tokens)
-            
-        self.mean_token_count = total_token_count / len(seqs)
-        self.mean_t = (total_t / total_token_count).detach().cpu().numpy()
+        self._compute_training_statistics(seqs)
         self.trained = True
+        
         return history
 
     def auto_train(self, seqs, auto_mode='gap', max_iters=1000, tol=1e-8, 
-                   learning_rate=0.01, continued=False, decay_rate=1.0, 
-                   print_every=10, batch_size=1024):
+               learning_rate=0.01, continued=False, decay_rate=1.0, 
+               print_every=10, batch_size=1024, checkpoint_file=None, 
+               checkpoint_interval=10):
         """
-        Train the model using self-supervised learning with two modes:
-          - 'gap': Gap filling (mask current token and predict it from context)
-          - 'reg': Auto-regressive (predict next token from previous tokens)
+        Train the model using self-supervised learning with memory optimization
+        and checkpoint mechanism. Supports both 'gap' and 'reg' training modes.
         
-        This method updates all learnable components with GPU acceleration.
+        Args:
+            seqs: List of character sequences
+            auto_mode: 'gap' or 'reg' training mode
+            max_iters: Maximum training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate
+            continued: Whether to continue from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print interval
+            batch_size: Batch size for training
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
+            
+        Returns:
+            list: Training loss history
         """
         if auto_mode not in ('gap', 'reg'):
             raise ValueError("auto_mode must be either 'gap' or 'reg'")
 
-        if not continued:
-            self.reset_parameters()
-            
-        # Precompute token indices for all sequences
-        all_sequences = []
-        for seq in seqs:
-            tokens = self.extract_tokens(seq)
-            token_indices = self.token_to_indices(tokens) if tokens else torch.tensor([], dtype=torch.long, device=self.device)
-            all_sequences.append((tokens, token_indices))
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
         
-        # Prepare all training samples
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+        else:
+            if not continued:
+                self.reset_parameters()
+            history = []
+        
+        # Precompute all training samples (mimicking HierDDLrnC approach)
         all_samples = []
-        for seq_idx, (tokens, token_indices) in enumerate(all_sequences):
+        
+        for seq_idx, seq in enumerate(seqs):
+            tokens = self.extract_tokens(seq)
             if not tokens:
                 continue
                 
+            token_indices = self.token_to_indices(tokens)
+            
             if auto_mode == 'gap':
                 # Each token is a sample (position k, token_idx)
                 for k, token_idx in enumerate(token_indices):
@@ -348,16 +442,22 @@ class DualDescriptorRN(nn.Module):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
+        
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
         total_samples = len(all_samples)
         
-        for it in range(max_iters):
+        for it in range(start_iter, max_iters):
             epoch_loss = 0.0
+            processed_samples = 0
+            
             # Shuffle samples
             random.shuffle(all_samples)
             
-            # Process in batches
+            # Process in batches with fixed batch size (like HierDDLrnC)
             for batch_start in range(0, total_samples, batch_size):
                 batch_end = min(batch_start + batch_size, total_samples)
                 batch_samples = all_samples[batch_start:batch_end]
@@ -399,36 +499,143 @@ class DualDescriptorRN(nn.Module):
                 loss.backward()
                 optimizer.step()
                 
-                epoch_loss += loss.item() * len(batch_samples)
+                batch_loss = loss.item() * len(batch_samples)
+                epoch_loss += batch_loss
+                processed_samples += len(batch_samples)
+                
+                # Clean up to free memory (like HierDDLrnC)
+                del k_tensor, current_indices_tensor, Nk_batch, targets, loss
+                if auto_mode == 'reg':
+                    del target_indices_tensor
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             
             # Average loss over epoch
-            avg_loss = epoch_loss / total_samples
+            avg_loss = epoch_loss / processed_samples if processed_samples > 0 else 0.0
             history.append(avg_loss)
-            scheduler.step()
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             if it % print_every == 0 or it == max_iters - 1:
                 mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {scheduler.get_last_lr()[0]:.6f}")
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
             
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > prev_loss:
+                    self.load_state_dict(best_model_state)
+                    print(f"Restored best model state with loss = {best_loss:.6f}")
+                    history[-1] = best_loss
                 break
             prev_loss = avg_loss
+            
+            scheduler.step()
+            
+            # Clean GPU memory at the end of each iteration
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6f}")
+            history[-1] = best_loss
         
         # Compute and store statistics for reconstruction/generation
-        total_t = torch.zeros(self.m, device=self.device)
-        total_token_count = 0
-        for tokens, token_indices in all_sequences:
-            embeds = self.embedding(token_indices)
-            total_token_count += len(tokens)
-            total_t += embeds.sum(dim=0)
-        
-        self.mean_token_count = total_token_count / len(seqs)
-        self.mean_t = (total_t / total_token_count).detach().cpu().numpy()
+        self._compute_training_statistics(seqs)
         self.trained = True
         
         return history
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint with complete training state
+        
+        Args:
+            checkpoint_file: Path to save checkpoint file
+            iteration: Current training iteration
+            history: Training loss history
+            optimizer: Optimizer instance
+            scheduler: Learning rate scheduler instance
+            best_loss: Best loss achieved so far
+        """
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'config': {
+                'charset': self.charset,
+                'vec_dim': self.m,
+                'bas_dim': self.L,
+                'rank': self.rank,
+                'rank_mode': self.rank_mode,
+                'mode': self.mode,
+                'user_step': self.step
+            },
+            'training_stats': {
+                'mean_t': self.mean_t if hasattr(self, 'mean_t') else None,
+                'mean_token_count': self.mean_token_count if hasattr(self, 'mean_token_count') else None
+            }
+        }
+        torch.save(checkpoint, checkpoint_file)
+        print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
+
+    def _compute_training_statistics(self, seqs, batch_size=50):
+        """Compute and store statistics for reconstruction and generation with memory optimization"""
+        total_token_count = 0
+        total_t = torch.zeros(self.m, device=self.device)
+        
+        with torch.no_grad():
+            for i in range(0, len(seqs), batch_size):
+                batch_seqs = seqs[i:i+batch_size]
+                batch_token_count = 0
+                batch_t_sum = torch.zeros(self.m, device=self.device)
+                
+                for seq in batch_seqs:
+                    try:
+                        tokens = self.extract_tokens(seq)
+                        batch_token_count += len(tokens)
+                        
+                        if tokens:
+                            token_indices = self.token_to_indices(tokens)
+                            k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                            Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                            batch_t_sum += Nk_batch.sum(dim=0)
+                            
+                            # Clean up
+                            del token_indices, k_positions, Nk_batch
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            print(f"Warning: Memory error computing statistics for sequence. Skipping.")
+                            continue
+                        else:
+                            raise e
+                
+                total_token_count += batch_token_count
+                total_t += batch_t_sum
+                
+                # Clean batch
+                del batch_t_sum
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        self.mean_token_count = total_token_count / len(seqs) if seqs else 0
+        self.mean_t = (total_t / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.m)
 
     def predict_t(self, seq):
         """
@@ -585,7 +792,7 @@ if __name__ == "__main__":
     grad_history = dd.grad_train(
         seqs, 
         t_list,
-        learning_rate=0.01,
+        learning_rate=0.05,
         max_iters=100,
         tol=1e-86,
         decay_rate=0.99,
@@ -655,7 +862,7 @@ if __name__ == "__main__":
         seqs,
         auto_mode='gap',
         max_iters=300,
-        learning_rate=0.001,
+        learning_rate=0.01,
         decay_rate=0.995,
         print_every=20,
         batch_size=2048
