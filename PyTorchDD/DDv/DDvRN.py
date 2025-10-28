@@ -201,11 +201,12 @@ class DualDescriptorRN(nn.Module):
         return total_loss / total_positions if total_positions else 0.0
 
     def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-               continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
+               continued=False, decay_rate=1.0, print_every=10, batch_size=32,
                checkpoint_file=None, checkpoint_interval=10):
         """
-        Train the model using gradient descent with batch processing and memory optimization.
-        GPU-accelerated with PyTorch, featuring checkpoint saving and memory management.
+        Train model using gradient descent with sequence-level batch processing.
+        Memory-optimized version that processes sequences in batches to avoid 
+        large precomputation and storage of all token positions.
         
         Args:
             seqs: List of character sequences
@@ -216,13 +217,14 @@ class DualDescriptorRN(nn.Module):
             continued: Whether to continue from existing parameters
             decay_rate: Learning rate decay rate
             print_every: Print interval
-            batch_size: Batch size for training
+            batch_size: Number of sequences to process in each batch
             checkpoint_file: Path to save/load checkpoint file for resuming training
             checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
         """
+        
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
         best_loss = float('inf')
@@ -242,31 +244,10 @@ class DualDescriptorRN(nn.Module):
                 self.reset_parameters()
             history = []
         
-        # Precompute token indices for all sequences (mimicking HierDDLrnC approach)
-        all_samples = []
-        total_token_count = 0
-        
-        for seq_idx, seq in enumerate(seqs):
-            toks = self.extract_tokens(seq)
-            if not toks:
-                continue
-                
-            token_indices = self.token_to_indices(toks)
-            total_token_count += len(toks)
-            
-            # Store samples with position information
-            for pos in range(len(toks)):
-                all_samples.append((pos, seq_idx, token_indices[pos].item()))
-        
-        total_samples = len(all_samples)
-        if total_samples == 0:
-            print("Warning: No training samples found")
-            return []
-        
         # Convert target vectors to tensor
         t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
         
-        # Set up optimizer
+        # Set up optimizer and scheduler
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
@@ -278,53 +259,71 @@ class DualDescriptorRN(nn.Module):
         prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
         
         for it in range(start_iter, max_iters):
-            epoch_loss = 0.0
-            processed_samples = 0
+            total_loss = 0.0
+            total_sequences = 0
             
-            # Shuffle samples
-            random.shuffle(all_samples)
+            # Shuffle sequences for each epoch to ensure diverse batches
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
             
-            # Process in batches with fixed batch size (like HierDDLrnC)
-            for batch_start in range(0, total_samples, batch_size):
-                batch_end = min(batch_start + batch_size, total_samples)
-                batch_samples = all_samples[batch_start:batch_end]
+            # Process sequences in batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
+                batch_targets = [t_tensors[idx] for idx in batch_indices]
                 
                 optimizer.zero_grad()
+                batch_loss = 0.0
+                batch_sequence_count = 0
                 
-                # Prepare batch data directly as tensors
-                k_list = []
-                token_idx_list = []
-                target_list = []
+                # Process each sequence in the current batch
+                for seq, target in zip(batch_seqs, batch_targets):
+                    # Extract tokens for current sequence
+                    tokens = self.extract_tokens(seq)
+                    if not tokens:
+                        continue  # Skip empty sequences
+                        
+                    # Convert tokens to indices
+                    token_indices = self.token_to_indices(tokens)
+                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    
+                    # Batch compute all Nk vectors for current sequence
+                    Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                    
+                    # Compute sequence-level prediction: average of all N(k) vectors
+                    seq_pred = torch.mean(Nk_batch, dim=0)
+                    
+                    # Calculate loss for this sequence (MSE between prediction and target)
+                    seq_loss = torch.sum((seq_pred - target) ** 2)
+                    batch_loss += seq_loss
+                    batch_sequence_count += 1
+                    
+                    # Clean up intermediate tensors to free GPU memory
+                    del Nk_batch, seq_pred, token_indices, k_positions
+                    
+                    # Periodically clear GPU cache to prevent memory fragmentation
+                    if batch_sequence_count % 10 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
-                for pos, seq_idx, token_idx in batch_samples:
-                    k_list.append(pos)
-                    token_idx_list.append(token_idx)
-                    target_list.append(t_tensors[seq_idx])
+                # Backpropagate batch loss if we have valid sequences
+                if batch_sequence_count > 0:
+                    batch_loss = batch_loss / batch_sequence_count
+                    batch_loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += batch_loss.item() * batch_sequence_count
+                    total_sequences += batch_sequence_count
                 
-                # Create tensors directly on GPU
-                k_tensor = torch.tensor(k_list, dtype=torch.float32, device=self.device)
-                token_indices_tensor = torch.tensor(token_idx_list, device=self.device)
-                targets = torch.stack(target_list)
-                
-                # Compute Nk in batch
-                Nk_batch = self.batch_compute_Nk(k_tensor, token_indices_tensor)
-                
-                # Compute loss
-                loss = torch.mean(torch.sum((Nk_batch - targets) ** 2, dim=1))
-                loss.backward()
-                optimizer.step()
-                
-                batch_loss = loss.item() * len(batch_samples)
-                epoch_loss += batch_loss
-                processed_samples += len(batch_samples)
-                
-                # Clean up to free memory (like HierDDLrnC)
-                del k_tensor, token_indices_tensor, targets, Nk_batch, loss
+                # Clear GPU cache after processing each batch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Average loss over epoch
-            avg_loss = epoch_loss / processed_samples if processed_samples > 0 else 0.0
+            # Calculate average loss for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+            else:
+                avg_loss = 0.0
+                
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -332,8 +331,10 @@ class DualDescriptorRN(nn.Module):
                 best_loss = avg_loss
                 best_model_state = copy.deepcopy(self.state_dict())
             
+            # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
-                print(f"GD Iter {it:3d}: D = {avg_loss:.6e}, LR = {scheduler.get_last_lr()[0]:.6f}")
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"GD Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -352,9 +353,10 @@ class DualDescriptorRN(nn.Module):
                 break
             prev_loss = avg_loss
             
+            # Update learning rate
             scheduler.step()
             
-            # Clean GPU memory at the end of each iteration
+            # Final GPU memory cleanup for this iteration
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -364,7 +366,7 @@ class DualDescriptorRN(nn.Module):
             print(f"Training ended. Restored best model state with loss = {best_loss:.6e}")
             history[-1] = best_loss
         
-        # Calculate statistics for reconstruction/generation
+        # Compute and store statistics for reconstruction/generation
         self._compute_training_statistics(seqs)
         self.trained = True
         
@@ -375,8 +377,9 @@ class DualDescriptorRN(nn.Module):
                print_every=10, batch_size=1024, checkpoint_file=None, 
                checkpoint_interval=10):
         """
-        Train the model using self-supervised learning with memory optimization
-        and checkpoint mechanism. Supports both 'gap' and 'reg' training modes.
+        Train the model using self-supervised learning with memory-optimized batch processing.
+        Memory-optimized version that processes sequences and samples in batches to avoid 
+        large precomputation and storage of all training samples.
         
         Args:
             seqs: List of character sequences
@@ -387,13 +390,14 @@ class DualDescriptorRN(nn.Module):
             continued: Whether to continue from existing parameters
             decay_rate: Learning rate decay rate
             print_every: Print interval
-            batch_size: Batch size for training
+            batch_size: Batch size for training samples
             checkpoint_file: Path to save/load checkpoint file for resuming training
             checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
         """
+        
         if auto_mode not in ('gap', 'reg'):
             raise ValueError("auto_mode must be either 'gap' or 'reg'")
 
@@ -416,29 +420,7 @@ class DualDescriptorRN(nn.Module):
                 self.reset_parameters()
             history = []
         
-        # Precompute all training samples (mimicking HierDDLrnC approach)
-        all_samples = []
-        
-        for seq_idx, seq in enumerate(seqs):
-            tokens = self.extract_tokens(seq)
-            if not tokens:
-                continue
-                
-            token_indices = self.token_to_indices(tokens)
-            
-            if auto_mode == 'gap':
-                # Each token is a sample (position k, token_idx)
-                for k, token_idx in enumerate(token_indices):
-                    all_samples.append((k, token_idx.item()))
-            else:  # 'reg' mode
-                # Each token except last is a sample (position k, current token, next token)
-                for k in range(len(tokens) - 1):
-                    all_samples.append((k, token_indices[k].item(), token_indices[k+1].item()))
-        
-        if not all_samples:
-            raise ValueError("No training samples found")
-            
-        # Set up optimizer
+        # Set up optimizer and scheduler
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
@@ -448,70 +430,103 @@ class DualDescriptorRN(nn.Module):
             scheduler.load_state_dict(scheduler_state)
         
         prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
-        total_samples = len(all_samples)
         
         for it in range(start_iter, max_iters):
-            epoch_loss = 0.0
-            processed_samples = 0
+            total_loss = 0.0
+            total_samples = 0
             
-            # Shuffle samples
-            random.shuffle(all_samples)
+            # Shuffle sequences for each epoch to ensure diverse samples
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
             
-            # Process in batches with fixed batch size (like HierDDLrnC)
-            for batch_start in range(0, total_samples, batch_size):
-                batch_end = min(batch_start + batch_size, total_samples)
-                batch_samples = all_samples[batch_start:batch_end]
+            # Process sequences in shuffled order
+            for seq_idx in indices:
+                seq = seqs[seq_idx]
+                tokens = self.extract_tokens(seq)
+                if not tokens:
+                    continue
+                    
+                token_indices = self.token_to_indices(tokens)
+                seq_samples = []
                 
-                optimizer.zero_grad()
-                
-                # Prepare batch data directly as tensors
-                k_list = []
-                current_indices_list = []
-                target_indices_list = [] if auto_mode == 'reg' else None
-                
-                for sample in batch_samples:
-                    if auto_mode == 'reg':
-                        k, current_idx, next_idx = sample
-                        k_list.append(k)
-                        current_indices_list.append(current_idx)
-                        target_indices_list.append(next_idx)
-                    else:  # 'gap' mode
-                        k, token_idx = sample
-                        k_list.append(k)
-                        current_indices_list.append(token_idx)
-                
-                # Create tensors directly on GPU
-                k_tensor = torch.tensor(k_list, dtype=torch.float32, device=self.device)
-                current_indices_tensor = torch.tensor(current_indices_list, device=self.device)
-                
-                # Compute Nk for current tokens
-                Nk_batch = self.batch_compute_Nk(k_tensor, current_indices_tensor)
-                
-                # Get target embeddings
+                # Generate samples for current sequence
                 if auto_mode == 'gap':
-                    targets = self.embedding(current_indices_tensor)
+                    # Each token is a sample (position k, token_idx)
+                    for k, token_idx in enumerate(token_indices):
+                        seq_samples.append((k, token_idx.item()))
                 else:  # 'reg' mode
-                    target_indices_tensor = torch.tensor(target_indices_list, device=self.device)
-                    targets = self.embedding(target_indices_tensor)
+                    # Each token except last is a sample (position k, current token, next token)
+                    for k in range(len(tokens) - 1):
+                        seq_samples.append((k, token_indices[k].item(), token_indices[k+1].item()))
                 
-                # Compute loss
-                loss = torch.mean(torch.sum((Nk_batch - targets) ** 2, dim=1))
-                loss.backward()
-                optimizer.step()
+                if not seq_samples:
+                    continue
                 
-                batch_loss = loss.item() * len(batch_samples)
-                epoch_loss += batch_loss
-                processed_samples += len(batch_samples)
+                # Process samples from current sequence in batches
+                for batch_start in range(0, len(seq_samples), batch_size):
+                    batch_samples = seq_samples[batch_start:batch_start + batch_size]
+                    
+                    optimizer.zero_grad()
+                    
+                    # Prepare batch data directly as tensors
+                    k_list = []
+                    current_indices_list = []
+                    target_indices_list = [] if auto_mode == 'reg' else None
+                    
+                    for sample in batch_samples:
+                        if auto_mode == 'reg':
+                            k, current_idx, next_idx = sample
+                            k_list.append(k)
+                            current_indices_list.append(current_idx)
+                            target_indices_list.append(next_idx)
+                        else:  # 'gap' mode
+                            k, token_idx = sample
+                            k_list.append(k)
+                            current_indices_list.append(token_idx)
+                    
+                    # Create tensors directly on GPU
+                    k_tensor = torch.tensor(k_list, dtype=torch.float32, device=self.device)
+                    current_indices_tensor = torch.tensor(current_indices_list, device=self.device)
+                    
+                    # Batch compute Nk for current tokens
+                    Nk_batch = self.batch_compute_Nk(k_tensor, current_indices_tensor)
+                    
+                    # Get target embeddings
+                    if auto_mode == 'gap':
+                        targets = self.embedding(current_indices_tensor)
+                    else:  # 'reg' mode
+                        target_indices_tensor = torch.tensor(target_indices_list, device=self.device)
+                        targets = self.embedding(target_indices_tensor)
+                    
+                    # Compute loss
+                    loss = torch.mean(torch.sum((Nk_batch - targets) ** 2, dim=1))
+                    loss.backward()
+                    optimizer.step()
+                    
+                    batch_loss = loss.item() * len(batch_samples)
+                    total_loss += batch_loss
+                    total_samples += len(batch_samples)
+                    
+                    # Clean up to free memory
+                    del k_tensor, current_indices_tensor, Nk_batch, targets, loss
+                    if auto_mode == 'reg':
+                        del target_indices_tensor
+                    
+                    # Periodically clear GPU cache to prevent memory fragmentation
+                    if total_samples % 1000 == 0 and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 
-                # Clean up to free memory (like HierDDLrnC)
-                del k_tensor, current_indices_tensor, Nk_batch, targets, loss
-                if auto_mode == 'reg':
-                    del target_indices_tensor
+                # Clear sequence-specific tensors
+                del token_indices, seq_samples
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             
-            # Average loss over epoch
-            avg_loss = epoch_loss / processed_samples if processed_samples > 0 else 0.0
+            # Calculate average loss for this iteration
+            if total_samples > 0:
+                avg_loss = total_loss / total_samples
+            else:
+                avg_loss = 0.0
+                
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -519,10 +534,12 @@ class DualDescriptorRN(nn.Module):
                 best_loss = avg_loss
                 best_model_state = copy.deepcopy(self.state_dict())
             
+            # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
                 mode_display = "Gap" if auto_mode == 'gap' else "Reg"
                 current_lr = scheduler.get_last_lr()[0]
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}, "
+                      f"Samples = {total_samples}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -541,9 +558,10 @@ class DualDescriptorRN(nn.Module):
                 break
             prev_loss = avg_loss
             
+            # Update learning rate
             scheduler.step()
             
-            # Clean GPU memory at the end of each iteration
+            # Final GPU memory cleanup for this iteration
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -636,24 +654,16 @@ class DualDescriptorRN(nn.Module):
         
         self.mean_token_count = total_token_count / len(seqs) if seqs else 0
         self.mean_t = (total_t / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.m)
-
+    
     def predict_t(self, seq):
-        """
-        Predict target vector for a sequence
-        Returns the average of all N(k) vectors in the sequence
-        """
+        """Predict target vector as average of N(k) vectors"""
         toks = self.extract_tokens(seq)
         if not toks:
-            return [0.0] * self.m
-            
-        token_indices = self.token_to_indices(toks)
-        k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
+            return np.zeros(self.m)
         
-        # Batch compute all Nk vectors
-        Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
-        Nk_sum = torch.sum(Nk_batch, dim=0)
-        
-        return (Nk_sum / len(toks)).detach().cpu().numpy()
+        # Compute all Nk vectors
+        Nk = self.describe(seq)
+        return np.mean(Nk, axis=0)
     
     def reconstruct(self):
         """Reconstruct representative sequence by minimizing error"""
@@ -803,7 +813,7 @@ if __name__ == "__main__":
     # Predict target vector for first sequence
     aseq = seqs[0]
     t_pred = dd.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x, 4) for x in t_pred]}")    
+    print(f"\nPredicted t for first sequence: {[round(x.item(), 4) for x in t_pred]}")    
     
     # Calculate flattened correlation between predicted and actual targets
     pred_t_list = [dd.predict_t(seq) for seq in seqs]
