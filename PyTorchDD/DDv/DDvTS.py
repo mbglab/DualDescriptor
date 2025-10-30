@@ -667,6 +667,343 @@ class DualDescriptorTS(nn.Module):
         print(f"Model loaded from {filename}")
         return self
 
+    def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
+        """
+        Train the I tensor on vector sequences using gradient descent with PyTorch optimization.
+        Supports two modes:
+          - 'gap': Predicts current vector (self-consistency)
+          - 'reg': Predicts next vector (auto-regressive)
+        
+        Parameters:
+            vec_seqs (list): List of vector sequences (each sequence is list of m-dim vectors)
+            learning_rate (float): Step size for gradient updates
+            max_iters (int): Maximum training iterations
+            tol (float): Convergence tolerance
+            auto_mode (str): Training mode - 'gap' or 'reg'
+            continued (bool): Continue training existing I tensor
+            decay_rate (float): Learning rate decay factor (1.0 = no decay)
+            
+        Returns:
+            list: Training history (loss values per iteration)
+        """
+        if auto_mode not in ('gap', 'reg'):
+            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+
+        # Initialize I tensor if needed
+        if not continued or not hasattr(self, 'I'):            
+            self.I = nn.Parameter(torch.empty(self.m, self.m, self.o, device=self.device))
+            nn.init.uniform_(self.I, -0.1, 0.1)
+        
+        # Calculate total training samples
+        total_samples = 0
+        for seq in vec_seqs:
+            if auto_mode == 'gap':
+                total_samples += len(seq)  # All vectors are samples
+            else:  # 'reg' mode
+                total_samples += max(0, len(seq) - 1)  # Vectors except last
+                
+        if total_samples == 0:
+            raise ValueError("No training samples found")
+            
+        # Setup optimizer for I tensor only
+        optimizer = optim.Adam([self.I], lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        history = []  # Store loss per iteration
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_I_state = None
+        
+        for it in range(max_iters):
+            optimizer.zero_grad()
+            total_loss = 0.0
+            
+            # Process all vector sequences
+            for seq in vec_seqs:
+                if not seq:
+                    continue
+                    
+                # Convert sequence to tensor
+                seq_tensor = torch.tensor(np.array(seq), dtype=torch.float32, device=self.device)
+                
+                # Process vectors based on mode
+                for k in range(len(seq)):
+                    # Skip last vector in 'reg' mode (no next vector)
+                    if auto_mode == 'reg' and k == len(seq) - 1:
+                        continue
+                        
+                    current_vec = seq_tensor[k]
+                    
+                    # Compute N(k) for current vector at position k using I tensor
+                    k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
+                    k_expanded = k_tensor.view(-1, 1, 1, 1)
+                    
+                    # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
+                    phi = torch.cos(2 * math.pi * k_expanded / self.periods)
+                    
+                    # Compute Nk using I tensor: Nk[i] = Σ_j Σ_g I[i][j][g] * current_vec[j] * phi[i,j,g]
+                    Nk = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
+                    
+                    # Determine target based on mode
+                    if auto_mode == 'gap':
+                        target = current_vec  # Self-consistency
+                    else:  # 'reg' mode
+                        target = seq_tensor[k + 1]  # Next vector prediction
+                    
+                    # Compute loss
+                    loss = torch.sum((Nk - target) ** 2)
+                    total_loss += loss
+            
+            # Average loss and backpropagate
+            avg_loss = total_loss / total_samples
+            avg_loss.backward()
+            optimizer.step()
+            
+            history.append(avg_loss.item())
+            
+            # Update best I state
+            if avg_loss.item() < best_loss:
+                best_loss = avg_loss.item()
+                best_I_state = self.I.detach().clone()
+            
+            # Print training progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
+                print(f"PartTrain({mode_display}) Iter {it:3d}: loss = {avg_loss.item():.6f}, LR = {current_lr:.6f}")
+            
+            # Check convergence
+            if abs(prev_loss - avg_loss.item()) < tol:
+                print(f"Converged after {it+1} iterations")
+                # Restore best I state
+                if best_I_state is not None:
+                    self.I.data = best_I_state
+                break
+            prev_loss = avg_loss.item()
+            
+            # Learning rate scheduling
+            scheduler.step()
+        
+        # Compute and store mean vector for generation
+        total_vectors = 0
+        total_vec_sum = torch.zeros(self.m, device=self.device)
+        for seq in vec_seqs:
+            seq_tensor = torch.tensor(np.array(seq), dtype=torch.float32, device=self.device)
+            total_vectors += len(seq)
+            total_vec_sum += seq_tensor.sum(dim=0)
+        
+        self.mean_vector = (total_vec_sum / total_vectors).cpu().numpy()
+        
+        return history
+
+    def part_generate(self, L, tau=0.0, mode='reg'):
+        """
+        Generate a sequence of vectors using the trained I tensor with PyTorch optimization
+        
+        Parameters:
+            L (int): Length of sequence to generate
+            tau (float): Temperature for randomness (0 = deterministic)
+            mode (str): Generation mode - 'gap' or 'reg' (must match training)
+                
+        Returns:
+            list: Generated sequence of m-dimensional vectors
+        """
+        if not hasattr(self, 'I'):
+            raise RuntimeError("I tensor not initialized - train first")
+            
+        if tau < 0:
+            raise ValueError("Temperature must be non-negative")
+            
+        mean_vector_tensor = torch.tensor(self.mean_vector, dtype=torch.float32, device=self.device)
+        sequence = []
+        
+        if mode == 'gap':
+            # Gap mode: Generate independent reconstructions at each position
+            for k in range(L):
+                # Start with mean vector
+                current_vec = mean_vector_tensor
+                
+                # Compute reconstruction at position k
+                k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
+                k_expanded = k_tensor.view(-1, 1, 1, 1)
+                
+                # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
+                phi = torch.cos(2 * math.pi * k_expanded / self.periods)
+                
+                # Compute reconstructed vector using I tensor
+                reconstructed_vec = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
+                
+                # Add temperature-controlled noise
+                if tau > 0:
+                    noise = torch.normal(0, tau, size=(self.m,), device=self.device)
+                    reconstructed_vec = reconstructed_vec + noise
+                    
+                sequence.append(reconstructed_vec.detach().cpu().numpy())
+            return sequence
+            
+        else:  # 'reg' mode
+            # Reg mode: Auto-regressive generation
+            current_vec = mean_vector_tensor  # Start with mean vector
+            
+            for k in range(L):
+                # Compute prediction for next vector
+                k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
+                k_expanded = k_tensor.view(-1, 1, 1, 1)
+                
+                # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
+                phi = torch.cos(2 * math.pi * k_expanded / self.periods)
+                
+                # Compute next vector prediction using I tensor
+                next_vec_pred = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
+                
+                # Add temperature-controlled noise
+                if tau > 0:
+                    noise = torch.normal(0, tau, size=(self.m,), device=self.device)
+                    next_vec = next_vec_pred + noise
+                else:
+                    next_vec = next_vec_pred
+                    
+                sequence.append(next_vec.detach().cpu().numpy())
+                current_vec = next_vec  # Use prediction as next input
+                
+            return sequence
+
+    def double_train(self, seqs, auto_mode='reg', part_mode='reg', 
+                    auto_params=None, part_params=None):
+        """
+        Two-stage training method with PyTorch optimization: 
+          1. First train on character sequences using auto_train (unsupervised)
+          2. Then convert sequences to vector sequences using S(l) and train I tensor
+        
+        Parameters:
+            seqs (list): Input character sequences
+            auto_mode (str): Training mode for auto_train - 'gap' or 'reg'
+            part_mode (str): Training mode for part_train - 'gap' or 'reg'
+            auto_params (dict): Parameters for auto_train (max_iters, tol, learning_rate)
+            part_params (dict): Parameters for part_train (max_iters, tol, learning_rate)
+            
+        Returns:
+            tuple: (auto_history, part_history) training histories
+        """
+        # Set default parameters if not provided
+        auto_params = auto_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
+        part_params = part_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
+        
+        # Stage 1: Train character model with auto_train
+        print("="*50)
+        print("Stage 1: Auto-training on character sequences")
+        print("="*50)
+        auto_history = self.auto_train(
+            seqs, 
+            auto_mode=auto_mode,
+            max_iters=auto_params['max_iters'],
+            tol=auto_params['tol'],
+            learning_rate=auto_params['learning_rate']
+        )
+        
+        # Convert sequences to vector sequences using S(l)
+        print("\n" + "="*50)
+        print("Converting sequences to vector representations")
+        print("="*50)
+        vec_seqs = []
+        for i, seq in enumerate(seqs):
+            # Get cumulative S(l) vectors for the sequence
+            s_vectors = self.S(seq)
+            vec_seqs.append(s_vectors)
+            if i < 3:  # Show sample conversion for first 3 sequences
+                print(f"Sequence {i+1} (len={len(seq)}) -> {len(s_vectors)} vectors")
+                print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
+                print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
+        
+        # Stage 2: Train I tensor on vector sequences
+        print("\n" + "="*50)
+        print("Stage 2: Training I tensor on vector sequences")
+        print("="*50)
+        part_history = self.part_train(
+            vec_seqs,
+            max_iters=part_params['max_iters'],
+            tol=part_params['tol'],
+            learning_rate=part_params['learning_rate'],
+            auto_mode=part_mode
+        )
+        
+        return auto_history, part_history
+
+    def double_generate(self, L, tau=0.0, mode='reg'):
+        """
+        Generate character sequences using a two-stage approach with PyTorch optimization:
+          1. Character-level model (auto-trained) for token probabilities
+          2. Vector-sequence model (part-trained) for structural coherence
+        
+        Parameters:
+            L (int): Length of sequence to generate
+            tau (float): Temperature for stochastic sampling (0=deterministic)
+            mode (str): Generation mode for vector refinement - 'gap' or 'reg' (default: 'reg')
+        
+        Returns:
+            str: Generated character sequence
+        """
+        # Stage 1: Generate initial sequence with character model
+        init_seq = self.generate(L, tau=tau)
+        
+        # Stage 2: Compute S(l) vectors for initial sequence
+        s_vectors = self.S(init_seq)
+        
+        # Stage 3: Refine vectors using I-tensor with specified mode
+        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
+        
+        # Stage 4: Reconstruct character sequence using both models
+        generated_tokens = []
+        current_s = torch.zeros(self.m, device=self.device)  # Initialize cumulative vector
+        
+        for k in range(L):
+            # Get target vector for current position
+            if k < len(refined_vectors):
+                target_vec = torch.tensor(refined_vectors[k], dtype=torch.float32, device=self.device)
+            else:
+                # If beyond refined vectors, use character model prediction
+                target_vec = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
+            
+            # Calculate required N(k) vector: ΔS = S(k) - S(k-1)
+            required_nk = target_vec - current_s
+            
+            # Find best matching token
+            best_token = None
+            min_error = float('inf')
+            token_scores = []
+            
+            # Precompute all token embeddings
+            all_token_indices = torch.arange(len(self.tokens), device=self.device)
+            
+            # Compute Nk for all tokens at position k
+            k_tensor = torch.tensor([k] * len(self.tokens), dtype=torch.float32, device=self.device)
+            Nk_all = self.batch_compute_Nk(k_tensor, all_token_indices)
+            
+            # Calculate errors for all tokens
+            errors = torch.sum((Nk_all - required_nk) ** 2, dim=1)
+            
+            # Get scores and find best token
+            scores = -errors  # Convert to score (higher = better)
+            
+            if tau == 0:  # Deterministic selection
+                max_idx = torch.argmax(scores).item()
+                chosen_token = self.idx_to_token[max_idx]
+            else:  # Stochastic selection
+                probs = torch.softmax(scores / tau, dim=0).detach().cpu().numpy()
+                chosen_idx = random.choices(range(len(self.tokens)), weights=probs, k=1)[0]
+                chosen_token = self.idx_to_token[chosen_idx]
+            
+            # Update sequence and cumulative vector
+            generated_tokens.append(chosen_token)
+            
+            # Compute actual N(k) for chosen token
+            token_idx = self.token_to_idx[chosen_token]
+            actual_nk = self.compute_Nk(k, token_idx)
+            current_s = current_s + actual_nk
+        
+        return ''.join(generated_tokens)
+
 # === Example Usage ===
 if __name__=="__main__":
 
@@ -774,7 +1111,7 @@ if __name__=="__main__":
         auto_seqs, 
         max_iters=50, 
         tol=1e-8, 
-        learning_rate=0.5, 
+        learning_rate=0.01, 
         auto_mode='gap',
         batch_size=1024
     )
@@ -785,4 +1122,102 @@ if __name__=="__main__":
         gen_seq = dd_gap.generate(100, tau=0.2)
         print(f"Sequence {i+1}: {gen_seq[:50]}...") 
     
+    # === Part Train/Generate Example ===
+    print("\n" + "="*50)
+    print("Part Train/Generate Example")
+    print("="*50)
+    
+    # Create new model
+    dd_part = DualDescriptorTS(charset="", rank=3, vec_dim=2, num_basis=5)
+    
+    # Generate sample vector sequences (2D vectors)
+    vec_seqs = []
+    for _ in range(5):  # 5 sequences
+        seq_len = random.randint(100, 150)
+        seq = []
+        for _ in range(seq_len):
+            # Generate random 2D vector
+            vec = [random.uniform(-1, 1), random.uniform(-1, 1)]
+            seq.append(vec)
+        vec_seqs.append(seq)
+    
+    # Train in self-consistency (gap) mode
+    print("\nTraining in 'gap' mode (self-consistency):")
+    gap_history = dd_part.part_train(vec_seqs, max_iters=100, 
+                                     learning_rate=0.1, auto_mode='gap')
+    
+    # Generate new vector sequence
+    print("\nGenerated vector sequence (gap mode):")
+    gen_seq = dd_part.part_generate(10, mode='gap', tau=0.0)
+    for i, vec in enumerate(gen_seq):
+        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
+    
+    # Train in auto-regressive (reg) mode
+    print("\nTraining in 'reg' mode (next-vector prediction):")
+    reg_history = dd_part.part_train(vec_seqs, max_iters=100, 
+                                     learning_rate=0.1, auto_mode='reg')
+    
+    # Generate new vector sequence with randomness
+    print("\nGenerated vector sequence with temperature (reg mode):")
+    gen_seq = dd_part.part_generate(10, mode='reg', tau=0.1)
+    for i, vec in enumerate(gen_seq):
+        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
+    
+    # === Double Generation Example ===
+    print("\n" + "="*50)
+    print("Double Generation Example")
+    print("="*50)
+
+    # Create and train model using double_train
+    dd_double = DualDescriptorTS(
+        charset=['A','C','G','T'], 
+        rank=3, 
+        vec_dim=2, 
+        num_basis=5,
+        mode='nonlinear',
+        user_step=2
+    )
+
+    # Generate sample DNA sequences
+    dna_seqs = []
+    for _ in range(10):  # 5 sequences
+        seq_len = random.randint(100, 200)
+        dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
+
+    # Configure training parameters
+    auto_config = {
+        'max_iters': 50,
+        'tol': 1e-6,
+        'learning_rate': 0.1
+    }
+    
+    part_config = {
+        'max_iters': 50,
+        'tol': 1e-6,
+        'learning_rate': 0.01
+    }
+
+    # Train with double_train (as in previous example)
+    auto_hist, part_hist = dd_double.double_train(
+        dna_seqs,  # Sample DNA sequences
+        auto_mode='reg',
+        part_mode='reg',
+        auto_params=auto_config,
+        part_params=part_config
+    )
+
+    # Generate sequences using different methods for comparison
+    print("\n1. Character-only generation:")
+    char_seq = dd_double.generate(100, tau=0.3)
+    print(char_seq)
+
+    print("\n2. Vector-only generation:")
+    vec_seq = dd_double.part_generate(10, mode='reg', tau=0.1)
+    for i, vec in enumerate(vec_seq):
+        print(f"Position {i}: [{vec[0]:.4f}, {vec[1]:.4f}]")
+
+    print("\n3. Double-generation (combined models):")
+    double_seq = dd_double.double_generate(100, tau=0.2)
+    print(double_seq)
+
     print("\nAll tests completed successfully!")
