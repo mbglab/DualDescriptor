@@ -62,6 +62,14 @@ class DualDescriptorTS(nn.Module):
                     periods[i, j, g] = i*(self.m*self.o) + j*self.o + g + 2
         self.register_buffer('periods', periods)
 
+        # Classification head (initialized later when num_classes is known)
+        self.num_classes = None
+        self.classifier = None        
+
+        # Label head (initialized later when num_classes is known)
+        self.num_labels = None  # Number of labels for multi-label classification
+        self.labeller = None
+
         # Initialize parameters
         self.reset_parameters()
         self.to(self.device)
@@ -70,6 +78,13 @@ class DualDescriptorTS(nn.Module):
         """Initialize model parameters"""
         nn.init.uniform_(self.embedding.weight, -0.5, 0.5)
         nn.init.uniform_(self.P, -0.1, 0.1)
+        if self.classifier is not None:
+            nn.init.normal_(self.classifier.weight, 0, 0.01)
+            if self.classifier.bias is not None:
+                nn.init.constant_(self.classifier.bias, 0)
+        if self.num_labels is not None:
+            nn.init.xavier_uniform_(self.labeller.weight)
+            nn.init.zeros_(self.labeller.bias)
         
     def token_to_indices(self, token_list):
         """Convert list of tokens to tensor of indices"""
@@ -211,7 +226,7 @@ class DualDescriptorTS(nn.Module):
                 
         return total_loss / total_positions if total_positions else 0.0
 
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                continued=False, decay_rate=1.0, print_every=10, batch_size=32,
                checkpoint_file=None, checkpoint_interval=10):
         """
@@ -345,20 +360,21 @@ class DualDescriptorTS(nn.Module):
         
         return history
 
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
-                   batch_size=32, checkpoint_file=None, checkpoint_interval=5):
+    def cls_train(self, seqs, labels, num_classes, max_iters=1000, tol=1e-8, learning_rate=0.01,
+                  continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+                  checkpoint_file=None, checkpoint_interval=10):
         """
-        Self-training method with memory-efficient sequence processing.
-        Supports both gap (self-consistency) and reg (next-token prediction) modes.
+        Train the model for multi-class classification using cross-entropy loss.
+        Optimized for GPU memory efficiency by processing sequences individually.
         
         Args:
             seqs: List of character sequences for training
+            labels: List of integer class labels (0 to num_classes-1)
+            num_classes: Number of classes in the classification problem
             max_iters: Maximum number of training iterations
             tol: Convergence tolerance
             learning_rate: Initial learning rate for optimizer
             continued: Whether to continue training from existing parameters
-            auto_mode: Training mode - 'gap' for self-consistency, 'reg' for next-token prediction
             decay_rate: Learning rate decay rate
             print_every: Print progress every N iterations
             batch_size: Number of sequences to process in each batch
@@ -369,8 +385,353 @@ class DualDescriptorTS(nn.Module):
             list: Training loss history
         """
         
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        # Initialize classification head if not already done
+        if self.classifier is None or self.num_classes != num_classes:            
+            self.classifier = nn.Linear(self.m, num_classes).to(self.device)
+            self.num_classes = num_classes
+        
+        if not continued:
+            self.reset_parameters()
+        
+        # Convert labels to tensor
+        label_tensors = torch.tensor(labels, dtype=torch.long, device=self.device)
+        
+        # Setup optimizer and scheduler
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        # Cross-entropy loss
+        criterion = nn.CrossEntropyLoss()
+        
+        # Training state variables
+        history = []
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
+        
+        for it in range(max_iters):
+            total_loss = 0.0
+            total_sequences = 0
+            correct_predictions = 0
+            
+            # Shuffle sequences for each epoch
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+            
+            # Process sequences in batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
+                batch_labels = label_tensors[batch_indices]
+                
+                optimizer.zero_grad()
+                batch_loss = 0.0
+                batch_logits = []
+                
+                # Process each sequence in the batch
+                for seq in batch_seqs:
+                    # Extract tokens and convert to indices
+                    tokens = self.extract_tokens(seq)
+                    if not tokens:
+                        # For empty sequences, use zero vector
+                        seq_vector = torch.zeros(self.m, device=self.device)
+                    else:
+                        token_indices = self.token_to_indices(tokens)
+                        k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                        
+                        # Compute N(k) vectors for all positions in the sequence
+                        Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                        
+                        # Compute sequence-level vector: average of all N(k) vectors
+                        seq_vector = torch.mean(Nk_batch, dim=0)
+                        
+                        # Clean up intermediate tensors to free memory
+                        del Nk_batch, token_indices, k_positions
+                    
+                    # Get logits through classification head
+                    logits = self.classifier(seq_vector.unsqueeze(0))
+                    batch_logits.append(logits)
+                
+                # Stack all logits and compute loss
+                if batch_logits:
+                    all_logits = torch.cat(batch_logits, dim=0)
+                    loss = criterion(all_logits, batch_labels)
+                    loss.backward()
+                    optimizer.step()
+                    
+                    # Calculate batch statistics
+                    batch_loss = loss.item()
+                    total_loss += batch_loss * len(batch_seqs)
+                    total_sequences += len(batch_seqs)
+                    
+                    # Calculate accuracy
+                    with torch.no_grad():
+                        predictions = torch.argmax(all_logits, dim=1)
+                        correct_predictions += (predictions == batch_labels).sum().item()
+                
+                # Clear GPU cache periodically
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Calculate average loss and accuracy for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+                accuracy = correct_predictions / total_sequences
+            else:
+                avg_loss = 0.0
+                accuracy = 0.0
+                
+            history.append(avg_loss)
+            
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"CLS Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {accuracy:.4f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                checkpoint = {
+                    'iteration': it,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'history': history,
+                    'best_loss': best_loss,
+                    'num_classes': self.num_classes
+                }
+                torch.save(checkpoint, checkpoint_file)
+                print(f"Checkpoint saved at iteration {it}")
+            
+            # Check convergence
+            if abs(prev_loss - avg_loss) < tol:
+                print(f"Converged after {it+1} iterations.")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                break
+                
+            prev_loss = avg_loss
+            
+            # Learning rate scheduling
+            scheduler.step()
+        
+        self.trained = True
+        
+        return history
+
+    def lbl_train(self, seqs, labels, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+                 continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+                 checkpoint_file=None, checkpoint_interval=10, pos_weight=None):
+        """
+        Train the model for multi-label classification using binary cross-entropy loss.
+        
+        Args:
+            seqs: List of character sequences for training
+            labels: List of binary label vectors (list of lists) or 2D numpy array/torch tensor
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            pos_weight: Weight for positive class (torch.Tensor of shape [num_labels])
+            
+        Returns:
+            list: Training loss history
+            list: Training accuracy history
+        """
+        #assert self.num_labels is not None, "Model must be initialized with num_labels for multi-label classification"
+
+        # Initialize label head if not already done
+        if self.labeller is None or self.num_labels != num_labels:
+            self.labeller = nn.Linear(self.m, num_labels).to(self.device)
+            self.num_labels = num_labels
+        
+        if not continued:
+            self.reset_parameters()
+        
+        # Convert labels to tensor
+        if isinstance(labels, list):
+            labels_tensor = torch.tensor(labels, dtype=torch.float32, device=self.device)
+        else:
+            labels_tensor = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
+        
+        # Setup loss function with optional positive class weighting
+        if pos_weight is not None:
+            pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=self.device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+        
+        # Setup optimizer and scheduler
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        # Training state variables
+        loss_history = []
+        acc_history = []
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
+        
+        for it in range(max_iters):
+            total_loss = 0.0
+            total_correct = 0
+            total_predictions = 0
+            total_sequences = 0
+            
+            # Shuffle sequences for each epoch
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+            
+            # Process sequences in batches
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
+                batch_labels = labels_tensor[batch_indices]
+                
+                optimizer.zero_grad()
+                batch_loss = 0.0
+                batch_correct = 0
+                batch_predictions = 0
+                
+                # Process each sequence in the batch
+                batch_predictions_list = []
+                for seq in batch_seqs:
+                    # Extract tokens and convert to indices
+                    tokens = self.extract_tokens(seq)
+                    if not tokens:
+                        # If no tokens, skip this sequence (should not happen for valid sequences)
+                        continue
+                        
+                    token_indices = self.token_to_indices(tokens)
+                    k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
+                    
+                    # Compute N(k) vectors for all positions in the sequence
+                    Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+                    
+                    # Compute sequence representation: average of all N(k) vectors
+                    seq_representation = torch.mean(Nk_batch, dim=0)
+                    
+                    # Pass through classification head to get logits
+                    logits = self.labeller(seq_representation)
+                    batch_predictions_list.append(logits)
+                    
+                    # Clean up intermediate tensors to free memory
+                    del Nk_batch, seq_representation, token_indices, k_positions
+                
+                # Stack predictions for the batch
+                if batch_predictions_list:
+                    batch_logits = torch.stack(batch_predictions_list, dim=0)
+                    
+                    # Calculate loss for the batch
+                    batch_loss = criterion(batch_logits, batch_labels)
+                    
+                    # Calculate accuracy
+                    with torch.no_grad():
+                        # Apply sigmoid to get probabilities
+                        probs = torch.sigmoid(batch_logits)
+                        # Threshold at 0.5 for binary predictions
+                        predictions = (probs > 0.5).float()
+                        # Calculate number of correct predictions
+                        batch_correct = (predictions == batch_labels).sum().item()
+                        batch_predictions = batch_labels.numel()
+                    
+                    # Backpropagate
+                    batch_loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += batch_loss.item() * len(batch_seqs)
+                    total_correct += batch_correct
+                    total_predictions += batch_predictions
+                    total_sequences += len(batch_seqs)
+                
+                # Clear GPU cache periodically
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            # Calculate average loss and accuracy for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+                avg_acc = total_correct / total_predictions if total_predictions > 0 else 0.0
+            else:
+                avg_loss = 0.0
+                avg_acc = 0.0
+                
+            loss_history.append(avg_loss)
+            acc_history.append(avg_acc)
+            
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"MLC Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {avg_acc:.4f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                checkpoint = {
+                    'iteration': it,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss_history': loss_history,
+                    'acc_history': acc_history,
+                    'best_loss': best_loss
+                }
+                torch.save(checkpoint, checkpoint_file)
+                print(f"Checkpoint saved at iteration {it}")
+            
+            # Check convergence
+            if abs(prev_loss - avg_loss) < tol:
+                print(f"Converged after {it+1} iterations.")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                break
+                
+            prev_loss = avg_loss
+            
+            # Learning rate scheduling
+            scheduler.step()
+        
+        self.trained = True
+        
+        return loss_history, acc_history
+
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, decay_rate=1.0, print_every=10,
+                   batch_size=32, checkpoint_file=None, checkpoint_interval=5):
+        """
+        Self-training method for self-consistency (gap mode) with memory-efficient sequence processing.
+        Trains the model so that N(k) vectors match the corresponding token embeddings at each position.
+        
+        Args:
+            seqs: List of character sequences for training
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            
+        Returns:
+            list: Training loss history
+        """
         
         if not continued:
             self.reset_parameters()
@@ -406,8 +767,8 @@ class DualDescriptorTS(nn.Module):
                 for seq in batch_seqs:
                     # Extract tokens and convert to indices
                     tokens = self.extract_tokens(seq)
-                    if len(tokens) <= 1 and auto_mode == 'reg':
-                        continue  # Skip sequences too short for regression mode
+                    if not tokens:
+                        continue
                         
                     token_indices = self.token_to_indices(tokens)
                     k_positions = torch.arange(len(tokens), dtype=torch.float32, device=self.device)
@@ -418,24 +779,15 @@ class DualDescriptorTS(nn.Module):
                     # Get token embeddings for target computation
                     token_embeddings = self.embedding(token_indices)
                     
-                    # Compute loss based on auto_mode
+                    # Self-consistency loss: N(k) should match token embedding at position k
                     seq_loss = 0.0
                     valid_positions = 0
                     
                     for k in range(len(tokens)):
-                        if auto_mode == 'gap':
-                            # Self-consistency: N(k) should match token embedding at position k
-                            target = token_embeddings[k]
-                            pred = Nk_batch[k]
-                            seq_loss += torch.sum((pred - target) ** 2)
-                            valid_positions += 1
-                        else:  # 'reg' mode
-                            if k < len(tokens) - 1:
-                                # Predict next token's embedding
-                                target = token_embeddings[k + 1]
-                                pred = Nk_batch[k]
-                                seq_loss += torch.sum((pred - target) ** 2)
-                                valid_positions += 1
+                        target = token_embeddings[k]
+                        pred = Nk_batch[k]
+                        seq_loss += torch.sum((pred - target) ** 2)
+                        valid_positions += 1
                     
                     if valid_positions > 0:
                         seq_loss = seq_loss / valid_positions
@@ -474,8 +826,7 @@ class DualDescriptorTS(nn.Module):
             # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                print(f"Self-Train Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
             
             # Save checkpoint if specified
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -587,33 +938,73 @@ class DualDescriptorTS(nn.Module):
         Nk_sum = torch.sum(Nk_batch, dim=0)
         
         return (Nk_sum / len(toks)).detach().cpu().numpy()
-    
-    def reconstruct(self):
-        """Reconstruct representative sequence by minimizing error"""
-        assert self.trained, "Model must be trained first"
-        n_tokens = round(self.mean_token_count)
-        mean_t_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
-        seq_tokens = []
-        
-        # Precompute all token embeddings
-        all_token_indices = torch.arange(len(self.tokens), device=self.device)
-        all_embeddings = self.embedding(all_token_indices)
-        
-        for k in range(n_tokens):
-            # Compute Nk for all tokens at position k
-            k_tensor = torch.tensor([k] * len(self.tokens), dtype=torch.float32, device=self.device)
-            Nk_all = self.batch_compute_Nk(k_tensor, all_token_indices)
-            
-            # Compute errors
-            errors = torch.sum((Nk_all - mean_t_tensor) ** 2, dim=1)
-            min_idx = torch.argmin(errors).item()
-            best_tok = self.idx_to_token[min_idx]
-            seq_tokens.append(best_tok)
-            
-        return ''.join(seq_tokens)
 
-    def generate(self, L, tau=0.0):
-        """Generate sequence of length L with temperature-controlled randomness"""
+    def predict_c(self, seq):
+        """
+        Predict class label for a sequence using the classification head.
+        
+        Args:
+            seq (str): Input character sequence
+            
+        Returns:
+            tuple: (predicted_class, class_probabilities)
+        """
+        if self.classifier is None:
+            raise ValueError("Model must be trained for classification first")
+        
+        # Get sequence vector representation
+        seq_vector = self.predict_t(seq)
+        seq_vector_tensor = torch.tensor(seq_vector, dtype=torch.float32, device=self.device)
+        
+        # Get logits through classification head
+        with torch.no_grad():
+            logits = self.classifier(seq_vector_tensor.unsqueeze(0))
+            probabilities = torch.softmax(logits, dim=1)
+            predicted_class = torch.argmax(probabilities, dim=1).item()
+            
+        return predicted_class, probabilities[0].cpu().numpy()
+
+    def predict_l(self, seq, threshold=0.5):
+        """
+        Predict multi-label classification for a sequence.
+        
+        Args:
+            seq: Input character sequence
+            threshold: Probability threshold for binary classification (default: 0.5)
+            
+        Returns:
+            numpy.ndarray: Binary label predictions (0 or 1 for each label)
+            numpy.ndarray: Probability scores for each label
+        """
+        assert self.num_labels is not None, "Model must be initialized with num_labels for label prediction"
+        
+        toks = self.extract_tokens(seq)
+        if not toks:
+            # Return zeros if no tokens
+            return np.zeros(self.num_labels, dtype=np.float32), np.zeros(self.num_labels, dtype=np.float32)
+        
+        token_indices = self.token_to_indices(toks)
+        k_positions = torch.arange(len(toks), dtype=torch.float32, device=self.device)
+        
+        # Compute N(k) vectors for all positions in the sequence
+        Nk_batch = self.batch_compute_Nk(k_positions, token_indices)
+        
+        # Compute sequence representation: average of all N(k) vectors
+        seq_representation = torch.mean(Nk_batch, dim=0)
+        
+        # Pass through classification head to get logits
+        with torch.no_grad():
+            logits = self.labeller(seq_representation)
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(logits).cpu().numpy()
+        
+        # Apply threshold to get binary predictions
+        binary_preds = (probs > threshold).astype(np.float32)
+        
+        return binary_preds, probs
+    
+    def reconstruct(self, L, tau=0.0):
+        """Reconstruct representative sequence of length L by minimizing error with temperature-controlled randomness"""
         assert self.trained, "Model must be trained first"
         if tau < 0:
             raise ValueError("Temperature must be non-negative")
@@ -667,342 +1058,6 @@ class DualDescriptorTS(nn.Module):
         print(f"Model loaded from {filename}")
         return self
 
-    def part_train(self, vec_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='reg', decay_rate=1.0, print_every=10):
-        """
-        Train the I tensor on vector sequences using gradient descent with PyTorch optimization.
-        Supports two modes:
-          - 'gap': Predicts current vector (self-consistency)
-          - 'reg': Predicts next vector (auto-regressive)
-        
-        Parameters:
-            vec_seqs (list): List of vector sequences (each sequence is list of m-dim vectors)
-            learning_rate (float): Step size for gradient updates
-            max_iters (int): Maximum training iterations
-            tol (float): Convergence tolerance
-            auto_mode (str): Training mode - 'gap' or 'reg'
-            continued (bool): Continue training existing I tensor
-            decay_rate (float): Learning rate decay factor (1.0 = no decay)
-            
-        Returns:
-            list: Training history (loss values per iteration)
-        """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
-
-        # Initialize I tensor if needed
-        if not continued or not hasattr(self, 'I'):            
-            self.I = nn.Parameter(torch.empty(self.m, self.m, self.o, device=self.device))
-            nn.init.uniform_(self.I, -0.1, 0.1)
-        
-        # Calculate total training samples
-        total_samples = 0
-        for seq in vec_seqs:
-            if auto_mode == 'gap':
-                total_samples += len(seq)  # All vectors are samples
-            else:  # 'reg' mode
-                total_samples += max(0, len(seq) - 1)  # Vectors except last
-                
-        if total_samples == 0:
-            raise ValueError("No training samples found")
-            
-        # Setup optimizer for I tensor only
-        optimizer = optim.Adam([self.I], lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        
-        history = []  # Store loss per iteration
-        prev_loss = float('inf')
-        best_loss = float('inf')
-        best_I_state = None
-        
-        for it in range(max_iters):
-            optimizer.zero_grad()
-            total_loss = 0.0
-            
-            # Process all vector sequences
-            for seq in vec_seqs:
-                if not seq:
-                    continue
-                    
-                # Convert sequence to tensor
-                seq_tensor = torch.tensor(np.array(seq), dtype=torch.float32, device=self.device)
-                
-                # Process vectors based on mode
-                for k in range(len(seq)):
-                    # Skip last vector in 'reg' mode (no next vector)
-                    if auto_mode == 'reg' and k == len(seq) - 1:
-                        continue
-                        
-                    current_vec = seq_tensor[k]
-                    
-                    # Compute N(k) for current vector at position k using I tensor
-                    k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
-                    k_expanded = k_tensor.view(-1, 1, 1, 1)
-                    
-                    # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
-                    phi = torch.cos(2 * math.pi * k_expanded / self.periods)
-                    
-                    # Compute Nk using I tensor: Nk[i] = Σ_j Σ_g I[i][j][g] * current_vec[j] * phi[i,j,g]
-                    Nk = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
-                    
-                    # Determine target based on mode
-                    if auto_mode == 'gap':
-                        target = current_vec  # Self-consistency
-                    else:  # 'reg' mode
-                        target = seq_tensor[k + 1]  # Next vector prediction
-                    
-                    # Compute loss
-                    loss = torch.sum((Nk - target) ** 2)
-                    total_loss += loss
-            
-            # Average loss and backpropagate
-            avg_loss = total_loss / total_samples
-            avg_loss.backward()
-            optimizer.step()
-            
-            history.append(avg_loss.item())
-            
-            # Update best I state
-            if avg_loss.item() < best_loss:
-                best_loss = avg_loss.item()
-                best_I_state = self.I.detach().clone()
-            
-            # Print training progress
-            if it % print_every == 0 or it == max_iters - 1:
-                current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"PartTrain({mode_display}) Iter {it:3d}: loss = {avg_loss.item():.6f}, LR = {current_lr:.6f}")
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss.item()) < tol:
-                print(f"Converged after {it+1} iterations")
-                # Restore best I state
-                if best_I_state is not None:
-                    self.I.data = best_I_state
-                break
-            prev_loss = avg_loss.item()
-            
-            # Learning rate scheduling
-            scheduler.step()
-        
-        # Compute and store mean vector for generation
-        total_vectors = 0
-        total_vec_sum = torch.zeros(self.m, device=self.device)
-        for seq in vec_seqs:
-            seq_tensor = torch.tensor(np.array(seq), dtype=torch.float32, device=self.device)
-            total_vectors += len(seq)
-            total_vec_sum += seq_tensor.sum(dim=0)
-        
-        self.mean_vector = (total_vec_sum / total_vectors).cpu().numpy()
-        
-        return history
-
-    def part_generate(self, L, tau=0.0, mode='reg'):
-        """
-        Generate a sequence of vectors using the trained I tensor with PyTorch optimization
-        
-        Parameters:
-            L (int): Length of sequence to generate
-            tau (float): Temperature for randomness (0 = deterministic)
-            mode (str): Generation mode - 'gap' or 'reg' (must match training)
-                
-        Returns:
-            list: Generated sequence of m-dimensional vectors
-        """
-        if not hasattr(self, 'I'):
-            raise RuntimeError("I tensor not initialized - train first")
-            
-        if tau < 0:
-            raise ValueError("Temperature must be non-negative")
-            
-        mean_vector_tensor = torch.tensor(self.mean_vector, dtype=torch.float32, device=self.device)
-        sequence = []
-        
-        if mode == 'gap':
-            # Gap mode: Generate independent reconstructions at each position
-            for k in range(L):
-                # Start with mean vector
-                current_vec = mean_vector_tensor
-                
-                # Compute reconstruction at position k
-                k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
-                k_expanded = k_tensor.view(-1, 1, 1, 1)
-                
-                # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
-                phi = torch.cos(2 * math.pi * k_expanded / self.periods)
-                
-                # Compute reconstructed vector using I tensor
-                reconstructed_vec = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
-                
-                # Add temperature-controlled noise
-                if tau > 0:
-                    noise = torch.normal(0, tau, size=(self.m,), device=self.device)
-                    reconstructed_vec = reconstructed_vec + noise
-                    
-                sequence.append(reconstructed_vec.detach().cpu().numpy())
-            return sequence
-            
-        else:  # 'reg' mode
-            # Reg mode: Auto-regressive generation
-            current_vec = mean_vector_tensor  # Start with mean vector
-            
-            for k in range(L):
-                # Compute prediction for next vector
-                k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
-                k_expanded = k_tensor.view(-1, 1, 1, 1)
-                
-                # Calculate basis functions: cos(2π*k/periods) [1, m, m, o]
-                phi = torch.cos(2 * math.pi * k_expanded / self.periods)
-                
-                # Compute next vector prediction using I tensor
-                next_vec_pred = torch.einsum('j,ijg,ijg->i', current_vec, self.I, phi[0])
-                
-                # Add temperature-controlled noise
-                if tau > 0:
-                    noise = torch.normal(0, tau, size=(self.m,), device=self.device)
-                    next_vec = next_vec_pred + noise
-                else:
-                    next_vec = next_vec_pred
-                    
-                sequence.append(next_vec.detach().cpu().numpy())
-                current_vec = next_vec  # Use prediction as next input
-                
-            return sequence
-
-    def double_train(self, seqs, auto_mode='reg', part_mode='reg', 
-                    auto_params=None, part_params=None):
-        """
-        Two-stage training method with PyTorch optimization: 
-          1. First train on character sequences using auto_train (unsupervised)
-          2. Then convert sequences to vector sequences using S(l) and train I tensor
-        
-        Parameters:
-            seqs (list): Input character sequences
-            auto_mode (str): Training mode for auto_train - 'gap' or 'reg'
-            part_mode (str): Training mode for part_train - 'gap' or 'reg'
-            auto_params (dict): Parameters for auto_train (max_iters, tol, learning_rate)
-            part_params (dict): Parameters for part_train (max_iters, tol, learning_rate)
-            
-        Returns:
-            tuple: (auto_history, part_history) training histories
-        """
-        # Set default parameters if not provided
-        auto_params = auto_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
-        part_params = part_params or {'max_iters': 100, 'tol': 1e-6, 'learning_rate': 0.01}
-        
-        # Stage 1: Train character model with auto_train
-        print("="*50)
-        print("Stage 1: Auto-training on character sequences")
-        print("="*50)
-        auto_history = self.auto_train(
-            seqs, 
-            auto_mode=auto_mode,
-            max_iters=auto_params['max_iters'],
-            tol=auto_params['tol'],
-            learning_rate=auto_params['learning_rate']
-        )
-        
-        # Convert sequences to vector sequences using S(l)
-        print("\n" + "="*50)
-        print("Converting sequences to vector representations")
-        print("="*50)
-        vec_seqs = []
-        for i, seq in enumerate(seqs):
-            # Get cumulative S(l) vectors for the sequence
-            s_vectors = self.S(seq)
-            vec_seqs.append(s_vectors)
-            if i < 3:  # Show sample conversion for first 3 sequences
-                print(f"Sequence {i+1} (len={len(seq)}) -> {len(s_vectors)} vectors")
-                print(f"  First vector: {[round(x, 4) for x in s_vectors[0]]}")
-                print(f"  Last vector: {[round(x, 4) for x in s_vectors[-1]]}")
-        
-        # Stage 2: Train I tensor on vector sequences
-        print("\n" + "="*50)
-        print("Stage 2: Training I tensor on vector sequences")
-        print("="*50)
-        part_history = self.part_train(
-            vec_seqs,
-            max_iters=part_params['max_iters'],
-            tol=part_params['tol'],
-            learning_rate=part_params['learning_rate'],
-            auto_mode=part_mode
-        )
-        
-        return auto_history, part_history
-
-    def double_generate(self, L, tau=0.0, mode='reg'):
-        """
-        Generate character sequences using a two-stage approach with PyTorch optimization:
-          1. Character-level model (auto-trained) for token probabilities
-          2. Vector-sequence model (part-trained) for structural coherence
-        
-        Parameters:
-            L (int): Length of sequence to generate
-            tau (float): Temperature for stochastic sampling (0=deterministic)
-            mode (str): Generation mode for vector refinement - 'gap' or 'reg' (default: 'reg')
-        
-        Returns:
-            str: Generated character sequence
-        """
-        # Stage 1: Generate initial sequence with character model
-        init_seq = self.generate(L, tau=tau)
-        
-        # Stage 2: Compute S(l) vectors for initial sequence
-        s_vectors = self.S(init_seq)
-        
-        # Stage 3: Refine vectors using I-tensor with specified mode
-        refined_vectors = self.part_generate(len(s_vectors), mode=mode, tau=tau)
-        
-        # Stage 4: Reconstruct character sequence using both models
-        generated_tokens = []
-        current_s = torch.zeros(self.m, device=self.device)  # Initialize cumulative vector
-        
-        for k in range(L):
-            # Get target vector for current position
-            if k < len(refined_vectors):
-                target_vec = torch.tensor(refined_vectors[k], dtype=torch.float32, device=self.device)
-            else:
-                # If beyond refined vectors, use character model prediction
-                target_vec = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
-            
-            # Calculate required N(k) vector: ΔS = S(k) - S(k-1)
-            required_nk = target_vec - current_s
-            
-            # Find best matching token
-            best_token = None
-            min_error = float('inf')
-            token_scores = []
-            
-            # Precompute all token embeddings
-            all_token_indices = torch.arange(len(self.tokens), device=self.device)
-            
-            # Compute Nk for all tokens at position k
-            k_tensor = torch.tensor([k] * len(self.tokens), dtype=torch.float32, device=self.device)
-            Nk_all = self.batch_compute_Nk(k_tensor, all_token_indices)
-            
-            # Calculate errors for all tokens
-            errors = torch.sum((Nk_all - required_nk) ** 2, dim=1)
-            
-            # Get scores and find best token
-            scores = -errors  # Convert to score (higher = better)
-            
-            if tau == 0:  # Deterministic selection
-                max_idx = torch.argmax(scores).item()
-                chosen_token = self.idx_to_token[max_idx]
-            else:  # Stochastic selection
-                probs = torch.softmax(scores / tau, dim=0).detach().cpu().numpy()
-                chosen_idx = random.choices(range(len(self.tokens)), weights=probs, k=1)[0]
-                chosen_token = self.idx_to_token[chosen_idx]
-            
-            # Update sequence and cumulative vector
-            generated_tokens.append(chosen_token)
-            
-            # Compute actual N(k) for chosen token
-            token_idx = self.token_to_idx[chosen_token]
-            actual_nk = self.compute_Nk(k, token_idx)
-            current_s = current_s + actual_nk
-        
-        return ''.join(generated_tokens)
 
 # === Example Usage ===
 if __name__=="__main__":
@@ -1024,7 +1079,7 @@ if __name__=="__main__":
     rank = 6
     user_step = 3
     
-    # Generate 1000 sequences with random target vectors
+    # Generate 100 sequences with random target vectors
     seqs, t_list = [], []
     for _ in range(100):
         L = random.randint(200, 300)
@@ -1052,12 +1107,12 @@ if __name__=="__main__":
     print("\n" + "="*50)
     print("Starting Gradient Descent Training")
     print("="*50)
-    dd.grad_train(seqs, t_list, max_iters=200, tol=1e-199, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
+    dd.reg_train(seqs, t_list, max_iters=100, tol=1e-199, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
    
     # Predict the target vector of the first sequence
     aseq = seqs[0]
     t_pred = dd.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x, 4) for x in t_pred]}")    
+    print(f"\nPredicted t for first sequence: {[round(x.item(), 4) for x in t_pred]}")    
     
     # Calculate the correlation between the predicted and the real target
     pred_t_list = [dd.predict_t(seq) for seq in seqs]
@@ -1071,25 +1126,207 @@ if __name__=="__main__":
         print(f"Dimension {i} prediction correlation: {corr:.4f}")
         corr_sum += corr
     corr_avg = corr_sum / dd.m
-    print(f"Average correlation: {corr_avg:.4f}")       
-  
-    # Reconstruct the representative sequence
-    repr_seq = dd.reconstruct()
-    print(f"\nRepresentative sequence (len={len(repr_seq)}): {repr_seq[:50]}...")
-    
-    # Generate new sequences
-    seq_det = dd.generate(L=100, tau=0.0)
-    seq_rand = dd.generate(L=100, tau=0.5)
-    print("\nDeterministic generation:", seq_det[:50] + "...")
-    print("Stochastic generation (tau=0.5):", seq_rand[:50] + "...")    
+    print(f"Average correlation: {corr_avg:.4f}")         
    
-    # === Combined self-training examples ===
+    # Reconstruct representative sequences
+    seq_det = dd.reconstruct(L=100, tau=0.0)
+    seq_rand = dd.reconstruct(L=100, tau=0.5)
+    print("\nDeterministic reconstruction:", seq_det[:50] + "...")
+    print("Stochastic reconstruction (tau=0.5):", seq_rand[:50] + "...")
+
+    # Classification task 
     print("\n" + "="*50)
-    print("Combined Auto-Training Example")
+    print("Example 2: Classification Task")
+    print("="*50)
+    
+    # Generate classification data
+    num_classes = 3
+    class_seqs = []
+    class_labels = []
+    
+    # Create sequences with different patterns for each class
+    for class_id in range(num_classes):
+        for _ in range(50):  # 50 sequences per class
+            L = random.randint(150, 250)
+            if class_id == 0:
+                # Class 0: High A content
+                seq = ''.join(random.choices(['A', 'C', 'G', 'T'], weights=[0.6, 0.1, 0.1, 0.2], k=L))
+            elif class_id == 1:
+                # Class 1: High GC content
+                seq = ''.join(random.choices(['A', 'C', 'G', 'T'], weights=[0.1, 0.4, 0.4, 0.1], k=L))
+            else:
+                # Class 2: Balanced
+                seq = ''.join(random.choices(['A', 'C', 'G', 'T'], k=L))
+            
+            class_seqs.append(seq)
+            class_labels.append(class_id)
+    
+    # Split into training and testing
+    train_size = int(0.8 * len(class_seqs))
+    train_seqs = class_seqs[:train_size]
+    train_labels = class_labels[:train_size]
+    test_seqs = class_seqs[train_size:]
+    test_labels = class_labels[train_size:]
+    
+    # Initialize new model for classification
+    dd_cls = DualDescriptorTS(
+        charset, 
+        rank=rank, 
+        vec_dim=vec_dim, 
+        num_basis=num_basis, 
+        mode='nonlinear', 
+        user_step=user_step,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    
+    # Train for classification
+    print("\n" + "="*50)
+    print("Starting Classification Training")
+    print("="*50)
+    history = dd_cls.cls_train(train_seqs, train_labels, num_classes, 
+                              max_iters=100, tol=1e-8, learning_rate=0.05,
+                              decay_rate=0.99, batch_size=32, print_every=1)
+    
+    # Test the classifier
+    print("\n" + "="*50)
+    print("Testing Classification Model")
+    print("="*50)
+    
+    correct = 0
+    all_predictions = []
+    
+    for seq, true_label in zip(test_seqs, test_labels):
+        pred_class, probs = dd_cls.predict_c(seq)
+        all_predictions.append(pred_class)
+        
+        if pred_class == true_label:
+            correct += 1
+    
+    accuracy = correct / len(test_seqs)
+    print(f"Test Accuracy: {accuracy:.4f} ({correct}/{len(test_seqs)})")
+    
+    # Show some example predictions
+    print("\nExample predictions:")
+    for i in range(min(5, len(test_seqs))):
+        pred_class, probs = dd_cls.predict_c(test_seqs[i])
+        print(f"Seq {i+1}: True={test_labels[i]}, Pred={pred_class}, Probs={[f'{p:.3f}' for p in probs]}")
+
+    # Initialize the model for multi-label classification
+    print("\n\n" + "="*50)
+    print("Multi-Label Classification Model")
+    print("="*50)
+
+    # Generate 100 sequences with random multi-labels for classification
+    num_labels = 4 # Example: 4 different biological functions
+    seqs_cls, labels = [], []
+    for _ in range(100):
+        L = random.randint(200, 300)
+        seq = ''.join(random.choices(charset, k=L))
+        seqs_cls.append(seq)
+        # Create random binary labels (multi-label classification)
+        # Each sequence can have 0-4 active labels
+        label_vec = [random.random() > 0.7 for _ in range(num_labels)]
+        labels.append([1.0 if x else 0.0 for x in label_vec])
+
+    
+    dd_cls = DualDescriptorTS(
+        charset, 
+        rank=rank, 
+        vec_dim=vec_dim, 
+        num_basis=num_basis, 
+        mode='nonlinear', 
+        user_step=user_step,        
+        device='cuda' if torch.cuda.is_available() else 'cpu'
+    )
+    
+    print(f"\nUsing device: {dd_cls.device}")
+    print(f"Number of tokens: {len(dd_cls.tokens)}")
+    print(f"Number of labels: {dd_cls.num_labels}")
+    
+    # Training multi-label classification model
+    print("\n" + "="*50)
+    print("Starting Gradient Descent Training for Multi-Label Classification")
+    print("="*50)
+    
+    # Split data into training and validation
+    train_size = 80
+    train_seqs = seqs_cls[:train_size]
+    train_labels = labels[:train_size]
+    val_seqs = seqs_cls[train_size:]
+    val_labels = labels[train_size:]
+    
+    # Train the model
+    loss_history, acc_history = dd_cls.lbl_train(
+        train_seqs, train_labels, 
+        max_iters=100, 
+        tol=1e-6, 
+        learning_rate=0.01, 
+        decay_rate=0.99, 
+        print_every=10, 
+        batch_size=32
+    )
+    
+    print(f"\nFinal training loss: {loss_history[-1]:.6f}")
+    print(f"Final training accuracy: {acc_history[-1]:.4f}")
+    
+    # Test on validation set
+    print("\n" + "="*50)
+    print("Validation Results")
+    print("="*50)
+    
+    val_correct = 0
+    val_total = 0
+    
+    for seq, true_labels in zip(val_seqs, val_labels):
+        pred_binary, pred_probs = dd_cls.predict_l(seq, threshold=0.5)
+        
+        # Convert true labels to numpy array
+        true_labels_np = np.array(true_labels)
+        
+        # Calculate accuracy for this sequence
+        correct = np.all(pred_binary == true_labels_np)
+        val_correct += correct
+        val_total += 1
+        
+        # Print detailed results for first few validation sequences
+        if val_total <= 3:
+            print(f"\nSequence {val_total}:")
+            print(f"True labels: {true_labels_np}")
+            print(f"Predicted binary: {pred_binary}")
+            print(f"Predicted probabilities: {[f'{p:.4f}' for p in pred_probs]}")
+            print(f"Correct: {correct}")
+    
+    val_accuracy = val_correct / val_total if val_total > 0 else 0.0
+    print(f"\nOverall validation accuracy: {val_accuracy:.4f} ({val_correct}/{val_total} sequences)")
+    
+    # Example of label prediction for a new sequence
+    print("\n" + "="*50)
+    print("Label Prediction Example")
+    print("="*50)
+    
+    # Create a test sequence
+    test_seq = "".join(random.choices(charset, k=250))
+    print(f"Test sequence (first 50 chars): {test_seq[:50]}...")
+    
+    # Predict labels
+    binary_pred, probs_pred = dd_cls.predict_l(test_seq, threshold=0.5)
+    print(f"\nPredicted binary labels: {binary_pred}")
+    print(f"Predicted probabilities: {[f'{p:.4f}' for p in probs_pred]}")
+    
+    # Interpret the predictions
+    label_names = ["Function_A", "Function_B", "Function_C", "Function_D"]
+    print("\nLabel interpretation:")
+    for i, (binary, prob) in enumerate(zip(binary_pred, probs_pred)):
+        status = "ACTIVE" if binary > 0.5 else "INACTIVE"
+        print(f"  {label_names[i]}: {status} (confidence: {prob:.4f})")
+
+     # === Combined self-training examples ===
+    print("\n" + "="*50)
+    print("Combined Self-Training Example")
     print("="*50)
     
     # Create a new model
-    dd_gap = DualDescriptorTS(
+    dd_self = DualDescriptorTS(
         charset, 
         rank=rank, 
         vec_dim=vec_dim, 
@@ -1100,124 +1337,25 @@ if __name__=="__main__":
     )
     
     # Generate sample sequences
-    auto_seqs = []
+    self_seqs = []
     for _ in range(10):
         L = random.randint(200, 300)
-        auto_seqs.append(''.join(random.choices(charset, k=L)))
+        self_seqs.append(''.join(random.choices(charset, k=L)))
     
-    # Conduct self-consistenty training (gap mode)
-    print("\nTraining in 'gap' mode (self-consistency):")
-    gap_history = dd_gap.auto_train(
-        auto_seqs, 
+    # Conduct self-consistenty training
+    print("\nTraining for self-consistency:")
+    self_history = dd_self.self_train(
+        self_seqs, 
         max_iters=50, 
         tol=1e-8, 
-        learning_rate=0.01, 
-        auto_mode='gap',
+        learning_rate=0.01,         
         batch_size=1024
     )
     
-    # Generate sequences
-    print("\nGenerated sequences from 'gap' model:")
+    # Reconstruct sequences
+    print("\nReconstructed sequences from model:")
     for i in range(2):
-        gen_seq = dd_gap.generate(100, tau=0.2)
-        print(f"Sequence {i+1}: {gen_seq[:50]}...") 
-    
-    # === Part Train/Generate Example ===
-    print("\n" + "="*50)
-    print("Part Train/Generate Example")
-    print("="*50)
-    
-    # Create new model
-    dd_part = DualDescriptorTS(charset="", rank=3, vec_dim=2, num_basis=5)
-    
-    # Generate sample vector sequences (2D vectors)
-    vec_seqs = []
-    for _ in range(5):  # 5 sequences
-        seq_len = random.randint(100, 150)
-        seq = []
-        for _ in range(seq_len):
-            # Generate random 2D vector
-            vec = [random.uniform(-1, 1), random.uniform(-1, 1)]
-            seq.append(vec)
-        vec_seqs.append(seq)
-    
-    # Train in self-consistency (gap) mode
-    print("\nTraining in 'gap' mode (self-consistency):")
-    gap_history = dd_part.part_train(vec_seqs, max_iters=100, 
-                                     learning_rate=0.1, auto_mode='gap')
-    
-    # Generate new vector sequence
-    print("\nGenerated vector sequence (gap mode):")
-    gen_seq = dd_part.part_generate(10, mode='gap', tau=0.0)
-    for i, vec in enumerate(gen_seq):
-        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
-    
-    # Train in auto-regressive (reg) mode
-    print("\nTraining in 'reg' mode (next-vector prediction):")
-    reg_history = dd_part.part_train(vec_seqs, max_iters=100, 
-                                     learning_rate=0.1, auto_mode='reg')
-    
-    # Generate new vector sequence with randomness
-    print("\nGenerated vector sequence with temperature (reg mode):")
-    gen_seq = dd_part.part_generate(10, mode='reg', tau=0.1)
-    for i, vec in enumerate(gen_seq):
-        print(f"Vec {i+1}: [{vec[0]:.10f}, {vec[1]:.10f}]")
-    
-    # === Double Generation Example ===
-    print("\n" + "="*50)
-    print("Double Generation Example")
-    print("="*50)
-
-    # Create and train model using double_train
-    dd_double = DualDescriptorTS(
-        charset=['A','C','G','T'], 
-        rank=3, 
-        vec_dim=2, 
-        num_basis=5,
-        mode='nonlinear',
-        user_step=2
-    )
-
-    # Generate sample DNA sequences
-    dna_seqs = []
-    for _ in range(10):  # 5 sequences
-        seq_len = random.randint(100, 200)
-        dna_seqs.append(''.join(random.choices(['A','C','G','T'], k=seq_len)))
-
-    # Configure training parameters
-    auto_config = {
-        'max_iters': 50,
-        'tol': 1e-6,
-        'learning_rate': 0.1
-    }
-    
-    part_config = {
-        'max_iters': 50,
-        'tol': 1e-6,
-        'learning_rate': 0.01
-    }
-
-    # Train with double_train (as in previous example)
-    auto_hist, part_hist = dd_double.double_train(
-        dna_seqs,  # Sample DNA sequences
-        auto_mode='reg',
-        part_mode='reg',
-        auto_params=auto_config,
-        part_params=part_config
-    )
-
-    # Generate sequences using different methods for comparison
-    print("\n1. Character-only generation:")
-    char_seq = dd_double.generate(100, tau=0.3)
-    print(char_seq)
-
-    print("\n2. Vector-only generation:")
-    vec_seq = dd_double.part_generate(10, mode='reg', tau=0.1)
-    for i, vec in enumerate(vec_seq):
-        print(f"Position {i}: [{vec[0]:.4f}, {vec[1]:.4f}]")
-
-    print("\n3. Double-generation (combined models):")
-    double_seq = dd_double.double_generate(100, tau=0.2)
-    print(double_seq)
+        rec_seq = dd_self.reconstruct(100, tau=0.2)
+        print(f"Sequence {i+1}: {rec_seq[:50]}...")       
 
     print("\nAll tests completed successfully!")
