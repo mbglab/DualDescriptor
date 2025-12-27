@@ -35,7 +35,7 @@ class DualDescriptorTS(nn.Module):
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # 1) Generate all possible tokens (k-mers + right-padded with '_')
+        # Generate all possible tokens (k-mers + right-padded with '_')
         toks = []
         if self.rank_mode=='pad':
             for r in range(1, self.rank+1):
@@ -62,12 +62,12 @@ class DualDescriptorTS(nn.Module):
                     periods[i, j, g] = i*(self.m*self.o) + j*self.o + g + 2
         self.register_buffer('periods', periods)
 
-        # Classification head (initialized later when num_classes is known)
-        self.num_classes = None
+        # Class head (initialized later when num_classes is known)
+        self.num_classes = None #Number of classes in the multi-class prediction task
         self.classifier = None        
 
-        # Label head (initialized later when num_classes is known)
-        self.num_labels = None  # Number of labels for multi-label classification
+        # Label head (initialized later when num_labels is known)
+        self.num_labels = None  # Number of labels for multi-label prediction task
         self.labeller = None
 
         # Initialize parameters
@@ -491,7 +491,7 @@ class DualDescriptorTS(nn.Module):
             # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                print(f"CLS Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {accuracy:.4f}, LR = {current_lr:.6f}")
+                print(f"CLS-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {accuracy:.4f}, LR = {current_lr:.6f}")
             
             # Save checkpoint if specified
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -524,7 +524,7 @@ class DualDescriptorTS(nn.Module):
         
         return history
 
-    def lbl_train(self, seqs, labels, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def lbl_train(self, seqs, labels, num_labels, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                  continued=False, decay_rate=1.0, print_every=10, batch_size=32,
                  checkpoint_file=None, checkpoint_interval=10, pos_weight=None):
         """
@@ -533,6 +533,7 @@ class DualDescriptorTS(nn.Module):
         Args:
             seqs: List of character sequences for training
             labels: List of binary label vectors (list of lists) or 2D numpy array/torch tensor
+            num_labels: Number of labels for multi-label prediction task
             max_iters: Maximum number of training iterations
             tol: Convergence tolerance
             learning_rate: Initial learning rate for optimizer
@@ -548,7 +549,6 @@ class DualDescriptorTS(nn.Module):
             list: Training loss history
             list: Training accuracy history
         """
-        #assert self.num_labels is not None, "Model must be initialized with num_labels for multi-label classification"
 
         # Initialize label head if not already done
         if self.labeller is None or self.num_labels != num_labels:
@@ -677,7 +677,7 @@ class DualDescriptorTS(nn.Module):
             # Print training progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                print(f"MLC Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {avg_acc:.4f}, LR = {current_lr:.6f}")
+                print(f"MLC-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {avg_acc:.4f}, LR = {current_lr:.6f}")
             
             # Save checkpoint if specified
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -950,7 +950,7 @@ class DualDescriptorTS(nn.Module):
             tuple: (predicted_class, class_probabilities)
         """
         if self.classifier is None:
-            raise ValueError("Model must be trained for classification first")
+            raise ValueError("Model must be trained first for classification")
         
         # Get sequence vector representation
         seq_vector = self.predict_t(seq)
@@ -976,7 +976,7 @@ class DualDescriptorTS(nn.Module):
             numpy.ndarray: Binary label predictions (0 or 1 for each label)
             numpy.ndarray: Probability scores for each label
         """
-        assert self.num_labels is not None, "Model must be initialized with num_labels for label prediction"
+        assert self.labeller is not None, "Model must be trained first for label prediction"
         
         toks = self.extract_tokens(seq)
         if not toks:
@@ -1079,15 +1079,6 @@ if __name__=="__main__":
     rank = 6
     user_step = 3
     
-    # Generate 100 sequences with random target vectors
-    seqs, t_list = [], []
-    for _ in range(100):
-        L = random.randint(200, 300)
-        seq = ''.join(random.choices(charset, k=L))
-        seqs.append(seq)
-        # Create a random vector target
-        t_list.append([random.uniform(-1.0, 1.0) for _ in range(vec_dim)])
-
     # Initialize the model
     dd = DualDescriptorTS(
         charset, 
@@ -1103,11 +1094,20 @@ if __name__=="__main__":
     print(f"\nUsing device: {dd.device}")
     print(f"Number of tokens: {len(dd.tokens)}")
 
+    # Generate 100 sequences with random target vectors
+    seqs, t_list = [], []
+    for _ in range(100):
+        L = random.randint(200, 300)
+        seq = ''.join(random.choices(charset, k=L))
+        seqs.append(seq)
+        # Create a random vector target
+        t_list.append([random.uniform(-1.0, 1.0) for _ in range(vec_dim)])
+
     # Training model
     print("\n" + "="*50)
     print("Starting Gradient Descent Training")
     print("="*50)
-    dd.reg_train(seqs, t_list, max_iters=100, tol=1e-199, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
+    dd.reg_train(seqs, t_list, max_iters=50, tol=1e-9, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
    
     # Predict the target vector of the first sequence
     aseq = seqs[0]
@@ -1136,7 +1136,7 @@ if __name__=="__main__":
 
     # Classification task 
     print("\n" + "="*50)
-    print("Example 2: Classification Task")
+    print("Classification Task")
     print("="*50)
     
     # Generate classification data
@@ -1159,15 +1159,8 @@ if __name__=="__main__":
                 seq = ''.join(random.choices(['A', 'C', 'G', 'T'], k=L))
             
             class_seqs.append(seq)
-            class_labels.append(class_id)
-    
-    # Split into training and testing
-    train_size = int(0.8 * len(class_seqs))
-    train_seqs = class_seqs[:train_size]
-    train_labels = class_labels[:train_size]
-    test_seqs = class_seqs[train_size:]
-    test_labels = class_labels[train_size:]
-    
+            class_labels.append(class_id)    
+
     # Initialize new model for classification
     dd_cls = DualDescriptorTS(
         charset, 
@@ -1183,33 +1176,33 @@ if __name__=="__main__":
     print("\n" + "="*50)
     print("Starting Classification Training")
     print("="*50)
-    history = dd_cls.cls_train(train_seqs, train_labels, num_classes, 
-                              max_iters=100, tol=1e-8, learning_rate=0.05,
+    history = dd_cls.cls_train(class_seqs, class_labels, num_classes, 
+                              max_iters=50, tol=1e-8, learning_rate=0.05,
                               decay_rate=0.99, batch_size=32, print_every=1)
     
-    # Test the classifier
+    # Show prediction results on the training dataset
     print("\n" + "="*50)
-    print("Testing Classification Model")
+    print("Prediction results")
     print("="*50)
     
     correct = 0
     all_predictions = []
     
-    for seq, true_label in zip(test_seqs, test_labels):
+    for seq, true_label in zip(class_seqs, class_labels):
         pred_class, probs = dd_cls.predict_c(seq)
         all_predictions.append(pred_class)
         
         if pred_class == true_label:
             correct += 1
     
-    accuracy = correct / len(test_seqs)
-    print(f"Test Accuracy: {accuracy:.4f} ({correct}/{len(test_seqs)})")
+    accuracy = correct / len(class_seqs)
+    print(f"Accuracy: {accuracy:.4f} ({correct}/{len(class_seqs)})")
     
     # Show some example predictions
     print("\nExample predictions:")
-    for i in range(min(5, len(test_seqs))):
-        pred_class, probs = dd_cls.predict_c(test_seqs[i])
-        print(f"Seq {i+1}: True={test_labels[i]}, Pred={pred_class}, Probs={[f'{p:.3f}' for p in probs]}")
+    for i in range(min(5, len(class_seqs))):
+        pred_class, probs = dd_cls.predict_c(class_seqs[i])
+        print(f"Seq {i+1}: True={class_labels[i]}, Pred={pred_class}, Probs={[f'{p:.3f}' for p in probs]}")
 
     # Initialize the model for multi-label classification
     print("\n\n" + "="*50)
@@ -1217,19 +1210,20 @@ if __name__=="__main__":
     print("="*50)
 
     # Generate 100 sequences with random multi-labels for classification
-    num_labels = 4 # Example: 4 different biological functions
-    seqs_cls, labels = [], []
+    num_labels = 4 # Example: 4 different biological functions    
+    label_seqs = []
+    labels = []
     for _ in range(100):
         L = random.randint(200, 300)
         seq = ''.join(random.choices(charset, k=L))
-        seqs_cls.append(seq)
+        label_seqs.append(seq)
         # Create random binary labels (multi-label classification)
         # Each sequence can have 0-4 active labels
         label_vec = [random.random() > 0.7 for _ in range(num_labels)]
         labels.append([1.0 if x else 0.0 for x in label_vec])
 
     
-    dd_cls = DualDescriptorTS(
+    dd_lbl = DualDescriptorTS(
         charset, 
         rank=rank, 
         vec_dim=vec_dim, 
@@ -1239,27 +1233,16 @@ if __name__=="__main__":
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
-    print(f"\nUsing device: {dd_cls.device}")
-    print(f"Number of tokens: {len(dd_cls.tokens)}")
-    print(f"Number of labels: {dd_cls.num_labels}")
-    
     # Training multi-label classification model
     print("\n" + "="*50)
     print("Starting Gradient Descent Training for Multi-Label Classification")
     print("="*50)
-    
-    # Split data into training and validation
-    train_size = 80
-    train_seqs = seqs_cls[:train_size]
-    train_labels = labels[:train_size]
-    val_seqs = seqs_cls[train_size:]
-    val_labels = labels[train_size:]
-    
+       
     # Train the model
-    loss_history, acc_history = dd_cls.lbl_train(
-        train_seqs, train_labels, 
-        max_iters=100, 
-        tol=1e-6, 
+    loss_history, acc_history = dd_lbl.lbl_train(
+        label_seqs, labels, num_labels,
+        max_iters=50, 
+        tol=1e-16, 
         learning_rate=0.01, 
         decay_rate=0.99, 
         print_every=10, 
@@ -1269,35 +1252,35 @@ if __name__=="__main__":
     print(f"\nFinal training loss: {loss_history[-1]:.6f}")
     print(f"Final training accuracy: {acc_history[-1]:.4f}")
     
-    # Test on validation set
+    # Show prediction results on training set
     print("\n" + "="*50)
-    print("Validation Results")
+    print("Prediction Results")
     print("="*50)
     
-    val_correct = 0
-    val_total = 0
+    all_correct = 0
+    total = 0
     
-    for seq, true_labels in zip(val_seqs, val_labels):
-        pred_binary, pred_probs = dd_cls.predict_l(seq, threshold=0.5)
+    for seq, true_labels in zip(label_seqs, labels):
+        pred_binary, pred_probs = dd_lbl.predict_l(seq, threshold=0.5)
         
         # Convert true labels to numpy array
         true_labels_np = np.array(true_labels)
         
         # Calculate accuracy for this sequence
         correct = np.all(pred_binary == true_labels_np)
-        val_correct += correct
-        val_total += 1
+        all_correct += correct
+        total += 1
         
-        # Print detailed results for first few validation sequences
-        if val_total <= 3:
-            print(f"\nSequence {val_total}:")
+        # Print detailed results for first few sequences
+        if total <= 3:
+            print(f"\nSequence {total}:")
             print(f"True labels: {true_labels_np}")
             print(f"Predicted binary: {pred_binary}")
             print(f"Predicted probabilities: {[f'{p:.4f}' for p in pred_probs]}")
             print(f"Correct: {correct}")
     
-    val_accuracy = val_correct / val_total if val_total > 0 else 0.0
-    print(f"\nOverall validation accuracy: {val_accuracy:.4f} ({val_correct}/{val_total} sequences)")
+    accuracy = all_correct / total if total > 0 else 0.0
+    print(f"\nOverall prediction accuracy: {accuracy:.4f} ({correct}/{total} sequences)")
     
     # Example of label prediction for a new sequence
     print("\n" + "="*50)
@@ -1309,7 +1292,7 @@ if __name__=="__main__":
     print(f"Test sequence (first 50 chars): {test_seq[:50]}...")
     
     # Predict labels
-    binary_pred, probs_pred = dd_cls.predict_l(test_seq, threshold=0.5)
+    binary_pred, probs_pred = dd_lbl.predict_l(test_seq, threshold=0.5)
     print(f"\nPredicted binary labels: {binary_pred}")
     print(f"Predicted probabilities: {[f'{p:.4f}' for p in probs_pred]}")
     
@@ -1322,7 +1305,7 @@ if __name__=="__main__":
 
      # === Combined self-training examples ===
     print("\n" + "="*50)
-    print("Combined Self-Training Example")
+    print("Self-Training Example")
     print("="*50)
     
     # Create a new model
