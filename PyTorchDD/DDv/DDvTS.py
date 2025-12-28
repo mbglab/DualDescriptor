@@ -1,7 +1,7 @@
 # Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
 # The Dual Descriptor Vector class (Tensor form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-29
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-29 ~ 2025-12-28
 
 import math
 import random
@@ -225,6 +225,13 @@ class DualDescriptorTS(nn.Module):
             total_positions += len(toks)
                 
         return total_loss / total_positions if total_positions else 0.0
+
+    def d(self, seq, t):
+        """
+        Compute pattern deviation value (d) for a single sequence. 
+        """
+        d_value = self.D([seq], [t])
+        return d_value     
 
     def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                continued=False, decay_rate=1.0, print_every=10, batch_size=32,
@@ -1107,7 +1114,7 @@ if __name__=="__main__":
     print("\n" + "="*50)
     print("Starting Gradient Descent Training")
     print("="*50)
-    dd.reg_train(seqs, t_list, max_iters=50, tol=1e-9, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
+    dd.reg_train(seqs, t_list, max_iters=100, tol=1e-9, learning_rate=0.1, decay_rate = 0.99, batch_size=2048)  
    
     # Predict the target vector of the first sequence
     aseq = seqs[0]
@@ -1280,7 +1287,7 @@ if __name__=="__main__":
             print(f"Correct: {correct}")
     
     accuracy = all_correct / total if total > 0 else 0.0
-    print(f"\nOverall prediction accuracy: {accuracy:.4f} ({correct}/{total} sequences)")
+    print(f"\nOverall prediction accuracy: {accuracy:.4f} ({all_correct}/{total} sequences)")
     
     # Example of label prediction for a new sequence
     print("\n" + "="*50)
@@ -1303,7 +1310,7 @@ if __name__=="__main__":
         status = "ACTIVE" if binary > 0.5 else "INACTIVE"
         print(f"  {label_names[i]}: {status} (confidence: {prob:.4f})")
 
-     # === Combined self-training examples ===
+    # === Self-training examples ===
     print("\n" + "="*50)
     print("Self-Training Example")
     print("="*50)
