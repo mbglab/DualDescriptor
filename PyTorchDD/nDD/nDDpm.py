@@ -17,35 +17,34 @@ class NumDualDescriptorPM(nn.Module):
     Numerical Vector Dual Descriptor with GPU acceleration using PyTorch:
       - Processes sequences of m-dimensional real vectors instead of character sequences
       - matrix P ∈ R^{m×m} of basis coefficients (simplified 2D version)
-      - mapping matrix M ∈ R^{m×m} for vector transformation
+      - square mapping matrix M ∈ R^{m×m} for vector transformation (assumes input_dim = model_dim)
       - indexed periods: period[i,j] = i*m + j + 2
       - basis function phi_{i,j}(k) = cos(2π * k / period[i,j])
       - supports 'linear' or 'nonlinear' (step-by-rank) vector extraction
     """
-    def __init__(self, input_dim, model_dim=2, rank=1, rank_op='avg', rank_mode='drop', mode='linear', user_step=None, device='cuda'):
+    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop', mode='linear', user_step=None, device='cuda'):
         super().__init__()
-        self.input_dim = input_dim    # Dimension of input vectors
+        self.vec_dim = vec_dim          # Dimension of input vectors and internal representation
         self.rank = rank              # r-per/k-mer length
         self.rank_op = rank_op        # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode    # 'pad' or 'drop'
-        self.m = model_dim            # embedding dimension
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
         self.step = user_step
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # Mapping matrix M for vector transformation (replaces token embeddings)
-        self.M = nn.Linear(self.input_dim, self.m, bias=False)
+        # Mapping matrix M for vector transformation
+        self.M = nn.Linear(self.vec_dim, self.vec_dim, bias=False)
         
         # Position-weight matrix P[i][j] (simplified 2D version)
-        self.P = nn.Parameter(torch.empty(self.m, self.m))
+        self.P = nn.Parameter(torch.empty(self.vec_dim, self.vec_dim))
         
         # Precompute indexed periods[i][j] (fixed, not trainable)
-        periods = torch.zeros(self.m, self.m, dtype=torch.float32)
-        for i in range(self.m):
-            for j in range(self.m):
-                periods[i, j] = i * self.m + j + 2
+        periods = torch.zeros(self.vec_dim, self.vec_dim, dtype=torch.float32)
+        for i in range(self.vec_dim):
+            for j in range(self.vec_dim):
+                periods[i, j] = i * self.vec_dim + j + 2
         self.register_buffer('periods', periods)
 
         # Class head (initialized later when num_classes is known)
@@ -146,7 +145,7 @@ class NumDualDescriptorPM(nn.Module):
                 # Pad or drop based on rank_mode setting
                 if self.rank_mode == 'pad' and frag_len < self.rank:
                     # Pad fragment with zero vectors if shorter than rank
-                    padding = torch.zeros(self.rank - frag_len, self.input_dim, device=self.device)
+                    padding = torch.zeros(self.rank - frag_len, self.vec_dim, device=self.device)
                     frag = torch.cat([frag, padding], dim=0)
                     vector_groups.append(frag)
                 elif frag_len == self.rank:
@@ -161,7 +160,7 @@ class NumDualDescriptorPM(nn.Module):
             return torch.stack(vectors)
         else:
             # Return empty tensor with correct dimensions
-            return torch.empty(0, self.input_dim, device=self.device)
+            return torch.empty(0, self.vec_dim, device=self.device)
 
     def batch_compute_Nk(self, k_tensor, vectors):
         """
@@ -170,20 +169,20 @@ class NumDualDescriptorPM(nn.Module):
         
         Args:
             k_tensor: Tensor of position indices [batch_size]
-            vectors: Tensor of vectors [batch_size, input_dim]
+            vectors: Tensor of vectors [batch_size, vec_dim]
             
         Returns:
-            Tensor of N(k) vectors [batch_size, m]
+            Tensor of N(k) vectors [batch_size, vec_dim]
         """
-        # Apply mapping matrix M to each vector
-        # vectors: [batch_size, input_dim]
-        # After M transformation: [batch_size, m]
-        x = self.M(vectors)  # [batch_size, m]
+        # Apply square mapping matrix M to each vector
+        # vectors: [batch_size, vec_dim]
+        # After M transformation: [batch_size, vec_dim]
+        x = self.M(vectors)  # [batch_size, vec_dim]
         
         # Expand dimensions for broadcasting [batch_size, 1, 1]
         k_expanded = k_tensor.view(-1, 1, 1)
         
-        # Calculate basis functions: cos(2π*k/periods) [batch_size, m, m]
+        # Calculate basis functions: cos(2π*k/periods) [batch_size, vec_dim, vec_dim]
         phi = torch.cos(2 * math.pi * k_expanded / self.periods)
         
         # Optimized computation using einsum
@@ -439,7 +438,7 @@ class NumDualDescriptorPM(nn.Module):
         
         # Initialize classification head if not already done
         if self.classifier is None or self.num_classes != num_classes:            
-            self.classifier = nn.Linear(self.m, num_classes).to(self.device)
+            self.classifier = nn.Linear(self.vec_dim, num_classes).to(self.device)
             self.num_classes = num_classes
         
         if not continued:
@@ -486,7 +485,7 @@ class NumDualDescriptorPM(nn.Module):
                     extracted_vectors = self.extract_vectors(vectors)
                     if extracted_vectors.shape[0] == 0:
                         # For empty sequences, use zero vector
-                        seq_vector = torch.zeros(self.m, device=self.device)
+                        seq_vector = torch.zeros(self.vec_dim, device=self.device)
                     else:
                         k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
                         
@@ -603,7 +602,7 @@ class NumDualDescriptorPM(nn.Module):
 
         # Initialize label head if not already done
         if self.labeller is None or self.num_labels != num_labels:
-            self.labeller = nn.Linear(self.m, num_labels).to(self.device)
+            self.labeller = nn.Linear(self.vec_dim, num_labels).to(self.device)
             self.num_labels = num_labels
         
         if not continued:
@@ -826,7 +825,7 @@ class NumDualDescriptorPM(nn.Module):
                     Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
                     
                     # Transform extracted vectors using M
-                    target_vectors = self.M(extracted_vectors)  # [num_vectors, m]
+                    target_vectors = self.M(extracted_vectors)  # [num_vectors, vec_dim]
                     
                     # Self-consistency loss: N(k) should match transformed vector at position k
                     seq_loss = 0.0
@@ -910,13 +909,13 @@ class NumDualDescriptorPM(nn.Module):
             batch_size: Number of sequences to process in each batch
         """
         total_vector_count = 0
-        total_t = torch.zeros(self.m, device=self.device)
+        total_t = torch.zeros(self.vec_dim, device=self.device)
         
         with torch.no_grad():
             for i in range(0, len(vector_seqs), batch_size):
                 batch_seqs = vector_seqs[i:i + batch_size]
                 batch_vector_count = 0
-                batch_vec_sum = torch.zeros(self.m, device=self.device)
+                batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
                 
                 for vectors in batch_seqs:
                     # Extract and apply rank operation to vectors
@@ -941,7 +940,7 @@ class NumDualDescriptorPM(nn.Module):
                     torch.cuda.empty_cache()
         
         self.mean_vector_count = total_vector_count / len(vector_seqs) if vector_seqs else 0
-        self.mean_t = (total_t / total_vector_count).cpu().numpy() if total_vector_count > 0 else np.zeros(self.m)
+        self.mean_t = (total_t / total_vector_count).cpu().numpy() if total_vector_count > 0 else np.zeros(self.vec_dim)
 
     def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
         """
@@ -976,12 +975,12 @@ class NumDualDescriptorPM(nn.Module):
         Returns the average of all N(k) vectors in the sequence
         """
         if len(vectors) == 0:
-            return [0.0] * self.m
+            return [0.0] * self.vec_dim
         
         # Extract and apply rank operation to vectors
         extracted_vectors = self.extract_vectors(vectors)
         if extracted_vectors.shape[0] == 0:
-            return [0.0] * self.m
+            return [0.0] * self.vec_dim
         
         k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
         
@@ -1079,7 +1078,7 @@ class NumDualDescriptorPM(nn.Module):
         
         # Pre-generate some candidate vectors
         num_candidates = 100
-        candidate_vectors = torch.randn(num_candidates, self.input_dim, device=self.device)
+        candidate_vectors = torch.randn(num_candidates, self.vec_dim, device=self.device)
         
         for k in range(num_windows):
             # Compute Nk for all candidate vectors at position k
@@ -1131,7 +1130,7 @@ if __name__=="__main__":
     
     print("="*50)
     print("Numerical Dual Descriptor PM - PyTorch GPU Accelerated Version")
-    print("Processes sequences of m-dimensional real vectors with 2D matrix P")
+    print("Processes sequences of m-dimensional real vectors with 2D matrix P")   
     print("="*50)
     
     # Set random seeds to ensure reproducibility
@@ -1140,16 +1139,14 @@ if __name__=="__main__":
     np.random.seed(11)
     
     # Parameters
-    input_dim = 10     # Dimension of input vectors
-    model_dim = 10      # Internal representation dimension
+    vec_dim = 10     # Dimension of input vectors and internal representation
     rank = 1          # Window size for vector sequences
     user_step = 1     # Step size for nonlinear mode
     
-    # Initialize the model (no num_basis parameter)
+    # Initialize the model (using vec_dim instead of input_dim and model_dim)
     ndd = NumDualDescriptorPM(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         mode='nonlinear', 
         user_step=user_step,
         device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -1157,10 +1154,10 @@ if __name__=="__main__":
     
     # Display device information
     print(f"\nUsing device: {ndd.device}")
-    print(f"Input dimension: {input_dim}")
-    print(f"Internal dimension: {model_dim}")
+    print(f"Vector dimension: {vec_dim}")
     print(f"Rank (window size): {rank}")
-    print(f"P matrix shape: {ndd.P.shape}")  # Should be [model_dim, model_dim]
+    print(f"P matrix shape: {ndd.P.shape}")  # Should be [vec_dim, vec_dim]
+    print(f"M matrix shape: {ndd.M.weight.shape}")  # Should be [vec_dim, vec_dim]
     
     # Generate 100 vector sequences with random target vectors
     print("\nGenerating training data...")
@@ -1168,10 +1165,10 @@ if __name__=="__main__":
     for _ in range(100):
         L = random.randint(200, 300)
         # Generate random vector sequence
-        seq = torch.randn(L, input_dim)
+        seq = torch.randn(L, vec_dim)
         seqs.append(seq)
         # Create a random vector target
-        t_list.append(np.random.uniform(-1.0, 1.0, model_dim))
+        t_list.append(np.random.uniform(-1.0, 1.0, vec_dim))
 
     # Training model
     print("\n" + "="*50)
@@ -1190,13 +1187,13 @@ if __name__=="__main__":
     
     # The predicted values and actual values used for correlation calculation
     corr_sum = 0.0
-    for i in range(ndd.m):
+    for i in range(ndd.vec_dim):
         actu_t = [t_vec[i] for t_vec in t_list]
         pred_t = [t_vec[i] for t_vec in pred_t_list]
         corr, _ = pearsonr(actu_t, pred_t)
         print(f"Dimension {i} prediction correlation: {corr:.4f}")
         corr_sum += corr
-    corr_avg = corr_sum / ndd.m
+    corr_avg = corr_sum / ndd.vec_dim
     print(f"Average correlation: {corr_avg:.4f}")         
    
     # Reconstruct representative sequences
@@ -1225,22 +1222,21 @@ if __name__=="__main__":
             L = random.randint(150, 250)
             if class_id == 0:
                 # Class 0: Vectors with positive mean
-                seq = torch.randn(L, input_dim) + 1.0
+                seq = torch.randn(L, vec_dim) + 1.0
             elif class_id == 1:
                 # Class 1: Vectors with negative mean
-                seq = torch.randn(L, input_dim) - 1.0
+                seq = torch.randn(L, vec_dim) - 1.0
             else:
                 # Class 2: Standard normal vectors
-                seq = torch.randn(L, input_dim)
+                seq = torch.randn(L, vec_dim)
             
             class_seqs.append(seq)
             class_labels.append(class_id)    
 
     # Initialize new model for classification
     ndd_cls = NumDualDescriptorPM(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         mode='nonlinear', 
         user_step=user_step,
         device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -1289,7 +1285,7 @@ if __name__=="__main__":
     labels = []
     for _ in range(100):
         L = random.randint(200, 300)
-        seq = torch.randn(L, input_dim)
+        seq = torch.randn(L, vec_dim)
         label_seqs.append(seq)
         # Create random binary labels (multi-label classification)
         # Each sequence can have 0-4 active labels
@@ -1298,9 +1294,8 @@ if __name__=="__main__":
 
     
     ndd_lbl = NumDualDescriptorPM(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         mode='nonlinear', 
         user_step=user_step,        
         device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -1361,7 +1356,7 @@ if __name__=="__main__":
     print("="*50)
     
     # Create a test sequence
-    test_seq = torch.randn(250, input_dim)
+    test_seq = torch.randn(250, vec_dim)
     print(f"Test sequence shape: {test_seq.shape}")
     
     # Predict labels
@@ -1383,9 +1378,8 @@ if __name__=="__main__":
     
     # Create a new model
     ndd_self = NumDualDescriptorPM(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         mode='nonlinear', 
         user_step=user_step,
         device='cuda' if torch.cuda.is_available() else 'cpu'
@@ -1395,7 +1389,7 @@ if __name__=="__main__":
     self_seqs = []
     for _ in range(10):
         L = random.randint(200, 300)
-        self_seqs.append(torch.randn(L, input_dim))
+        self_seqs.append(torch.randn(L, vec_dim))
     
     # Conduct self-consistency training
     print("\nTraining for self-consistency:")

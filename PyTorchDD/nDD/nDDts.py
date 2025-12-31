@@ -17,18 +17,31 @@ class NumDualDescriptorTS(nn.Module):
     Numerical Vector Dual Descriptor with GPU acceleration using PyTorch:
       - Processes sequences of m-dimensional real vectors instead of character sequences
       - tensor P ∈ R^{m×m×o} of basis coefficients
-      - mapping matrix M ∈ R^{m×m} for vector transformation
+      - mapping matrix M ∈ R^{m×m} for vector transformation (square matrix)
       - indexed periods: period[i,j,g] = i*(m*o) + j*o + g + 2
       - basis function phi_{i,j,g}(k) = cos(2π * k / period[i,j,g])
       - supports 'linear' or 'nonlinear' (step-by-rank) vector extraction
     """
-    def __init__(self, input_dim, model_dim=2, rank=1, rank_op='avg', rank_mode='drop', num_basis=5, mode='linear', user_step=None, device='cuda'):
+    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop', num_basis=5, mode='linear', user_step=None, device='cuda'):
+        """
+        Initialize the Numerical Dual Descriptor model.
+        
+        Args:
+            vec_dim: Dimension of input vectors and internal representation (square matrix)
+            rank: r-per/k-mer length
+            rank_op: 'avg', 'sum', 'pick', 'user_func'
+            rank_mode: 'pad' or 'drop'
+            num_basis: number of basis terms
+            mode: 'linear' or 'nonlinear'
+            user_step: custom step size for nonlinear mode
+            device: 'cuda' or 'cpu'
+        """
         super().__init__()
-        self.input_dim = input_dim    # Dimension of input vectors
+        self.vec_dim = vec_dim        # Dimension of input vectors and internal representation
         self.rank = rank              # r-per/k-mer length
         self.rank_op = rank_op        # 'avg', 'sum', 'pick', 'user_func'
         self.rank_mode = rank_mode    # 'pad' or 'drop'
-        self.m = model_dim            # embedding dimension
+        self.m = vec_dim              # embedding dimension (same as vec_dim)
         self.o = num_basis            # number of basis terms         
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
@@ -36,8 +49,8 @@ class NumDualDescriptorTS(nn.Module):
         self.trained = False
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        # Mapping matrix M for vector transformation (replaces token embeddings)
-        self.M = nn.Linear(self.input_dim, self.m, bias=False)
+        # Mapping matrix M for vector transformation
+        self.M = nn.Linear(self.vec_dim, self.vec_dim, bias=False)
         
         # Position-weight tensor P[i][j][g]
         self.P = nn.Parameter(torch.empty(self.m, self.m, self.o))
@@ -148,7 +161,7 @@ class NumDualDescriptorTS(nn.Module):
                 # Pad or drop based on rank_mode setting
                 if self.rank_mode == 'pad' and frag_len < self.rank:
                     # Pad fragment with zero vectors if shorter than rank
-                    padding = torch.zeros(self.rank - frag_len, self.input_dim, device=self.device)
+                    padding = torch.zeros(self.rank - frag_len, self.vec_dim, device=self.device)
                     frag = torch.cat([frag, padding], dim=0)
                     vector_groups.append(frag)
                 elif frag_len == self.rank:
@@ -163,7 +176,7 @@ class NumDualDescriptorTS(nn.Module):
             return torch.stack(vectors)
         else:
             # Return empty tensor with correct dimensions
-            return torch.empty(0, self.input_dim, device=self.device)
+            return torch.empty(0, self.vec_dim, device=self.device)
 
     def batch_compute_Nk(self, k_tensor, vectors):
         """
@@ -172,13 +185,13 @@ class NumDualDescriptorTS(nn.Module):
         
         Args:
             k_tensor: Tensor of position indices [batch_size]
-            vectors: Tensor of vectors [batch_size, input_dim]
+            vectors: Tensor of vectors [batch_size, vec_dim]
             
         Returns:
             Tensor of N(k) vectors [batch_size, m]
         """
         # Apply mapping matrix M to each vector
-        # vectors: [batch_size, input_dim]
+        # vectors: [batch_size, vec_dim]
         # After M transformation: [batch_size, m]
         x = self.M(vectors)  # [batch_size, m]
         
@@ -1081,7 +1094,7 @@ class NumDualDescriptorTS(nn.Module):
         
         # Pre-generate some candidate vectors
         num_candidates = 100
-        candidate_vectors = torch.randn(num_candidates, self.input_dim, device=self.device)
+        candidate_vectors = torch.randn(num_candidates, self.vec_dim, device=self.device)
         
         for k in range(num_windows):
             # Compute Nk for all candidate vectors at position k
@@ -1142,17 +1155,15 @@ if __name__=="__main__":
     np.random.seed(11)
     
     # Parameters
-    input_dim = 10     # Dimension of input vectors
-    model_dim = 10      # Internal representation dimension
-    num_basis = 5    # Number of basis functions
-    rank = 1          # Window size for vector sequences
-    user_step = 1     # Step size for nonlinear mode
+    vec_dim = 15        # Dimension of input vectors and internal representation
+    num_basis = 5       # Number of basis functions
+    rank = 1            # Window size for vector sequences
+    user_step = 1       # Step size for nonlinear mode
     
     # Initialize the model
     ndd = NumDualDescriptorTS(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,
@@ -1161,8 +1172,7 @@ if __name__=="__main__":
     
     # Display device information
     print(f"\nUsing device: {ndd.device}")
-    print(f"Input dimension: {input_dim}")
-    print(f"Internal dimension: {model_dim}")
+    print(f"Vector dimension: {vec_dim}")
     print(f"Rank (window size): {rank}")
     
     # Generate 100 vector sequences with random target vectors
@@ -1171,10 +1181,10 @@ if __name__=="__main__":
     for _ in range(100):
         L = random.randint(200, 300)
         # Generate random vector sequence
-        seq = torch.randn(L, input_dim)
+        seq = torch.randn(L, vec_dim)
         seqs.append(seq)
         # Create a random vector target
-        t_list.append(np.random.uniform(-1.0, 1.0, model_dim))
+        t_list.append(np.random.uniform(-1.0, 1.0, vec_dim))
 
     # Training model
     print("\n" + "="*50)
@@ -1228,22 +1238,21 @@ if __name__=="__main__":
             L = random.randint(150, 250)
             if class_id == 0:
                 # Class 0: Vectors with positive mean
-                seq = torch.randn(L, input_dim) + 1.0
+                seq = torch.randn(L, vec_dim) + 1.0
             elif class_id == 1:
                 # Class 1: Vectors with negative mean
-                seq = torch.randn(L, input_dim) - 1.0
+                seq = torch.randn(L, vec_dim) - 1.0
             else:
                 # Class 2: Standard normal vectors
-                seq = torch.randn(L, input_dim)
+                seq = torch.randn(L, vec_dim)
             
             class_seqs.append(seq)
             class_labels.append(class_id)    
 
     # Initialize new model for classification
     ndd_cls = NumDualDescriptorTS(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,
@@ -1255,7 +1264,7 @@ if __name__=="__main__":
     print("Starting Classification Training")
     print("="*50)
     history = ndd_cls.cls_train(class_seqs, class_labels, num_classes, 
-                               max_iters=50, tol=1e-8, learning_rate=0.05,
+                               max_iters=10, tol=1e-8, learning_rate=0.05,
                                decay_rate=0.99, batch_size=16, print_every=5)
     
     # Show prediction results on the training dataset
@@ -1293,7 +1302,7 @@ if __name__=="__main__":
     labels = []
     for _ in range(100):
         L = random.randint(200, 300)
-        seq = torch.randn(L, input_dim)
+        seq = torch.randn(L, vec_dim)
         label_seqs.append(seq)
         # Create random binary labels (multi-label classification)
         # Each sequence can have 0-4 active labels
@@ -1302,9 +1311,8 @@ if __name__=="__main__":
 
     
     ndd_lbl = NumDualDescriptorTS(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,        
@@ -1366,7 +1374,7 @@ if __name__=="__main__":
     print("="*50)
     
     # Create a test sequence
-    test_seq = torch.randn(250, input_dim)
+    test_seq = torch.randn(250, vec_dim)
     print(f"Test sequence shape: {test_seq.shape}")
     
     # Predict labels
@@ -1388,9 +1396,8 @@ if __name__=="__main__":
     
     # Create a new model
     ndd_self = NumDualDescriptorTS(
-        input_dim=input_dim,
+        vec_dim=vec_dim,
         rank=rank, 
-        model_dim=model_dim, 
         num_basis=num_basis, 
         mode='nonlinear', 
         user_step=user_step,
@@ -1401,7 +1408,7 @@ if __name__=="__main__":
     self_seqs = []
     for _ in range(10):
         L = random.randint(200, 300)
-        self_seqs.append(torch.randn(L, input_dim))
+        self_seqs.append(torch.randn(L, vec_dim))
     
     # Conduct self-consistency training
     print("\nTraining for self-consistency:")
