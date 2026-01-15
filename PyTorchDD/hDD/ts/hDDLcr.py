@@ -3,7 +3,7 @@
 # Combines character-level processing and hierarchical vector processing with Linker matrices
 # Modified to support variable-length sequences with adaptive Linker matrices
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-11-12
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-11-12 ~ 2026-1-12
 
 import math
 import random
@@ -612,7 +612,7 @@ class HierDDLtsC(nn.Module):
             target = output.mean(dim=1)  # Average over sequence length
             return target.squeeze(0).cpu().numpy()
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                    continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
                    checkpoint_file=None, checkpoint_interval=10):
         """
@@ -751,8 +751,8 @@ class HierDDLtsC(nn.Module):
         
         return history
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
                    checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training method for the hierarchical model with adaptive Linker matrices for variable-length sequences
@@ -763,7 +763,7 @@ class HierDDLtsC(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: 'gap' or 'reg' training mode
+            self_mode: 'gap' or 'reg' training mode
             decay_rate: Learning rate decay rate
             print_every: Print interval
             checkpoint_file: Path to save/load checkpoint file for resuming training
@@ -777,8 +777,8 @@ class HierDDLtsC(nn.Module):
             if len(seq) > self.max_input_seq_len:
                 raise ValueError(f"Sequence length {len(seq)} exceeds maximum allowed {self.max_input_seq_len}")
                 
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
@@ -793,7 +793,7 @@ class HierDDLtsC(nn.Module):
             history = checkpoint['history']
             start_iter = checkpoint['iteration'] + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
         else:
             if not continued:
                 self.reset_parameters()   
@@ -820,7 +820,7 @@ class HierDDLtsC(nn.Module):
                 char_output, actual_token_seq_len = self.char_sequence_to_tensor(seq)  # [1, token_seq_len, vec_dim]
                 char_seq_len = char_output.shape[1]
                 
-                if char_seq_len <= 1 and auto_mode == 'reg':
+                if char_seq_len <= 1 and self_mode == 'reg':
                     continue  # Skip sequences that are too short for reg mode
                 
                 # Forward pass through hierarchical layers with adaptive Linker matrices
@@ -831,7 +831,7 @@ class HierDDLtsC(nn.Module):
                 
                 hier_seq_len = hierarchical_output.shape[1]
                 
-                # Compute loss based on auto_mode
+                # Compute loss based on self_mode
                 seq_loss = 0.0
                 valid_positions = 0
                 
@@ -839,7 +839,7 @@ class HierDDLtsC(nn.Module):
                 min_seq_len = min(char_seq_len, hier_seq_len)
                 
                 for k in range(min_seq_len):
-                    if auto_mode == 'gap':
+                    if self_mode == 'gap':
                         # Self-consistency: output should match char layer output
                         target = char_output[0, k]
                         pred = hierarchical_output[0, k]
@@ -877,8 +877,8 @@ class HierDDLtsC(nn.Module):
             
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -1046,83 +1046,9 @@ class HierDDLtsC(nn.Module):
         else:
             self.mean_target = None
     
-    def reconstruct(self):
+    def reconstruct(self, L, tau=0.0):
         """
-        Reconstruct representative character sequence using the entire hierarchical model.
-        
-        This method leverages the complete model architecture including both the character layer
-        and all hierarchical layers with adaptive Linker matrices to reconstruct a sequence that best 
-        represents the learned patterns from the training data.
-        
-        Returns:
-            str: Reconstructed character sequence
-        """
-        assert self.trained, "Model must be trained first"
-        assert self.mean_target is not None, "Mean target vector must be computed first"
-        
-        # Determine sequence length based on training statistics
-        n_tokens = round(self.mean_token_count)
-        if n_tokens <= 0:
-            n_tokens = 10  # Default minimum length
-        
-        # Get the target vector from the final hierarchical layer output space
-        final_dim = self.model_dims[-1] if self.model_dims else self.vec_dim
-        
-        # Precompute all token embeddings
-        all_token_indices = torch.arange(len(self.tokens), device=self.device)
-        seq_tokens = []
-        
-        # Track current sequence state for hierarchical processing
-        current_sequence = ""
-        
-        for k in range(n_tokens):
-            best_tok = None
-            min_error = float('inf')
-            
-            # Evaluate each possible token at this position
-            for token_idx, token in enumerate(self.tokens):
-                # Build candidate sequence
-                candidate_seq = current_sequence + token
-                
-                # Don't pad - let the model handle variable length naturally
-                if len(candidate_seq) > self.max_input_seq_len:
-                    candidate_seq = candidate_seq[:self.max_input_seq_len]
-                
-                # Process through entire hierarchical model
-                with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
-                    
-                    # Get the prediction (average over sequence)
-                    if model_output.numel() > 0:
-                        pred_target = model_output.mean(dim=1).squeeze(0)
-                        
-                        # Compute error compared to mean target
-                        error = torch.sum((pred_target - self.mean_target) ** 2).item()
-                        
-                        if error < min_error:
-                            min_error = error
-                            best_tok = token
-            
-            # Add best token to sequence
-            if best_tok is not None:
-                seq_tokens.append(best_tok)
-                current_sequence = ''.join(seq_tokens)
-            else:
-                # Fallback: use character layer reconstruction
-                char_layer_recon = self.char_reconstruct()
-                return char_layer_recon
-        
-        reconstructed_seq = ''.join(seq_tokens)
-        
-        # Remove padding characters if present
-        if '_' in reconstructed_seq:
-            reconstructed_seq = reconstructed_seq.replace('_', '')
-        
-        return reconstructed_seq[:self.max_input_seq_len]  # Ensure doesn't exceed maximum length
-
-    def generate(self, L, tau=0.0):
-        """
-        Generate character sequence of length L using the entire hierarchical model.
+        Reconstruct character sequence of length L using the entire hierarchical model.
         
         This method uses temperature-controlled sampling based on the complete model's
         predictions, incorporating both character-level and hierarchical patterns with adaptive Linker matrices.
@@ -1489,13 +1415,13 @@ if __name__ == "__main__":
     print("Gradient Descent Training with Variable-Length Sequences")
     print("="*50)
     
-    gd_history = model.grad_train(
+    reg_history = model.reg_train(
         seqs, t_list,
         max_iters=50,  # Reduced for demonstration
         learning_rate=0.01,
         decay_rate=0.98,
         print_every=5,
-        batch_size=8,   # Smaller batch size for variable lengths
+        batch_size=256,   # Smaller batch size for variable lengths
         checkpoint_file='hierddltsc_var_gd_checkpoint.pth',
         checkpoint_interval=10
     )
@@ -1525,41 +1451,30 @@ if __name__ == "__main__":
     print("Sequence Reconstruction with Variable-Length Support")
     print("="*50)
     
-    reconstructed_seq = model.reconstruct()
-    print(f"Reconstructed sequence (length {len(reconstructed_seq)}):")
-    print(f"First 100 chars: {reconstructed_seq[:100]}")
+    # Deterministic reconstruction
+    det_seq = model.reconstruct(L=100, tau=0.0)
+    print(f"Deterministic reconstruction (tau=0.0): {det_seq[:50]}...")
+    
+    # Stochastic reconstruction
+    stoch_seq = model.reconstruct(L=100, tau=0.5)
+    print(f"Stochastic reconstruction (tau=0.5): {stoch_seq[:50]}...")
     
     # Character-level reconstruction
     char_reconstructed_seq = model.char_reconstruct()
     print(f"Character-level reconstructed sequence (length {len(char_reconstructed_seq)}):")
     print(f"First 100 chars: {char_reconstructed_seq[:100]}")
     
-    # Sequence generation with variable-length support
-    print("\n" + "="*50)
-    print("Sequence Generation with Variable-Length Support")
-    print("="*50)
-    
-    # Generate sequences of different lengths
-    for length in [50, 100, 150]:
-        # Deterministic generation
-        det_seq = model.generate(L=length, tau=0.0)
-        print(f"Deterministic generation (length {length}, tau=0.0): {det_seq[:50]}...")
-        
-        # Stochastic generation
-        stoch_seq = model.generate(L=length, tau=0.5)
-        print(f"Stochastic generation (length {length}, tau=0.5): {stoch_seq[:50]}...")
-    
     # Character-level generation
     char_gen_seq = model.char_generate(L=80, tau=0.2)
     print(f"Character-level generation (tau=0.2): {char_gen_seq}")
     
-    # Auto-training example with variable-length sequences
+    # Self-training example with variable-length sequences
     print("\n" + "="*50)
-    print("Auto-Training Example with Variable-Length Sequences")
+    print("Self-Training Example with Variable-Length Sequences")
     print("="*50)
     
-    # Create a new model for auto-training
-    auto_model = HierDDLtsC(
+    # Create a new model for self-training
+    self_model = HierDDLtsC(
         charset=charset,
         rank=rank,
         vec_dim=vec_dim,
@@ -1574,21 +1489,21 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Auto-train in gap mode with variable-length sequences
-    print("\nAuto-training in 'gap' mode with variable-length sequences...")
-    auto_history_gap = auto_model.auto_train(
+    # Self-train in gap mode with variable-length sequences
+    print("\nSelf-training in 'gap' mode with variable-length sequences...")
+    self_history_gap = self_model.self_train(
         seqs[:20],  # Use subset for faster demonstration
         max_iters=10,
         learning_rate=0.01,
-        auto_mode='gap',
+        self_mode='gap',
         print_every=2,
-        checkpoint_file='hierddltsc_var_auto_checkpoint.pth',
+        checkpoint_file='hierddltsc_var_self_checkpoint.pth',
         checkpoint_interval=5
     )
     
-    # Generate from auto-trained model
-    auto_gen_seq = auto_model.generate(L=80, tau=0.2)
-    print(f"Generated from auto-trained model: {auto_gen_seq}")
+    # Reconstruct from self-trained model
+    self_rec_seq = self_model.reconstruct(L=80, tau=0.2)
+    print(f"Reconstructed from self-trained model: {self_rec_seq}")
     
     # Model save and load test
     print("\n" + "="*50)
@@ -1619,18 +1534,18 @@ if __name__ == "__main__":
         else:
             print("  ✗ Prediction consistency test FAILED")
     
-    # Test generation consistency
+    # Test reconstruction consistency
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    original_gen = model.generate(L=50, tau=0.1)
+    original_rec = model.reconstruct(L=50, tau=0.1)
     
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    loaded_gen = loaded_model.generate(L=50, tau=0.1)
+    loaded_rec = loaded_model.reconstruct(L=50, tau=0.1)
     
-    if original_gen == loaded_gen:
-        print("✓ Generation consistency test PASSED")
+    if original_rec == loaded_rec:
+        print("✓ Reconstruction consistency test PASSED")
     else:
-        print("✗ Generation consistency test FAILED")
-        print(f"Original: {original_gen}")
-        print(f"Loaded:   {loaded_gen}")
+        print("✗ Reconstruction consistency test FAILED")
+        print(f"Original: {original_rec}")
+        print(f"Loaded:   {loaded_rec}")
     
     print("\nAll tests with variable-length sequences completed successfully!")
