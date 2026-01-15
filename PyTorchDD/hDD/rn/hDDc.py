@@ -2,7 +2,7 @@
 # Hierarchical Dual Descriptor (Random AB matrix form) and Character Sequence Input (HierDDrnC)
 # Combines character-level processing and hierarchical vector processing
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11 ~ 2026-1-13
 
 import math
 import random
@@ -209,6 +209,42 @@ class HierDDrnC(nn.Module):
         """Convert list of tokens to tensor of indices"""
         return torch.tensor([self.token_to_idx[tok] for tok in token_list], device=self.device)
     
+    def batch_token_indices(self, seqs):
+        """
+        Optimization: Convert a batch of strings to indices tensor in one go.
+        Performs tokenization on CPU using list comprehensions (fast for strings)
+        then moves to target device as a single tensor.
+        
+        Args:
+            seqs (list): List of strings.
+        
+        Returns:
+            Tensor: LongTensor of shape [batch_size, token_seq_len]
+        """
+        all_indices = []
+        
+        for seq in seqs:
+            toks = self.extract_tokens(seq)
+            all_indices.append([self.token_to_idx[t] for t in toks])
+        
+        if not all_indices:
+            return torch.zeros((len(seqs), 0), dtype=torch.long, device=self.device)
+        
+        # Find max length for padding
+        max_len = max(len(indices) for indices in all_indices)
+        
+        # Pad sequences to same length
+        padded_indices = []
+        for indices in all_indices:
+            if len(indices) < max_len:
+                # Pad with 0 (index of first token)
+                padded = indices + [0] * (max_len - len(indices))
+            else:
+                padded = indices
+            padded_indices.append(padded)
+        
+        return torch.tensor(padded_indices, dtype=torch.long, device=self.device)
+    
     def extract_tokens(self, seq):
         """
         Extract k-mer tokens from a character sequence based on tokenization mode.
@@ -249,55 +285,62 @@ class HierDDrnC(nn.Module):
                     toks.append(frag)
         return toks
 
-    def char_batch_compute_Nk(self, token_indices):
+    def char_forward(self, token_indices):
         """
-        Vectorized computation of N(k) vectors for a batch of tokens using random AB matrix form
-        Args:
-            token_indices: Tensor of token indices [batch_size]
-        Returns:
-            Tensor of N(k) vectors [batch_size, vec_dim]
-        """
-        batch_size = token_indices.shape[0]
+        Optimization: Vectorized computation of N(k) vectors for a BATCH of sequences.
         
-        # Get embeddings for all tokens [batch_size, vec_dim]
+        Args:
+            token_indices: Tensor of token indices [batch_size, seq_len]
+        Returns:
+            Tensor of N(k) vectors [batch_size, seq_len, vec_dim]
+        """
+        batch_size, seq_len = token_indices.shape
+        
+        # Get embeddings: [batch_size, seq_len, vec_dim]
         x = self.char_embedding(token_indices)
         
-        # Linear transformation
+        # Linear transformation (broadcasts over batch and seq)
         transformed = self.char_linear(x)
         
         # Apply layer normalization
         normalized = torch.nn.functional.layer_norm(transformed, (self.vec_dim,))
         
         # Compute basis indices: j = k % basis_dim for each position
-        seq_len = batch_size  # Each token is at a different position
-        j_indices = torch.arange(seq_len) % self.char_basis_dim
-        j_indices = j_indices.to(self.device)
+        # Optimization: Pre-compute/broadcast indices. Same for all batches.
+        j_indices = torch.arange(seq_len, device=self.device) % self.char_basis_dim
         
         # Select basis vectors: (seq_len, vec_dim)
         B_vectors = self.char_Bbasis[j_indices]
         
         # Compute scalars: dot product of normalized and B_vectors
-        scalars = torch.einsum('bd,bd->b', normalized, B_vectors)
+        # Optimization: einsum over batch(b), seq(s), dim(d)
+        # normalized [b, s, d], B_vectors [s, d] -> scalars [b, s]
+        scalars = torch.einsum('bsd,sd->bs', normalized, B_vectors)
         
         # Select coefficient vectors: (seq_len, vec_dim)
+        # Acoeff [dim, basis_dim] -> select cols based on j_indices -> [dim, seq_len] -> transpose -> [seq_len, dim]
         A_vectors = self.char_Acoeff[:, j_indices].t()
         
         # Compute new features: scalars * A_vectors
-        Nk = scalars.unsqueeze(1) * A_vectors
+        # scalars [b, s] -> [b, s, 1]
+        # A_vectors [s, d] -> broadcast to [b, s, d]
+        Nk = scalars.unsqueeze(2) * A_vectors.unsqueeze(0)
             
         return Nk
+
+    def char_batch_compute_Nk(self, token_indices):
+        """Wrapper for old 1D calls -> delegates to vectorized implementation"""
+        if token_indices.dim() == 1:
+            return self.char_forward(token_indices.unsqueeze(0)).squeeze(0)
+        return self.char_forward(token_indices)
 
     def char_describe(self, seq):
         """Compute N(k) vectors for each k-mer in sequence (character-level processing)"""
         toks = self.extract_tokens(seq)
         if not toks:
             return []
-        
-        token_indices = self.token_to_indices(toks)
-        
-        # Batch compute all Nk vectors
-        N_batch = self.char_batch_compute_Nk(token_indices)
-        return N_batch.detach().cpu().numpy()
+        token_indices = torch.tensor([self.token_to_idx[tok] for tok in toks], device=self.device)
+        return self.char_batch_compute_Nk(token_indices).detach().cpu().numpy()
 
     def char_reconstruct(self):
         """Reconstruct representative sequence by minimizing error (character-level)"""
@@ -306,25 +349,30 @@ class HierDDrnC(nn.Module):
         mean_t_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
         seq_tokens = []
         
-        # Precompute all token embeddings
         all_token_indices = torch.arange(len(self.tokens), device=self.device)
         
         for k in range(n_tokens):
-            # We need to simulate the position for each token
-            # For AB matrix, position affects basis selection via j = k % basis_dim
-            # So we create a batch with the same position for all tokens
-            position_specific_indices = all_token_indices  # All tokens at this position
+            # Manual computation for efficiency
+            emb = self.char_embedding(all_token_indices) # [NumTokens, Dim]
+            trans = self.char_linear(emb)
+            norm = torch.nn.functional.layer_norm(trans, (self.vec_dim,))
             
-            # Compute Nk for all tokens at position k
-            Nk_all = self.char_batch_compute_Nk(position_specific_indices)
+            # Basis at position k
+            j = k % self.char_basis_dim
+            B_vec = self.char_Bbasis[j] # [Dim]
+            scalar = torch.matmul(norm, B_vec) # [NumTokens]
             
-            # Compute errors
-            errors = torch.sum((Nk_all - mean_t_tensor) ** 2, dim=1)
+            A_vec = self.char_Acoeff[:, j] # [Dim]
+            Nk_candidates = scalar.unsqueeze(1) * A_vec.unsqueeze(0) # [NumTokens, Dim]
+            
+            errors = torch.sum((Nk_candidates - mean_t_tensor) ** 2, dim=1)
             min_idx = torch.argmin(errors).item()
-            best_tok = self.idx_to_token[min_idx]
-            seq_tokens.append(best_tok)
+            seq_tokens.append(self.idx_to_token[min_idx])
             
-        return ''.join(seq_tokens)
+        reconstructed_seq = ''.join(seq_tokens)
+        if '_' in reconstructed_seq:
+            reconstructed_seq = reconstructed_seq.replace('_', '')
+        return reconstructed_seq
 
     def char_generate(self, L, tau=0.0):
         """Generate sequence of length L with temperature-controlled randomness (character-level)"""
@@ -335,76 +383,69 @@ class HierDDrnC(nn.Module):
         num_blocks = (L + self.rank - 1) // self.rank
         mean_t_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
         generated_tokens = []
-        
-        # Precompute all token embeddings
         all_token_indices = torch.arange(len(self.tokens), device=self.device)
         
         for k in range(num_blocks):
-            # Compute Nk for all tokens at position k
-            position_specific_indices = all_token_indices
-            Nk_all = self.char_batch_compute_Nk(position_specific_indices)
+            # Fast manual compute for position k
+            emb = self.char_embedding(all_token_indices)
+            trans = self.char_linear(emb)
+            norm = torch.nn.functional.layer_norm(trans, (self.vec_dim,))
             
-            # Compute scores
-            errors = torch.sum((Nk_all - mean_t_tensor) ** 2, dim=1)
-            scores = -errors  # Convert to score (higher = better)
+            j = k % self.char_basis_dim
+            B_vec = self.char_Bbasis[j]
+            scalar = torch.matmul(norm, B_vec)
+            A_vec = self.char_Acoeff[:, j]
+            Nk_candidates = scalar.unsqueeze(1) * A_vec.unsqueeze(0)
             
-            if tau == 0:  # Deterministic selection
+            errors = torch.sum((Nk_candidates - mean_t_tensor) ** 2, dim=1)
+            scores = -errors
+            
+            if tau == 0:
                 max_idx = torch.argmax(scores).item()
-                best_tok = self.idx_to_token[max_idx]
-                generated_tokens.append(best_tok)
-            else:  # Stochastic selection
+                generated_tokens.append(self.idx_to_token[max_idx])
+            else:
                 probs = torch.softmax(scores / tau, dim=0).detach().cpu().numpy()
-                chosen_idx = random.choices(range(len(self.tokens)), weights=probs, k=1)[0]
-                chosen_tok = self.idx_to_token[chosen_idx]
-                generated_tokens.append(chosen_tok)
+                chosen_idx = np.random.choice(len(self.tokens), p=probs)
+                generated_tokens.append(self.idx_to_token[chosen_idx])
                 
         full_seq = ''.join(generated_tokens)
+        if '_' in full_seq:
+            full_seq = full_seq.replace('_', '')
         return full_seq[:L]
     
-    def char_sequence_to_tensor(self, seq):
-        """
-        Convert character sequence to tensor representation through char layer
-        
-        Args:
-            seq (str): Input character sequence
-            
-        Returns:
-            Tensor: Sequence tensor of shape [1, seq_len, vec_dim]
-        """
-        toks = self.extract_tokens(seq)
-        if not toks:
-            return torch.zeros((1, 0, self.vec_dim), device=self.device)
-        
-        token_indices = self.token_to_indices(toks)
-        
-        # Compute N(k) vectors through char layer
-        Nk_batch = self.char_batch_compute_Nk(token_indices)
-        
-        # Add batch dimension
-        return Nk_batch.unsqueeze(0)  # [1, seq_len, vec_dim]
+    def batch_sequence_to_tensor(self, seqs):
+        """Helper to go from strings -> token indices -> char layer output"""
+        indices = self.batch_token_indices(seqs) # [Batch, SeqLen]
+        return self.char_forward(indices) # [Batch, SeqLen, Dim]
     
-    def forward(self, seq):
+    def forward(self, input_data):
         """
-        Forward pass through entire hierarchical model
+        Forward pass through entire hierarchical model.
+        Optimization: Accepts either raw strings OR pre-computed token indices.
+        Process inputs as a batch directly.
         
         Args:
-            seq (str or list): Input character sequence(s)
-            
-        Returns:
-            Tensor: Output of shape [batch_size, seq_len, final_dim]
+            input_data: List of strings OR Tensor of token indices [Batch, SeqLen]
         """
-        if isinstance(seq, str):
-            # Single sequence
-            x = self.char_sequence_to_tensor(seq)
+        # Handle input types
+        if isinstance(input_data, list):
+            # Batch of strings
+            token_indices = self.batch_token_indices(input_data)
+        elif isinstance(input_data, torch.Tensor):
+            # Indices tensor (already on device or needs move)
+            token_indices = input_data.to(self.device)
+            if token_indices.dim() == 1: # Single sequence case
+                token_indices = token_indices.unsqueeze(0)
+        elif isinstance(input_data, str):
+            # Single string
+            token_indices = self.batch_token_indices([input_data])
         else:
-            # Multiple sequences - process each separately and stack
-            batch_tensors = []
-            for s in seq:
-                tensor_seq = self.char_sequence_to_tensor(s)
-                batch_tensors.append(tensor_seq.squeeze(0))
-            x = torch.stack(batch_tensors)  # [batch_size, seq_len, vec_dim]
+            raise TypeError("Input must be list of strings, single string, or Tensor")
+            
+        # 1. Character Layer Forward (Vectorized)
+        x = self.char_forward(token_indices) # [Batch, SeqLen, Dim]
         
-        # Pass through hierarchical layers
+        # 2. Hierarchical Layers Forward
         for layer in self.hierarchical_layers:
             x = layer(x)
             
@@ -426,7 +467,7 @@ class HierDDrnC(nn.Module):
             target = output.mean(dim=1)  # Average over sequence length
             return target.squeeze(0).cpu().numpy()
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                    continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
                    checkpoint_file=None, checkpoint_interval=10):
         """
@@ -468,7 +509,10 @@ class HierDDrnC(nn.Module):
             history = []
         
         # Convert target vectors to tensor
-        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
+        t_tensors = torch.tensor(t_list, dtype=torch.float32, device='cpu')
+        
+        # Pre-process data: convert strings to indices on CPU
+        all_indices = self.batch_token_indices(seqs)  # On CPU
         
         # Set up optimizer (train all parameters including char layer)
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
@@ -483,39 +527,38 @@ class HierDDrnC(nn.Module):
         
         for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_sequences = 0
+            num_samples = len(seqs)
             
-            # Process sequences in random order
-            indices = list(range(len(seqs)))
-            random.shuffle(indices)
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
             
-            for i in range(0, len(indices), batch_size):
-                batch_indices = indices[i:i+batch_size]
-                batch_seqs = [seqs[idx] for idx in batch_indices]
-                batch_targets = [t_tensors[idx] for idx in batch_indices]
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_indices = all_indices[batch_idx].to(self.device)
+                batch_t = t_tensors[batch_idx].to(self.device) # [B, TargetDim]
                 
                 optimizer.zero_grad()
-                batch_loss = 0.0
                 
-                for seq, target in zip(batch_seqs, batch_targets):
-                    # Forward pass
-                    output = self.forward(seq)  # [1, seq_len, final_dim]
-                    pred_target = output.mean(dim=1).squeeze(0)  # [final_dim]
-                    
-                    # Compute loss
-                    loss = torch.sum((pred_target - target) ** 2)
-                    batch_loss += loss
+                # Single forward pass for the whole batch
+                output = self.forward(batch_indices) # [B, SeqLen, OutDim]
                 
-                # Average loss over batch
-                batch_loss = batch_loss / len(batch_seqs)
-                batch_loss.backward()
+                # Vectorized Loss Calculation
+                # Mean over sequence dimension
+                pred_target = output.mean(dim=1) # [B, OutDim]
+                
+                # Sum of squared errors (sum over dim, sum over batch)
+                loss = torch.sum((pred_target - batch_t) ** 2)
+                
+                # Normalize loss for backward pass
+                loss = loss / len(batch_idx)
+                
+                loss.backward()
                 optimizer.step()
                 
-                total_loss += batch_loss.item() * len(batch_seqs)
-                total_sequences += len(batch_seqs)
+                total_loss += loss.item() * len(batch_idx)
             
             # Average loss over epoch
-            avg_loss = total_loss / total_sequences
+            avg_loss = total_loss / num_samples
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -543,7 +586,7 @@ class HierDDrnC(nn.Module):
                 break
             prev_loss = avg_loss
 
-            #if it % 5 == 0:  # Decay every 5 iterations
+            # Decay learning rate every iteration
             scheduler.step()
 
         # If training ended without convergence, restore best model state
@@ -559,11 +602,11 @@ class HierDDrnC(nn.Module):
         
         return history
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
-                   checkpoint_file=None, checkpoint_interval=5):
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                   batch_size=256, checkpoint_file=None, checkpoint_interval=5):
         """
-        Self-training method for the hierarchical model
+        Self-training method for the hierarchical model with batch processing
         
         Args:
             seqs: List of character sequences
@@ -571,17 +614,18 @@ class HierDDrnC(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: 'gap' or 'reg' training mode
+            self_mode: 'gap' or 'reg' training mode
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            batch_size: Batch size for training
             checkpoint_file: Path to save/load checkpoint file for resuming training
             checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
         """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
@@ -596,11 +640,15 @@ class HierDDrnC(nn.Module):
             history = checkpoint['history']
             start_iter = checkpoint['iteration'] + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
         else:
             if not continued:
                 self.reset_parameters()   
             history = []
+        
+        # Pre-process data: convert strings to indices on CPU
+        all_indices = self.batch_token_indices(seqs)
+        num_samples = len(seqs)
         
         # Set up optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
@@ -615,56 +663,64 @@ class HierDDrnC(nn.Module):
         
         for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_samples = 0
             
-            # Process each sequence
-            for seq in seqs:
-                # Convert to tensor through char layer
-                char_output = self.char_sequence_to_tensor(seq)  # [1, seq_len, vec_dim]
-                seq_len = char_output.shape[1]
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
+            
+            # Process each batch
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_indices = all_indices[batch_idx].to(self.device)
                 
-                if seq_len <= 1 and auto_mode == 'reg':
-                    continue  # Skip sequences that are too short for reg mode
+                optimizer.zero_grad()
                 
-                # Forward pass through hierarchical layers
-                hierarchical_output = char_output
+                # 1. Compute Char Output (Target for Gap/Reg)
+                char_output = self.char_forward(batch_indices) # [B, S_char, D]
+                
+                # 2. Compute Hierarchical Output
+                hier_out = char_output
                 for layer in self.hierarchical_layers:
-                    hierarchical_output = layer(hierarchical_output)
+                    hier_out = layer(hier_out) # [B, S_hier, D_hier]
                 
-                # Compute loss based on auto_mode
-                seq_loss = 0.0
-                valid_positions = 0
+                # 3. Vectorized Loss Calculation
+                loss = 0.0
                 
-                for k in range(seq_len):
-                    if auto_mode == 'gap':
-                        # Self-consistency: output should match char layer output
-                        target = char_output[0, k]
-                        pred = hierarchical_output[0, k]
-                        seq_loss += torch.sum((pred - target) ** 2)
-                        valid_positions += 1
-                    else:  # 'reg' mode
-                        if k < seq_len - 1:
-                            # Predict next position's char layer output
-                            target = char_output[0, k + 1]
-                            pred = hierarchical_output[0, k]
-                            seq_loss += torch.sum((pred - target) ** 2)
-                            valid_positions += 1
+                # Determine valid comparison length
+                # S_char might be different from S_hier if layers change sequence length
+                min_len = min(char_output.shape[1], hier_out.shape[1])
                 
-                if valid_positions > 0:
-                    seq_loss = seq_loss / valid_positions
-                    total_loss += seq_loss.item()
-                    total_samples += 1
+                if self_mode == 'gap':
+                    # ||Hier[k] - Char[k]||^2
+                    # Slicing up to min_len
+                    diff = hier_out[:, :min_len, :] - char_output[:, :min_len, :]
+                    # Mean over dim and valid length, Sum over batch
+                    sq_diff = torch.sum(diff ** 2, dim=-1) # [B, S_valid]
+                    loss = torch.sum(torch.mean(sq_diff, dim=1)) # Sum of means
                     
-                    # Backward pass
-                    optimizer.zero_grad()
-                    seq_loss.backward()
-                    optimizer.step()
-            
-            if total_samples == 0:
-                avg_loss = 0.0
-            else:
-                avg_loss = total_loss / total_samples
+                else: # 'reg' mode
+                    # Predict next: Hier[k] vs Char[k+1]
+                    if min_len > 1:
+                        # Targets: Char 1 to min_len
+                        targets = char_output[:, 1:min_len, :]
+                        # Preds: Hier 0 to min_len-1
+                        preds = hier_out[:, 0:min_len-1, :]
+                        
+                        diff = preds - targets
+                        sq_diff = torch.sum(diff ** 2, dim=-1)
+                        loss = torch.sum(torch.mean(sq_diff, dim=1))
+                    else:
+                        loss = torch.tensor(0.0, device=self.device)
+
+                batch_loss_scalar = loss.item()
                 
+                # Normalize by batch size for gradient step
+                if batch_loss_scalar > 0:
+                    (loss / len(batch_idx)).backward()
+                    optimizer.step()
+                
+                total_loss += batch_loss_scalar
+
+            avg_loss = total_loss / num_samples
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -674,8 +730,8 @@ class HierDDrnC(nn.Module):
             
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -694,7 +750,8 @@ class HierDDrnC(nn.Module):
                 break
             prev_loss = avg_loss
 
-            if it % 5 == 0:  # Decay every 5 iterations
+            # Decay every 5 iterations (as per original logic)
+            if it % 5 == 0: 
                 scheduler.step()
 
         # If training ended without convergence, restore best model state
@@ -754,38 +811,30 @@ class HierDDrnC(nn.Module):
         torch.save(checkpoint, checkpoint_file)
         #print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
 
-    def _compute_training_statistics(self, seqs, batch_size=50):
+    def _compute_training_statistics(self, seqs, batch_size=256):
         """Compute and store statistics for reconstruction and generation"""
-        total_token_count = 0
-        total_vec_sum = torch.zeros(self.vec_dim, device=self.device)
+        all_indices = self.batch_token_indices(seqs)
         
         with torch.no_grad():
+            total_vec_sum = torch.zeros(self.vec_dim, device=self.device)
+            total_token_count = 0
+            
             for i in range(0, len(seqs), batch_size):
-                batch_seqs = seqs[i:i+batch_size]
-                batch_token_count = 0
-                batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
+                batch_indices = all_indices[i:i+batch_size].to(self.device)
                 
-                for seq in batch_seqs:
-                    toks = self.extract_tokens(seq)
-                    if not toks:
-                        continue
-                        
-                    batch_token_count += len(toks)
-                    token_indices = self.token_to_indices(toks)
-                    
-                    Nk_batch = self.char_batch_compute_Nk(token_indices)
-                    batch_vec_sum += Nk_batch.sum(dim=0)
+                # Get char layer output [B, S, D]
+                nk_batch = self.char_forward(batch_indices)
                 
-                total_token_count += batch_token_count
-                total_vec_sum += batch_vec_sum
+                # Sum over Batch and Sequence dim
+                total_vec_sum += nk_batch.sum(dim=[0, 1])
                 
-                # Clean batch
-                del batch_vec_sum
+                # Count tokens
+                total_token_count += batch_indices.shape[0] * batch_indices.shape[1]
         
         self.mean_token_count = total_token_count / len(seqs) if seqs else 0
         self.mean_t = (total_vec_sum / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.vec_dim)
 
-    def _compute_hierarchical_mean_target(self, seqs, batch_size=32):
+    def _compute_hierarchical_mean_target(self, seqs, batch_size=256):
         """
         Compute the mean target vector in the final hierarchical layer output space
         This represents the average pattern learned by the entire hierarchical model
@@ -798,129 +847,48 @@ class HierDDrnC(nn.Module):
         total_output = torch.zeros(final_dim, device=self.device)
         total_sequences = 0
         
+        all_indices = self.batch_token_indices(seqs)
+        
         with torch.no_grad():
-            # Batch processing sequences
             for i in range(0, len(seqs), batch_size):
-                batch_seqs = seqs[i:i+batch_size]
-                batch_outputs = []
-                
-                for seq in batch_seqs:
-                    try:
-                        output = self.forward(seq)
-                        if output.numel() > 0:
-                            seq_output = output.mean(dim=1).squeeze(0)
-                            batch_outputs.append(seq_output)
-                    except RuntimeError as e:
-                        # Handle the situation of insufficient memory
-                        if "out of memory" in str(e):
-                            print(f"Warning: The sequence is too long, resulting in insufficient memory. Skip the sequence: {seq[:50]}...")
-                            continue
-                        else:
-                            raise e
-                
-                if batch_outputs:
-                    # Immediately accumulate and release the batch memory
-                    batch_tensor = torch.stack(batch_outputs)
-                    total_output += batch_tensor.sum(dim=0)
-                    total_sequences += len(batch_outputs)
+                batch_indices = all_indices[i:i+batch_size].to(self.device)
+                try:
+                    output = self.forward(batch_indices) # [B, S_out, D_out]
                     
-                    # Clean batches
-                    del batch_tensor, batch_outputs
-                
-                # Optional: Regularly clean the GPU cache
-                if torch.cuda.is_available() and (i // batch_size) % 10 == 0:
-                    torch.cuda.empty_cache()
+                    # Mean over sequence, Sum over batch
+                    # Mean over seq: [B, D_out]
+                    batch_means = output.mean(dim=1)
+                    total_output += batch_means.sum(dim=0)
+                    total_sequences += batch_indices.shape[0]
+                    
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        print(f"Warning: OOM in mean target compute. Batch {i}")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
         
         if total_sequences > 0:
             self.mean_target = total_output / total_sequences
         else:
             self.mean_target = None
     
-    def reconstruct(self):
+    def reconstruct(self, L, tau=0.0):
         """
         Reconstruct representative character sequence using the entire hierarchical model.
         
-        This method leverages the complete model architecture including both the character layer
-        and all hierarchical layers to reconstruct a sequence that best represents the learned
-        patterns from the training data.
-        
-        Returns:
-            str: Reconstructed character sequence
-        """
-        assert self.trained, "Model must be trained first"
-        assert self.mean_target is not None, "Mean target vector must be computed first"
-        
-        # Determine sequence length based on training statistics
-        n_tokens = round(self.mean_token_count)
-        if n_tokens <= 0:
-            n_tokens = 10  # Default minimum length
-        
-        # Get the target vector from the final hierarchical layer output space
-        final_dim = self.model_dims[-1] if self.model_dims else self.vec_dim
-        
-        # Precompute all token embeddings
-        all_token_indices = torch.arange(len(self.tokens), device=self.device)
-        seq_tokens = []
-        
-        # Track current sequence state for hierarchical processing
-        current_sequence = ""
-        
-        for k in range(n_tokens):
-            best_tok = None
-            min_error = float('inf')
-            
-            # Evaluate each possible token at this position
-            for token_idx, token in enumerate(self.tokens):
-                # Build candidate sequence
-                candidate_seq = current_sequence + token
-                
-                # Process through entire hierarchical model
-                with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
-                    
-                    # Get the prediction (average over sequence)
-                    if model_output.numel() > 0:
-                        pred_target = model_output.mean(dim=1).squeeze(0)
-                        
-                        # Compute error compared to mean target
-                        error = torch.sum((pred_target - self.mean_target) ** 2).item()
-                        
-                        if error < min_error:
-                            min_error = error
-                            best_tok = token
-            
-            # Add best token to sequence
-            if best_tok is not None:
-                seq_tokens.append(best_tok)
-                current_sequence = ''.join(seq_tokens)
-            else:
-                # Fallback: use character layer reconstruction
-                char_layer_recon = self.char_reconstruct()
-                return char_layer_recon
-        
-        reconstructed_seq = ''.join(seq_tokens)
-        
-        # Remove padding characters if present
-        if '_' in reconstructed_seq:
-            reconstructed_seq = reconstructed_seq.replace('_', '')
-        
-        return reconstructed_seq
-
-    def generate(self, L, tau=0.0):
-        """
-        Generate character sequence of length L using the entire hierarchical model.
-        
-        This method uses temperature-controlled sampling based on the complete model's
-        predictions, incorporating both character-level and hierarchical patterns.
+        This method generates a sequence of length L that best represents the learned
+        patterns from the training data, using temperature-controlled sampling.
         
         Args:
-            L (int): Length of sequence to generate
+            L (int): Length of sequence to reconstruct
             tau (float): Temperature parameter for stochastic sampling.
                         tau=0: deterministic (greedy) selection
                         tau>0: stochastic selection with temperature
             
         Returns:
-            str: Generated character sequence
+            str: Reconstructed character sequence
         """
         assert self.trained, "Model must be trained first"
         assert self.mean_target is not None, "Mean target vector must be computed first"
@@ -936,6 +904,7 @@ class HierDDrnC(nn.Module):
         # Generate sequence token by token
         while len(generated_sequence) < L:
             candidate_scores = {}
+            valid_tokens = []
             
             # Evaluate each possible token
             for token in self.tokens:
@@ -945,40 +914,41 @@ class HierDDrnC(nn.Module):
                 if len(candidate_seq) > L:
                     continue
                     
-                with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
-                    
-                    if model_output.numel() > 0:
-                        pred_target = model_output.mean(dim=1).squeeze(0)
-                        error = torch.sum((pred_target - self.mean_target) ** 2).item()
-                        score = -error  # Convert error to score (higher = better)
-                        candidate_scores[token] = score
+                valid_tokens.append(token)
             
-            if not candidate_scores:
+            if not valid_tokens:
                 # No valid candidates, use character layer as fallback
                 char_layer_gen = self.char_generate(L - len(generated_sequence), tau)
                 generated_sequence += char_layer_gen
                 break
             
-            # Select token based on temperature
-            tokens = list(candidate_scores.keys())
-            scores = list(candidate_scores.values())
+            # Create batch of candidate sequences
+            candidate_seqs = [generated_sequence + token for token in valid_tokens]
             
-            if tau == 0:
-                # Deterministic selection: choose token with highest score
-                best_idx = np.argmax(scores)
-                chosen_token = tokens[best_idx]
-            else:
-                # Stochastic selection with temperature
-                scores_array = np.array(scores)
-                # Apply temperature scaling
-                scaled_scores = scores_array / tau
-                # Convert to probabilities using softmax
-                exp_scores = np.exp(scaled_scores - np.max(scaled_scores))  # Numerical stability
-                probs = exp_scores / np.sum(exp_scores)
-                # Sample based on probabilities
-                chosen_idx = np.random.choice(len(tokens), p=probs)
-                chosen_token = tokens[chosen_idx]
+            with torch.no_grad():
+                model_output = self.forward(candidate_seqs)
+                
+                # Get predictions (average over sequence)
+                pred_targets = model_output.mean(dim=1)  # [num_candidates, final_dim]
+                
+                # Compute errors compared to mean target
+                diff = pred_targets - self.mean_target.unsqueeze(0)
+                errors = torch.sum(diff ** 2, dim=1).cpu().numpy()
+                scores = -errors  # Convert error to score (higher = better)
+                
+                # Select token based on temperature
+                if tau == 0:
+                    # Deterministic selection: choose token with highest score
+                    best_idx = np.argmax(scores)
+                    chosen_token = valid_tokens[best_idx]
+                else:
+                    # Stochastic selection with temperature
+                    scaled_scores = scores / tau
+                    exp_scores = np.exp(scaled_scores - np.max(scaled_scores))  # Numerical stability
+                    probs = exp_scores / np.sum(exp_scores)
+                    # Sample based on probabilities
+                    chosen_idx = np.random.choice(len(valid_tokens), p=probs)
+                    chosen_token = valid_tokens[chosen_idx]
             
             generated_sequence += chosen_token
         
@@ -1210,13 +1180,13 @@ if __name__ == "__main__":
     print("Gradient Descent Training")
     print("="*50)
     
-    gd_history = model.grad_train(
+    reg_history = model.reg_train(
         seqs, t_list,
         max_iters=100,
         learning_rate=0.1,
         decay_rate=0.98,
         print_every=5,
-        batch_size=32,
+        batch_size=16,
         checkpoint_file='hierddrnc_gd_checkpoint.pth',
         checkpoint_interval=10
     )
@@ -1246,30 +1216,21 @@ if __name__ == "__main__":
     print("Sequence Reconstruction")
     print("="*50)
     
-    reconstructed_seq = model.reconstruct()
-    print(f"Reconstructed sequence (length {len(reconstructed_seq)}):")
-    print(f"First 100 chars: {reconstructed_seq[:100]}")
+    # Deterministic reconstruction
+    det_seq = model.reconstruct(L=100, tau=0.0)
+    print(f"Deterministic reconstruction (tau=0.0): {det_seq}")
     
-    # Sequence generation
+    # Stochastic reconstruction
+    stoch_seq = model.reconstruct(L=100, tau=0.5)
+    print(f"Stochastic reconstruction (tau=0.5): {stoch_seq}")
+    
+    # Self-training example
     print("\n" + "="*50)
-    print("Sequence Generation")
+    print("Self-Training Example")
     print("="*50)
     
-    # Deterministic generation
-    det_seq = model.generate(L=100, tau=0.0)
-    print(f"Deterministic generation (tau=0.0): {det_seq}")
-    
-    # Stochastic generation
-    stoch_seq = model.generate(L=100, tau=0.5)
-    print(f"Stochastic generation (tau=0.5): {stoch_seq}")
-    
-    # Auto-training example
-    print("\n" + "="*50)
-    print("Auto-Training Example")
-    print("="*50)
-    
-    # Create a new model for auto-training
-    auto_model = HierDDrnC(
+    # Create a new model for self-training
+    self_model = HierDDrnC(
         charset=charset,
         rank=rank,
         vec_dim=vec_dim,
@@ -1280,27 +1241,28 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Use shorter sequences for auto-training
-    auto_seqs = []
+    # Use shorter sequences for self-training
+    self_seqs = []
     for _ in range(100):
         L = random.randint(100, 200)
-        auto_seqs.append(''.join(random.choices(charset, k=L)))
+        self_seqs.append(''.join(random.choices(charset, k=L)))
     
-    # Auto-train in gap mode
-    print("\nAuto-training in 'gap' mode...")
-    auto_history_gap = auto_model.auto_train(
-        auto_seqs,
+    # Self-train in gap mode
+    print("\nSelf-training in 'gap' mode...")
+    self_history_gap = self_model.self_train(
+        self_seqs,
         max_iters=30,
         learning_rate=0.01,
-        auto_mode='gap',
+        self_mode='gap',
         print_every=5,
-        checkpoint_file='hierddrnc_auto_checkpoint.pth',
+        batch_size=256,
+        checkpoint_file='hierddrnc_self_checkpoint.pth',
         checkpoint_interval=5
     )
     
-    # Generate from auto-trained model
-    auto_gen_seq = auto_model.generate(L=80, tau=0.2)
-    print(f"Generated from auto-trained model: {auto_gen_seq}")
+    # Reconstruct from self-trained model
+    self_rec_seq = self_model.reconstruct(L=80, tau=0.2)
+    print(f"Reconstructed from self-trained model: {self_rec_seq}")
     
     # Model save and load test
     print("\n" + "="*50)
@@ -1329,18 +1291,18 @@ if __name__ == "__main__":
     else:
         print("✗ Model save/load test FAILED")
     
-    # Test generation consistency
+    # Test reconstruction consistency
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    original_gen = model.generate(L=50, tau=0.1)
+    original_rec = model.reconstruct(L=50, tau=0.1)
     
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    loaded_gen = loaded_model.generate(L=50, tau=0.1)
+    loaded_rec = loaded_model.reconstruct(L=50, tau=0.1)
     
-    if original_gen == loaded_gen:
-        print("✓ Generation consistency test PASSED")
+    if original_rec == loaded_rec:
+        print("✓ Reconstruction consistency test PASSED")
     else:
-        print("✗ Generation consistency test FAILED")
-        print(f"Original: {original_gen}")
-        print(f"Loaded:   {loaded_gen}")
+        print("✗ Reconstruction consistency test FAILED")
+        print(f"Original: {original_rec}")
+        print(f"Loaded:   {loaded_rec}")
     
     print("\nAll tests completed successfully!")
