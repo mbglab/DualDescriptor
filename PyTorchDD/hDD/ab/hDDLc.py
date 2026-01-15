@@ -2,7 +2,7 @@
 # Hierarchical Dual Descriptor (AB matrix form) with Character Sequence Input (HierDDLabC)
 # Combines character-level processing and hierarchical vector processing with Linker matrices
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11 ~ 2026-1-11
 
 import math
 import random
@@ -320,6 +320,52 @@ class HierDDLabC(nn.Module):
         """Convert list of tokens to tensor of indices"""
         return torch.tensor([self.token_to_idx[tok] for tok in token_list], device=self.device)
     
+    def batch_token_indices(self, seqs, device=None):
+        """
+        Vectorized conversion of a batch of strings to token indices tensor
+        
+        Args:
+            seqs (list): List of input character strings
+            device (torch.device): Target device (defaults to self.device)
+            
+        Returns:
+            torch.Tensor: LongTensor of shape [batch_size, token_seq_len]
+        """
+        target_device = device if device is not None else self.device
+        
+        # Prepare tokenization parameters
+        step = 1 if self.mode == 'linear' else (self.step or self.rank)
+        L = self.input_seq_len
+        
+        all_indices = []
+        
+        # Vectorized tokenization for all sequences
+        if self.mode == 'linear':
+            ranges = range(L - self.rank + 1)
+            for seq in seqs:
+                # Direct string slicing for each position
+                toks = [seq[i:i+self.rank] for i in ranges]
+                all_indices.append([self.token_to_idx[t] for t in toks])
+                
+        else:  # nonlinear mode
+            ranges = range(0, L, step)
+            for seq in seqs:
+                seq_indices = []
+                for i in ranges:
+                    frag = seq[i:i+self.rank]
+                    if len(frag) == self.rank:
+                        seq_indices.append(self.token_to_idx[frag])
+                    else:
+                        if self.rank_mode == 'pad':
+                            frag_pad = frag.ljust(self.rank, '_')
+                            seq_indices.append(self.token_to_idx[frag_pad])
+                all_indices.append(seq_indices)
+
+        if not all_indices:
+            return torch.zeros((len(seqs), 0), dtype=torch.long, device=target_device)
+            
+        return torch.tensor(all_indices, dtype=torch.long, device=target_device)
+    
     def extract_tokens(self, seq):
         """
         Extract k-mer tokens from a character sequence based on tokenization mode.
@@ -363,14 +409,23 @@ class HierDDLabC(nn.Module):
     def char_batch_compute_Nk(self, token_indices):
         """
         Vectorized computation of N(k) vectors for a batch of tokens using AB matrix form
-        Args:
-            token_indices: Tensor of token indices [batch_size]
-        Returns:
-            Tensor of N(k) vectors [batch_size, vec_dim]
-        """
-        batch_size = token_indices.shape[0]
         
-        # Get embeddings for all tokens [batch_size, vec_dim]
+        Args:
+            token_indices: Tensor of token indices [batch_size, seq_len] or [seq_len]
+            
+        Returns:
+            Tensor of N(k) vectors [batch_size, seq_len, vec_dim] or [seq_len, vec_dim]
+        """
+        # Handle single sequence case
+        if token_indices.dim() == 1:
+            token_indices = token_indices.unsqueeze(0)
+            unsqueeze_output = True
+        else:
+            unsqueeze_output = False
+            
+        batch_size, seq_len = token_indices.shape
+        
+        # Get embeddings for all tokens [batch_size, seq_len, vec_dim]
         x = self.char_embedding(token_indices)
         
         # Linear transformation
@@ -380,21 +435,23 @@ class HierDDLabC(nn.Module):
         normalized = torch.nn.functional.layer_norm(transformed, (self.vec_dim,))
         
         # Compute basis indices: j = k % basis_dim for each position
-        seq_len = batch_size  # Each token is at a different position
-        j_indices = torch.arange(seq_len) % self.char_basis_dim
-        j_indices = j_indices.to(self.device)
+        j_indices = torch.arange(seq_len, device=self.device) % self.char_basis_dim
         
         # Select basis vectors: (seq_len, vec_dim)
         B_vectors = self.char_Bbasis[j_indices]
         
         # Compute scalars: dot product of normalized and B_vectors
-        scalars = torch.einsum('bd,bd->b', normalized, B_vectors)
+        scalars = torch.einsum('bsd,sd->bs', normalized, B_vectors)
         
         # Select coefficient vectors: (seq_len, vec_dim)
         A_vectors = self.char_Acoeff[:, j_indices].t()
         
         # Compute new features: scalars * A_vectors
-        Nk = scalars.unsqueeze(1) * A_vectors
+        Nk = scalars.unsqueeze(2) * A_vectors.unsqueeze(0)
+        
+        # Remove batch dimension if input was single sequence
+        if unsqueeze_output:
+            Nk = Nk.squeeze(0)
             
         return Nk
 
@@ -486,42 +543,52 @@ class HierDDLabC(nn.Module):
         if len(seq) != self.input_seq_len:
             raise ValueError(f"Input sequence length must be {self.input_seq_len}, got {len(seq)}")
         
-        toks = self.extract_tokens(seq)
-        if not toks:
-            return torch.zeros((1, 0, self.vec_dim), device=self.device)
+        # Use batch processing for consistency
+        return self.batch_sequence_to_tensor([seq])
+    
+    def batch_sequence_to_tensor(self, seqs):
+        """
+        Convert batch of character sequences to tensor representation
         
-        # Validate token sequence length
-        if len(toks) != self.token_seq_len:
-            raise ValueError(f"Token sequence length mismatch: expected {self.token_seq_len}, got {len(toks)}")
-        
-        token_indices = self.token_to_indices(toks)
+        Args:
+            seqs (list): List of input character sequences
+            
+        Returns:
+            Tensor: Sequence tensor of shape [batch_size, token_seq_len, vec_dim]
+        """
+        # Convert strings to token indices
+        indices = self.batch_token_indices(seqs)
         
         # Compute N(k) vectors through char layer
-        Nk_batch = self.char_batch_compute_Nk(token_indices)
-        
-        # Add batch dimension
-        return Nk_batch.unsqueeze(0)  # [1, token_seq_len, vec_dim]
+        return self.char_batch_compute_Nk(indices)
     
-    def forward(self, seq):
+    def forward(self, input_data):
         """
         Forward pass through entire hierarchical model with Linker matrices
         
         Args:
-            seq (str or list): Input character sequence(s) of fixed length input_seq_len
+            input_data: Input character sequence(s) - can be:
+                - str: Single character sequence
+                - list: List of character sequences
+                - torch.Tensor: Pre-computed token indices [batch_size, seq_len]
             
         Returns:
             Tensor: Output of shape [batch_size, final_linker_dim, final_model_dim]
         """
-        if isinstance(seq, str):
+        # Handle different input types
+        if isinstance(input_data, str):
             # Single sequence
-            x = self.char_sequence_to_tensor(seq)
+            x = self.char_sequence_to_tensor(input_data)
+        elif isinstance(input_data, list):
+            # Multiple sequences
+            x = self.batch_sequence_to_tensor(input_data)
+        elif isinstance(input_data, torch.Tensor):
+            # Pre-computed token indices
+            if input_data.dim() == 1:
+                input_data = input_data.unsqueeze(0)
+            x = self.char_batch_compute_Nk(input_data.to(self.device))
         else:
-            # Multiple sequences - process each separately and stack
-            batch_tensors = []
-            for s in seq:
-                tensor_seq = self.char_sequence_to_tensor(s)
-                batch_tensors.append(tensor_seq.squeeze(0))
-            x = torch.stack(batch_tensors)  # [batch_size, token_seq_len, vec_dim]
+            raise TypeError("Input must be str, list of str, or Tensor")
         
         # Pass through hierarchical layers with Linker matrices
         for layer in self.hierarchical_layers:
@@ -545,7 +612,7 @@ class HierDDLabC(nn.Module):
             target = output.mean(dim=1)  # Average over sequence length
             return target.squeeze(0).cpu().numpy()
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                    continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
                    checkpoint_file=None, checkpoint_interval=10):
         """
@@ -592,7 +659,11 @@ class HierDDLabC(nn.Module):
             history = []
         
         # Convert target vectors to tensor
-        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
+        t_tensors = torch.tensor(t_list, dtype=torch.float32, device=self.device)
+        
+        # Pre-process token indices for all sequences
+        all_indices = self.batch_token_indices(seqs, device='cpu')
+        num_samples = len(seqs)
         
         # Set up optimizer (train all parameters including char layer)
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
@@ -607,39 +678,34 @@ class HierDDLabC(nn.Module):
         
         for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_sequences = 0
             
-            # Process sequences in random order
-            indices = list(range(len(seqs)))
-            random.shuffle(indices)
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
             
-            for i in range(0, len(indices), batch_size):
-                batch_indices = indices[i:i+batch_size]
-                batch_seqs = [seqs[idx] for idx in batch_indices]
-                batch_targets = [t_tensors[idx] for idx in batch_indices]
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_indices = all_indices[batch_idx].to(self.device)
+                batch_targets = t_tensors[batch_idx]
                 
                 optimizer.zero_grad()
-                batch_loss = 0.0
                 
-                for seq, target in zip(batch_seqs, batch_targets):
-                    # Forward pass
-                    output = self.forward(seq)  # [1, final_linker_dim, final_model_dim]
-                    pred_target = output.mean(dim=1).squeeze(0)  # [final_model_dim]
-                    
-                    # Compute loss
-                    loss = torch.sum((pred_target - target) ** 2)
-                    batch_loss += loss
+                # Forward pass for the whole batch
+                output = self.forward(batch_indices)
+                pred_targets = output.mean(dim=1)  # [batch_size, final_model_dim]
                 
-                # Average loss over batch
-                batch_loss = batch_loss / len(batch_seqs)
-                batch_loss.backward()
+                # Compute loss
+                loss = torch.sum((pred_targets - batch_targets) ** 2)
+                batch_loss_val = loss.item()
+                
+                # Normalize by batch size
+                loss = loss / len(batch_idx)
+                loss.backward()
                 optimizer.step()
                 
-                total_loss += batch_loss.item() * len(batch_seqs)
-                total_sequences += len(batch_seqs)
+                total_loss += batch_loss_val
             
             # Average loss over epoch
-            avg_loss = total_loss / total_sequences
+            avg_loss = total_loss / num_samples
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -683,9 +749,9 @@ class HierDDLabC(nn.Module):
         
         return history
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
-                   checkpoint_file=None, checkpoint_interval=5):
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                   batch_size=1024, checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training method for the hierarchical model with Linker matrices
         
@@ -695,7 +761,7 @@ class HierDDLabC(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: 'gap' or 'reg' training mode
+            self_mode: 'gap' or 'reg' training mode
             decay_rate: Learning rate decay rate
             print_every: Print interval
             checkpoint_file: Path to save/load checkpoint file for resuming training
@@ -709,8 +775,8 @@ class HierDDLabC(nn.Module):
             if len(seq) != self.input_seq_len:
                 raise ValueError(f"All sequences must have length {self.input_seq_len}")
         
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
@@ -725,11 +791,15 @@ class HierDDLabC(nn.Module):
             history = checkpoint['history']
             start_iter = checkpoint['iteration'] + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
         else:
             if not continued:
                 self.reset_parameters()   
             history = []
+        
+        # Pre-process token indices for all sequences
+        all_indices = self.batch_token_indices(seqs, device='cpu')
+        num_samples = len(seqs)        
         
         # Set up optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
@@ -744,61 +814,80 @@ class HierDDLabC(nn.Module):
         
         for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_samples = 0
             
-            # Process each sequence
-            for seq in seqs:
-                # Convert to tensor through char layer
-                char_output = self.char_sequence_to_tensor(seq)  # [1, token_seq_len, vec_dim]
-                char_seq_len = char_output.shape[1]
-                
-                if char_seq_len <= 1 and auto_mode == 'reg':
-                    continue  # Skip sequences that are too short for reg mode
-                
-                # Forward pass through hierarchical layers with Linker matrices
-                hierarchical_output = char_output
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
+            
+            # Apply causal masks if in 'reg' mode
+            original_linkers = []
+            original_residual_linkers = []
+            
+            if self_mode == 'reg':
                 for layer in self.hierarchical_layers:
-                    hierarchical_output = layer(hierarchical_output)
-                
-                hier_seq_len = hierarchical_output.shape[1]
-                
-                # Compute loss based on auto_mode
-                seq_loss = 0.0
-                valid_positions = 0
-                
-                # Use the minimum sequence length to avoid index errors
-                min_seq_len = min(char_seq_len, hier_seq_len)
-                
-                for k in range(min_seq_len):
-                    if auto_mode == 'gap':
-                        # Self-consistency: output should match char layer output
-                        target = char_output[0, k]
-                        pred = hierarchical_output[0, k]
-                        seq_loss += torch.sum((pred - target) ** 2)
-                        valid_positions += 1
-                    else:  # 'reg' mode
-                        if k < char_seq_len - 1 and k < hier_seq_len:
-                            # Predict next position's char layer output
-                            target = char_output[0, k + 1]
-                            pred = hierarchical_output[0, k]
-                            seq_loss += torch.sum((pred - target) ** 2)
-                            valid_positions += 1
-                
-                if valid_positions > 0:
-                    seq_loss = seq_loss / valid_positions
-                    total_loss += seq_loss.item()
-                    total_samples += 1
-                    
-                    # Backward pass
-                    optimizer.zero_grad()
-                    seq_loss.backward()
-                    optimizer.step()
+                    if hasattr(layer, 'Linker'):
+                        causal_mask = torch.tril(torch.ones_like(layer.Linker))
+                        original_linkers.append(layer.Linker.data.clone())
+                        layer.Linker.data.mul_(causal_mask)
+                        
+                        if hasattr(layer, 'residual_linker') and layer.residual_linker is not None:
+                            cm_res = torch.tril(torch.ones_like(layer.residual_linker))
+                            original_residual_linkers.append(layer.residual_linker.data.clone())
+                            layer.residual_linker.data.mul_(cm_res)
+                        else:
+                            original_residual_linkers.append(None)
             
-            if total_samples == 0:
-                avg_loss = 0.0
-            else:
-                avg_loss = total_loss / total_samples
+            # Process batches
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_indices = all_indices[batch_idx].to(self.device)
                 
+                optimizer.zero_grad()
+                
+                # Compute character layer output
+                char_output = self.char_batch_compute_Nk(batch_indices)
+                
+                # Forward through hierarchical layers
+                hier_out = char_output
+                for layer in self.hierarchical_layers:
+                    hier_out = layer(hier_out)
+                
+                # Compute loss based on self_mode
+                loss = 0.0
+                min_len = min(char_output.shape[1], hier_out.shape[1])
+                
+                if self_mode == 'gap':
+                    # Self-consistency: hierarchical output should match character layer output
+                    if min_len > 0:
+                        diff = hier_out[:, :min_len, :] - char_output[:, :min_len, :]
+                        sq_diff = torch.sum(diff ** 2, dim=-1)
+                        loss = torch.sum(torch.mean(sq_diff, dim=1))
+                else:  # 'reg' mode
+                    # Predict next position's character layer output
+                    if min_len > 1:
+                        targets = char_output[:, 1:min_len, :]
+                        preds = hier_out[:, :min_len-1, :]
+                        diff = preds - targets
+                        sq_diff = torch.sum(diff ** 2, dim=-1)
+                        loss = torch.sum(torch.mean(sq_diff, dim=1))
+                
+                batch_loss_scalar = loss.item()
+                
+                # Backward pass if loss > 0
+                if batch_loss_scalar > 0:
+                    (loss / len(batch_idx)).backward()
+                    optimizer.step()
+                
+                total_loss += batch_loss_scalar
+            
+            # Restore original weights if in 'reg' mode
+            if self_mode == 'reg':
+                for idx, layer in enumerate(self.hierarchical_layers):
+                    if hasattr(layer, 'Linker'):
+                        layer.Linker.data.copy_(original_linkers[idx])
+                        if original_residual_linkers[idx] is not None:
+                            layer.residual_linker.data.copy_(original_residual_linkers[idx])
+            
+            avg_loss = total_loss / num_samples
             history.append(avg_loss)
             
             # Update best model state if current loss is lower
@@ -808,8 +897,8 @@ class HierDDLabC(nn.Module):
             
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -892,38 +981,31 @@ class HierDDLabC(nn.Module):
         torch.save(checkpoint, checkpoint_file)
         #print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
 
-    def _compute_training_statistics(self, seqs, batch_size=50):
+    def _compute_training_statistics(self, seqs, batch_size=256):
         """Compute and store statistics for reconstruction and generation"""
         total_token_count = 0
         total_vec_sum = torch.zeros(self.vec_dim, device=self.device)
         
+        # Pre-process all sequences
+        all_indices = self.batch_token_indices(seqs, device='cpu')
+        
         with torch.no_grad():
             for i in range(0, len(seqs), batch_size):
-                batch_seqs = seqs[i:i+batch_size]
-                batch_token_count = 0
-                batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
+                batch_indices = all_indices[i:i+batch_size].to(self.device)
                 
-                for seq in batch_seqs:
-                    toks = self.extract_tokens(seq)
-                    if not toks:
-                        continue
-                        
-                    batch_token_count += len(toks)
-                    token_indices = self.token_to_indices(toks)
-                    
-                    Nk_batch = self.char_batch_compute_Nk(token_indices)
-                    batch_vec_sum += Nk_batch.sum(dim=0)
+                # Get character layer output for the batch
+                nk_batch = self.char_batch_compute_Nk(batch_indices)
                 
-                total_token_count += batch_token_count
-                total_vec_sum += batch_vec_sum
+                # Sum over batch and sequence dimensions
+                total_vec_sum += nk_batch.sum(dim=[0, 1])
                 
-                # Clean batch
-                del batch_vec_sum
+                # Count tokens
+                total_token_count += batch_indices.shape[0] * batch_indices.shape[1]
         
         self.mean_token_count = total_token_count / len(seqs) if seqs else 0
         self.mean_t = (total_vec_sum / total_token_count).cpu().numpy() if total_token_count > 0 else np.zeros(self.vec_dim)
 
-    def _compute_hierarchical_mean_target(self, seqs, batch_size=32):
+    def _compute_hierarchical_mean_target(self, seqs, batch_size=256):
         """
         Compute the mean target vector in the final hierarchical layer output space
         This represents the average pattern learned by the entire hierarchical model
@@ -936,123 +1018,37 @@ class HierDDLabC(nn.Module):
         total_output = torch.zeros(final_dim, device=self.device)
         total_sequences = 0
         
+        # Pre-process all sequences
+        all_indices = self.batch_token_indices(seqs, device='cpu')
+        
         with torch.no_grad():
-            # Batch processing sequences
             for i in range(0, len(seqs), batch_size):
-                batch_seqs = seqs[i:i+batch_size]
-                batch_outputs = []
-                
-                for seq in batch_seqs:
-                    try:
-                        output = self.forward(seq)
-                        if output.numel() > 0:
-                            seq_output = output.mean(dim=1).squeeze(0)
-                            batch_outputs.append(seq_output)
-                    except RuntimeError as e:
-                        # Handle the situation of insufficient memory
-                        if "out of memory" in str(e):
-                            print(f"Warning: The sequence is too long, resulting in insufficient memory. Skip the sequence: {seq[:50]}...")
-                            continue
-                        else:
-                            raise e
-                
-                if batch_outputs:
-                    # Immediately accumulate and release the batch memory
-                    batch_tensor = torch.stack(batch_outputs)
-                    total_output += batch_tensor.sum(dim=0)
-                    total_sequences += len(batch_outputs)
+                batch_indices = all_indices[i:i+batch_size].to(self.device)
+                try:
+                    output = self.forward(batch_indices)
                     
-                    # Clean batches
-                    del batch_tensor, batch_outputs
-                
-                # Optional: Regularly clean the GPU cache
-                if torch.cuda.is_available() and (i // batch_size) % 10 == 0:
-                    torch.cuda.empty_cache()
+                    # Mean over sequence dimension, sum over batch
+                    batch_means = output.mean(dim=1)
+                    total_output += batch_means.sum(dim=0)
+                    total_sequences += batch_indices.shape[0]
+                    
+                except RuntimeError as e:
+                    # Handle out of memory errors
+                    if "out of memory" in str(e):
+                        print(f"Warning: The sequence batch is too large, resulting in insufficient memory. Skipping batch...")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        raise e
         
         if total_sequences > 0:
             self.mean_target = total_output / total_sequences
         else:
             self.mean_target = None
     
-    def reconstruct(self):
+    def reconstruct(self, L, tau=0.0):
         """
-        Reconstruct representative character sequence using the entire hierarchical model with Linker matrices.
-        
-        This method leverages the complete model architecture including both the character layer
-        and all hierarchical layers with Linker matrices to reconstruct a sequence that best represents 
-        the learned patterns from the training data.
-        
-        Returns:
-            str: Reconstructed character sequence
-        """
-        assert self.trained, "Model must be trained first"
-        assert self.mean_target is not None, "Mean target vector must be computed first"
-        
-        # Determine sequence length based on training statistics
-        n_tokens = round(self.mean_token_count)
-        if n_tokens <= 0:
-            n_tokens = 10  # Default minimum length
-        
-        # Get the target vector from the final hierarchical layer output space
-        final_dim = self.model_dims[-1] if self.model_dims else self.vec_dim
-        
-        # Precompute all token embeddings
-        all_token_indices = torch.arange(len(self.tokens), device=self.device)
-        seq_tokens = []
-        
-        # Track current sequence state for hierarchical processing
-        current_sequence = ""
-        
-        for k in range(n_tokens):
-            best_tok = None
-            min_error = float('inf')
-            
-            # Evaluate each possible token at this position
-            for token_idx, token in enumerate(self.tokens):
-                # Build candidate sequence
-                candidate_seq = current_sequence + token
-                
-                # Pad to fixed length if necessary
-                if len(candidate_seq) < self.input_seq_len:
-                    candidate_seq = candidate_seq.ljust(self.input_seq_len, 'A')  # Pad with 'A'
-                elif len(candidate_seq) > self.input_seq_len:
-                    candidate_seq = candidate_seq[:self.input_seq_len]
-                
-                # Process through entire hierarchical model with Linker matrices
-                with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
-                    
-                    # Get the prediction (average over sequence)
-                    if model_output.numel() > 0:
-                        pred_target = model_output.mean(dim=1).squeeze(0)
-                        
-                        # Compute error compared to mean target
-                        error = torch.sum((pred_target - self.mean_target) ** 2).item()
-                        
-                        if error < min_error:
-                            min_error = error
-                            best_tok = token
-            
-            # Add best token to sequence
-            if best_tok is not None:
-                seq_tokens.append(best_tok)
-                current_sequence = ''.join(seq_tokens)
-            else:
-                # Fallback: use character layer reconstruction
-                char_layer_recon = self.char_reconstruct()
-                return char_layer_recon
-        
-        reconstructed_seq = ''.join(seq_tokens)
-        
-        # Remove padding characters if present
-        if '_' in reconstructed_seq:
-            reconstructed_seq = reconstructed_seq.replace('_', '')
-        
-        return reconstructed_seq[:self.input_seq_len]  # Ensure fixed length
-
-    def generate(self, L, tau=0.0):
-        """
-        Generate character sequence of length L using the entire hierarchical model with Linker matrices.
+        Reconstruct character sequence of length L using the entire hierarchical model with Linker matrices.
         
         This method uses temperature-controlled sampling based on the complete model's
         predictions, incorporating both character-level and hierarchical patterns with Linker matrices.
@@ -1064,7 +1060,7 @@ class HierDDLabC(nn.Module):
                         tau>0: stochastic selection with temperature
             
         Returns:
-            str: Generated character sequence
+            str: Reconstructed character sequence
         """
         assert self.trained, "Model must be trained first"
         assert self.mean_target is not None, "Mean target vector must be computed first"
@@ -1370,7 +1366,7 @@ if __name__ == "__main__":
     print("Gradient Descent Training")
     print("="*50)
     
-    gd_history = model.grad_train(
+    reg_history = model.reg_train(
         seqs, t_list,
         max_iters=100,
         learning_rate=0.01,
@@ -1406,30 +1402,21 @@ if __name__ == "__main__":
     print("Sequence Reconstruction")
     print("="*50)
     
-    reconstructed_seq = model.reconstruct()
-    print(f"Reconstructed sequence (length {len(reconstructed_seq)}):")
-    print(f"First 100 chars: {reconstructed_seq[:100]}")
+    # Deterministic reconstruction
+    det_seq = model.reconstruct(L=100, tau=0.0)
+    print(f"Deterministic reconstruction (tau=0.0): {det_seq}")
     
-    # Sequence generation
+    # Stochastic reconstruction
+    stoch_seq = model.reconstruct(L=100, tau=0.5)
+    print(f"Stochastic reconstruction (tau=0.5): {stoch_seq}")
+    
+    # Self-training example
     print("\n" + "="*50)
-    print("Sequence Generation")
+    print("Self-Training Example")
     print("="*50)
     
-    # Deterministic generation
-    det_seq = model.generate(L=100, tau=0.0)
-    print(f"Deterministic generation (tau=0.0): {det_seq}")
-    
-    # Stochastic generation
-    stoch_seq = model.generate(L=100, tau=0.5)
-    print(f"Stochastic generation (tau=0.5): {stoch_seq}")
-    
-    # Auto-training example
-    print("\n" + "="*50)
-    print("Auto-Training Example")
-    print("="*50)
-    
-    # Create a new model for auto-training
-    auto_model = HierDDLabC(
+    # Create a new model for self-training
+    self_model = HierDDLabC(
         charset=charset,
         rank=rank,
         vec_dim=vec_dim,
@@ -1444,24 +1431,25 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Use sequences for auto-training
-    auto_seqs = seqs[:50]  # Use subset for auto-training
+    # Use sequences for self-training
+    self_seqs = seqs[:50]  # Use subset for self-training
     
-    # Auto-train in gap mode
-    print("\nAuto-training in 'gap' mode...")
-    auto_history_gap = auto_model.auto_train(
-        auto_seqs,
+    # Self-train in gap mode
+    print("\nSelf-training in 'gap' mode...")
+    self_history_gap = self_model.self_train(
+        self_seqs,
         max_iters=30,
         learning_rate=0.01,
-        auto_mode='reg',
+        self_mode='gap',
         print_every=5,
-        checkpoint_file='hierddlabc_auto_checkpoint.pth',
+        batch_size=256,
+        checkpoint_file='hierddlabc_self_checkpoint.pth',
         checkpoint_interval=5
     )
     
-    # Generate from auto-trained model
-    auto_gen_seq = auto_model.generate(L=80, tau=0.2)
-    print(f"Generated from auto-trained model: {auto_gen_seq}")
+    # Reconstruct from self-trained model
+    self_rec_seq = self_model.reconstruct(L=80, tau=0.2)
+    print(f"Reconstructed from self-trained model: {self_rec_seq}")
     
     # Model save and load test
     print("\n" + "="*50)
@@ -1490,18 +1478,18 @@ if __name__ == "__main__":
     else:
         print("✗ Model save/load test FAILED")
     
-    # Test generation consistency
+    # Test reconstruction consistency
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    original_gen = model.generate(L=50, tau=0.1)
+    original_rec = model.reconstruct(L=50, tau=0.1)
     
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    loaded_gen = loaded_model.generate(L=50, tau=0.1)
+    loaded_rec = loaded_model.reconstruct(L=50, tau=0.1)
     
-    if original_gen == loaded_gen:
-        print("✓ Generation consistency test PASSED")
+    if original_rec == loaded_rec:
+        print("✓ Reconstruction consistency test PASSED")
     else:
-        print("✗ Generation consistency test FAILED")
-        print(f"Original: {original_gen}")
-        print(f"Loaded:   {loaded_gen}")
+        print("✗ Reconstruction consistency test FAILED")
+        print(f"Original: {original_rec}")
+        print(f"Loaded:   {loaded_rec}")
     
     print("\nAll tests completed successfully!")

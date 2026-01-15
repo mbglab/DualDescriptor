@@ -2,7 +2,7 @@
 # The Hierarchical Numeric Dual Descriptor (AB matrix form) with Linker matrices in PyTorch
 # With layer normalization and residual connections and generation capability
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26 ~ 2026-1-13
 
 import math
 import random
@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import copy
+import os
 
 class Layer(nn.Module):
     """
@@ -286,10 +288,12 @@ class HierDDLab(nn.Module):
         loss = nn.functional.mse_loss(avg_vectors, targets)
         return loss
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-88, 
-                   learning_rate=0.01, decay_rate=1.0, print_every=10):
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-88, 
+                   learning_rate=0.01, decay_rate=1.0, print_every=10,
+                   continued=False, checkpoint_file=None, checkpoint_interval=10,
+                   batch_size=256):
         """
-        Train the model using Adam optimizer
+        Train the model using Adam optimizer with batch processing and checkpoint support
         
         Args:
             seqs (list): Training sequences
@@ -299,51 +303,144 @@ class HierDDLab(nn.Module):
             learning_rate (float): Initial learning rate
             decay_rate (float): Learning rate decay rate
             print_every (int): Print progress every n iterations
+            continued (bool): Whether to continue from existing parameters
+            checkpoint_file (str): File to save/load checkpoints
+            checkpoint_interval (int): Save checkpoint every n iterations
+            batch_size (int): Batch size for training
             
         Returns:
             list: Training loss history
         """
+        # Load checkpoint if continuing
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
+        history = []
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6e}")
+        
+        # Convert data to tensors
+        seqs_tensor = torch.tensor(np.array(seqs), dtype=torch.float32, device=self.device)
+        targets = torch.tensor(np.array(t_list), dtype=torch.float32, device=self.device)
+        num_samples = len(seqs)
+        
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        history = []
-        best_loss = float('inf')
         
-        for it in range(max_iters):
-            optimizer.zero_grad()
+        # Load optimizer state if continuing
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
+        
+        for it in range(start_iter, max_iters):
+            total_loss = 0.0
             
-            # Compute loss
-            loss = self.deviation(seqs, t_list)
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
             
-            # Backpropagate
-            loss.backward()
+            for i in range(0, num_samples, batch_size):
+                # Get batch indices
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = seqs_tensor[batch_idx]
+                batch_targets = targets[batch_idx]
+                
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = self.forward(batch_seqs)
+                avg_vectors = outputs.mean(dim=1)
+                
+                # Compute loss
+                loss = nn.functional.mse_loss(avg_vectors, batch_targets)
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                
+                # Update parameters
+                optimizer.step()
+                
+                total_loss += loss.item() * len(batch_idx)
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+            # Average loss
+            avg_loss = total_loss / num_samples
+            history.append(avg_loss)
             
-            # Update parameters
-            optimizer.step()               
-            
-            # Record loss
-            current_loss = loss.item()
-            history.append(current_loss)
+            # Update best loss
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 lr = optimizer.param_groups[0]['lr']
-                print(f"Iter {it:3d}: Loss = {current_loss:.6f}, LR = {lr:.6f}")
-
-            # Decay learning rate
-            scheduler.step()
+                print(f"GD Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {lr:.6e}")
+            
+            # Save checkpoint
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
             
             # Check convergence
-            if current_loss < best_loss:
-                best_loss = current_loss
-            elif best_loss - current_loss < tol:
+            if len(history) > 1 and abs(history[-2] - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations")
                 break
-                
+            
+            # Decay learning rate
+            scheduler.step()
+        
+        # Restore best model if available
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Restored best model state with loss = {best_loss:.6e}")
+            history[-1] = best_loss
+        
         self.trained = True
         return history
+    
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint
+        
+        Args:
+            checkpoint_file (str): File to save checkpoint
+            iteration (int): Current iteration
+            history (list): Training loss history
+            optimizer: Optimizer object
+            scheduler: Learning rate scheduler
+            best_loss (float): Best loss so far
+        """
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'config': {
+                'input_dim': self.input_dim,
+                'model_dims': self.model_dims,
+                'basis_dims': self.basis_dims,
+                'input_seq_len': self.input_seq_len,
+                'linker_dims': self.linker_dims,
+                'linker_trainable': self.linker_trainable,
+                'use_residual': self.use_residual,
+                'device': str(self.device)
+            },
+            'training_stats': {
+                'mean_t': self.mean_t if hasattr(self, 'mean_t') else None
+            }
+        }
+        torch.save(checkpoint, checkpoint_file)
 
     def predict_t(self, vec_seq):
         """
@@ -362,8 +459,9 @@ class HierDDLab(nn.Module):
         # Compute average vector
         return np.mean(outputs, axis=0).tolist()
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
-                  continued=False, auto_mode='gap', decay_rate=1.0, print_every=10):
+    def self_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
+                  continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                  batch_size=256, checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training for the ENTIRE hierarchical model with two modes:
           - 'gap': Predicts current input vector (self-consistency)
@@ -378,23 +476,43 @@ class HierDDLab(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: Training mode ('gap' or 'reg')
+            self_mode: Training mode ('gap' or 'reg')
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            batch_size: Batch size for training
+            checkpoint_file: File to save/load checkpoints
+            checkpoint_interval: Save checkpoint every n iterations
         
         Returns:
             Training loss history
         """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
         # Validate input sequences
         for seq in seqs:
             if len(seq) != self.input_seq_len:
                 raise ValueError(f"All sequences must have length {self.input_seq_len}")
         
+        # Load checkpoint if continuing
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
+        history = []
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+        
         # Convert sequences to tensors
-        seqs_tensor = [torch.tensor(seq, dtype=torch.float32, device=self.device) for seq in seqs]
+        seqs_tensor = torch.tensor(np.array(seqs), dtype=torch.float32, device=self.device)
+        num_samples = len(seqs)
         
         # Initialize all layers if not continuing training
         if not continued:
@@ -420,87 +538,167 @@ class HierDDLab(nn.Module):
                 total_vectors += seq.size(0)
             self.mean_t = (total / total_vectors).cpu().numpy()            
         
-        # Calculate total training samples
-        total_samples = 0
-        for seq in seqs_tensor:
-            if auto_mode == 'gap':
-                total_samples += seq.size(0)  # All positions are samples
-            else:  # 'reg' mode
-                total_samples += max(0, seq.size(0) - 1)  # All except last position
-        
-        if total_samples == 0:
-            raise ValueError("No training samples found")
-        
         # Setup optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer state if continuing
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
+            total_batches = 0  # Track number of processed batches
             
-            for seq in seqs_tensor:
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
+            
+            for i in range(0, num_samples, batch_size):
+                # Get batch indices
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = seqs_tensor[batch_idx]
+                
                 optimizer.zero_grad()
                 
+                # Apply causal masking to Linker matrices in reg mode
+                original_linkers = []
+                original_residual_linkers = []
+                
+                if self_mode == 'reg':
+                    for layer in self.layers:
+                        # Create causal mask for main Linker
+                        causal_mask = torch.tril(torch.ones_like(layer.Linker))
+                        original_linker = layer.Linker.clone()
+                        layer.Linker.data = layer.Linker.data * causal_mask
+                        original_linkers.append(original_linker)
+                        
+                        # Create causal mask for residual Linker if exists
+                        if hasattr(layer, 'residual_linker') and layer.residual_linker is not None:
+                            causal_mask_residual = torch.tril(torch.ones_like(layer.residual_linker))
+                            original_residual_linker = layer.residual_linker.clone()
+                            layer.residual_linker.data = layer.residual_linker.data * causal_mask_residual
+                            original_residual_linkers.append(original_residual_linker)
+                        else:
+                            original_residual_linkers.append(None)
+                
                 # Forward pass through all layers
-                current = seq.unsqueeze(0)  # Add batch dimension
+                x = batch_seqs
                 for layer in self.layers:
-                    current = layer(current)
+                    x = layer(x)
                 
-                # Remove batch dimension
-                current = current.squeeze(0)
+                # Restore original Linker matrices after forward pass in reg mode
+                if self_mode == 'reg':
+                    for i, layer in enumerate(self.layers):
+                        layer.Linker.data = original_linkers[i]
+                        if original_residual_linkers[i] is not None:
+                            layer.residual_linker.data = original_residual_linkers[i]
                 
-                # Calculate loss based on auto_mode
+                # Calculate loss based on self_mode
                 loss = 0.0
-                valid_positions = 0
                 
-                for k in range(current.size(0)):
-                    # Skip last position in 'reg' mode
-                    if auto_mode == 'reg' and k == seq.size(0) - 1:
+                # Vectorized loss calculation
+                if self_mode == 'gap':
+                    # For gap mode, we need to compare hierarchical output with original input
+                    # Check if output dimensions match input dimensions
+                    if x.shape[1:] == batch_seqs.shape[1:]:
+                        # Direct comparison when dimensions match
+                        loss = nn.functional.mse_loss(x, batch_seqs)
+                    else:
+                        # When dimensions don't match, we need to handle differently
+                        # For demonstration, we'll compute loss on overlapping dimensions
+                        min_seq_len = min(x.shape[1], batch_seqs.shape[1])
+                        min_dim = min(x.shape[2], batch_seqs.shape[2])
+                        
+                        if min_seq_len > 0 and min_dim > 0:
+                            # Compare only overlapping parts
+                            pred_slice = x[:, :min_seq_len, :min_dim]
+                            target_slice = batch_seqs[:, :min_seq_len, :min_dim]
+                            loss = nn.functional.mse_loss(pred_slice, target_slice)
+                        else:
+                            # Skip this batch if no overlap
+                            continue
+                else:  # 'reg' mode
+                    # Predict next vector: Hier[k] vs Input[k+1]
+                    # We need at least 2 positions for meaningful comparison
+                    if batch_seqs.shape[1] > 1 and x.shape[1] >= 1:
+                        # Targets: Input from position 1 to end
+                        targets = batch_seqs[:, 1:, :]
+                        
+                        # Predictions: Hierarchical output from position 0 to end-1
+                        # We need to ensure we have enough output positions
+                        max_pred_len = min(x.shape[1], targets.shape[1])
+                        
+                        if max_pred_len > 0:
+                            preds = x[:, :max_pred_len, :]
+                            targets_slice = targets[:, :max_pred_len, :]
+                            loss = nn.functional.mse_loss(preds, targets_slice)
+                        else:
+                            continue
+                    else:
+                        # Skip this batch if not enough positions
                         continue
-                    
-                    # Determine target based on mode
-                    if auto_mode == 'gap':
-                        target = seq[k]
-                    else:  # 'reg' mode
-                        target = seq[k + 1]
-                    
-                    # Calculate MSE loss
-                    loss += torch.sum((current[k] - target) ** 2)
-                    valid_positions += 1
                 
-                if valid_positions > 0:
-                    loss = loss / valid_positions
-                    total_loss += loss.item()
+                # Only proceed if we have a valid loss
+                if loss.item() > 0:
+                    # Backward pass and optimization
                     loss.backward()
+                    
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                    
+                    # Update parameters
                     optimizer.step()
+                    
+                    total_loss += loss.item()
+                    total_batches += 1
             
-            # Average loss
-            avg_loss = total_loss / len(seqs_tensor)
-            history.append(avg_loss)            
+            # Calculate average loss only if we processed any batches
+            if total_batches > 0:
+                avg_loss = total_loss / total_batches
+            else:
+                # If no batches were processed, use a high loss to continue training
+                avg_loss = 1.0  # Arbitrary high value to continue training
+                print(f"Iteration {it}: No valid batches processed, using default loss")
+            
+            history.append(avg_loss)
+            
+            # Update best loss
+            if avg_loss < best_loss and total_batches > 0:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-
-            # Update learning rate
-            if it % 5 == 0:  # Decay every 5 iterations
-                scheduler.step()
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}, Batches = {total_batches}")
             
-            # Check convergence
-            if prev_loss - avg_loss < tol:
-                print(f"Converged after {it+1} iterations")
-                break
-            prev_loss = avg_loss
+            # Save checkpoint
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
+            
+            # Check convergence - only if we processed batches and loss is not default
+            if len(history) > 1 and total_batches > 0 and avg_loss != 1.0:
+                loss_change = abs(history[-2] - avg_loss)
+                if loss_change < tol:
+                    print(f"Converged after {it+1} iterations with loss change {loss_change:.6e}")
+                    break
+            
+            # Update learning rate scheduler - only if optimizer.step() was called
+            if total_batches > 0:
+                scheduler.step()
+        
+        # Restore best model if available
+        if best_model_state is not None and best_loss < history[-1] and total_batches > 0:
+            self.load_state_dict(best_model_state)
+            print(f"Restored best model state with loss = {best_loss:.6f}")
+            history[-1] = best_loss
         
         self.trained = True
         return history
     
-    def generate(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
+    def reconstruct(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
         """
         Generate sequence of vectors with temperature-controlled randomness.
         Supports both continuous and discrete generation modes.
@@ -514,7 +712,7 @@ class HierDDLab(nn.Module):
         Returns:
             Generated sequence as numpy array
         """
-        assert self.trained and hasattr(self, 'mean_t'), "Model must be auto-trained first"
+        assert self.trained and hasattr(self, 'mean_t'), "Model must be self-trained first"
         if tau < 0:
             raise ValueError("Temperature must be non-negative")
         if discrete_mode and vocab_size is None:
@@ -582,37 +780,54 @@ class HierDDLab(nn.Module):
 
     def count_parameters(self):
         """
-        Calculate and print the number of learnable parameters
+        Calculate and print the number of learnable parameters in table format
         """
         total_params = 0
         trainable_params = 0
-        print("Model Parameter Counts:")
+        
+        print("="*70)
+        print(f"{'Component':<15} | {'Layer/Param':<25} | {'Count':<15} | {'Shape':<20}")
+        print("-"*70)
         
         for l_idx, layer in enumerate(self.layers):
-            layer_params = sum(p.numel() for p in layer.parameters())
-            layer_trainable = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+            in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
+            out_dim = self.model_dims[l_idx]
+            basis_dim = self.basis_dims[l_idx]
+            in_seq = self.input_seq_len if l_idx == 0 else self.linker_dims[l_idx-1]
+            out_seq = self.linker_dims[l_idx]
+            
+            print(f"Layer {l_idx:<13} | {'Config':<25} | {f'in={in_dim}, out={out_dim}':<15} | {f'L={basis_dim}, seq={in_seq}→{out_seq}':<20}")
+            print("-"*70)
+            
+            layer_params = 0
+            layer_trainable = 0
+            
+            # Count parameters for each parameter in the layer
+            for name, param in layer.named_parameters():
+                if param.requires_grad:
+                    num = param.numel()
+                    layer_trainable += num
+                    print(f"{'':<15} | {name:<25} | {num:<15} | {str(tuple(param.shape)):<20}")
+                layer_params += param.numel()
+            
+            # Count buffers (non-trainable parameters)
+            for name, buffer in layer.named_buffers():
+                if buffer is not None:
+                    num = buffer.numel()
+                    print(f"{'':<15} | {name+'(buffer)':<25} | {num:<15} | {str(tuple(buffer.shape)):<20}")
             
             total_params += layer_params
             trainable_params += layer_trainable
             
-            in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
-            in_seq = self.input_seq_len if l_idx == 0 else self.linker_dims[l_idx-1]
-            out_dim = self.model_dims[l_idx]
-            L_i = self.basis_dims[l_idx]
-            out_seq = self.linker_dims[l_idx]
-            
-            print(f"  Layer {l_idx} (in_dim: {in_dim}, out_dim: {out_dim}, L: {L_i}, in_seq: {in_seq}, out_seq: {out_seq}):")
-            print(f"    Parameters: {layer_params} (Trainable: {layer_trainable})")
-            print(f"    Residual type: {self.use_residual[l_idx]}")
-            
-            # Count residual parameters if using separate residual
-            if self.use_residual[l_idx] == 'separate':
-                residual_params = layer.residual_proj.weight.numel()
-                residual_params += layer.residual_linker.numel()
-                print(f"    Residual params: {residual_params} (Trainable: {residual_params if layer.residual_linker.requires_grad else 0})")
+            print(f"{'':<15} | {'TOTAL':<25} | {layer_params:<15} |")
+            print(f"{'':<15} | {'Trainable':<25} | {layer_trainable:<15} |")
+            print("-"*70)
         
-        print(f"Total parameters: {total_params}")
-        print(f"Trainable parameters: {trainable_params}")        
+        # Print summary
+        print(f"{'SUMMARY':<15} | {'Total Parameters':<25} | {total_params:<15} |")
+        print(f"{'':<15} | {'Trainable Parameters':<25} | {trainable_params:<15} |")
+        print("="*70)
+        
         return total_params, trainable_params  
     
     def save(self, filename):
@@ -683,7 +898,7 @@ if __name__ == "__main__":
     
     # Configuration
     input_dim = 10          # Input vector dimension
-    input_seq_len = 100     # Fixed input sequence length
+    input_seq_len = 300     # Fixed input sequence length
     model_dims = [8, 6, 3] # Output dimensions for each layer
     basis_dims = [150, 100, 50] # Basis dimensions for each layer
     linker_dims = [50, 20, 10] # Output sequence lengths for each layer
@@ -722,20 +937,23 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Show parameter counts
-    print("\nModel parameter counts:")
+    # Show parameter counts in table format
+    print("\nModel parameter counts (table format):")
     total_params, trainable_params = model_mixed.count_parameters()
     
-    # Train model
-    print("\nTraining model...")
-    history = model_mixed.grad_train(
+    # Train model with batch processing and checkpoint
+    print("\nTraining model with batch processing...")
+    reg_history = model_mixed.reg_train(
         seqs, 
         t_list,
         learning_rate=0.01,
         tol=1e-88,
         max_iters=100,
         decay_rate=0.99,
-        print_every=10
+        print_every=10,
+        batch_size=256,
+        checkpoint_file='hier_ddl_gd_checkpoint.pth',
+        checkpoint_interval=20
     )
     
     # Evaluate predictions
@@ -751,11 +969,67 @@ if __name__ == "__main__":
     
     print(f"Average correlation: {np.mean(corrs):.4f}")      
     
-    # Test Case 2: Save and load model
-    print("\n=== Test Case 3: Save and Load Model ===")
+    # Test Case 2: Self-training and reconstruction
+    print("\n=== Test Case 2: Self-training and Reconstruction ===")
+    
+    # Create a fresh model for self-training
+    model_self = HierDDLab(
+        input_dim=input_dim,
+        model_dims=[10, 20, 10],
+        basis_dims=basis_dims,
+        linker_dims=linker_dims,
+        input_seq_len=input_seq_len,
+        linker_trainable=[True, False, True],
+        use_residual=['separate', 'shared', None],
+        device=device
+    )
+    
+    # Self-train in gap mode with checkpoint
+    print("\nSelf-training in 'gap' mode...")
+    self_history = model_self.self_train(
+        seqs[:10],
+        max_iters=20,
+        learning_rate=0.01,
+        self_mode='gap',
+        print_every=5,
+        batch_size=32,
+        checkpoint_file='hier_ddl_self_checkpoint.pth',
+        checkpoint_interval=10
+    )
+    
+    # Reconstruct new sequences
+    print("\nReconstructing sequences...")
+    reconstructed_seq = model_self.reconstruct(L=5, tau=0.1)
+    print(f"Reconstructed sequence shape: {reconstructed_seq.shape}")
+    print("First 5 reconstructed vectors:")
+    for i, vec in enumerate(reconstructed_seq):
+        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")
+    
+    # Test Case 3: Continued training
+    print("\n=== Test Case 3: Continued Training ===")
+    
+    # Continue training from checkpoint
+    print("\nContinuing self-training from checkpoint...")
+    continued_history = model_self.self_train(
+        seqs[:10],
+        max_iters=15,
+        learning_rate=0.005,
+        self_mode='gap',
+        print_every=5,
+        batch_size=32,
+        continued=True,
+        checkpoint_file='hier_ddl_self_checkpoint.pth',
+        checkpoint_interval=10
+    )
+    
+    print(f"Initial self-training had {len(self_history)} iterations")
+    print(f"Continued training added {len(continued_history)} iterations")
+    
+    # Test Case 4: Save and load model
+    print("\n=== Test Case 4: Save and Load Model ===")
     
     # Save model
-    model_mixed.save("hier_ddl_model.pth")
+    model_self.save("hier_ddl_model.pth")
     
     # Load model
     loaded_model = HierDDLab.load("hier_ddl_model.pth", device=device)
@@ -765,50 +1039,16 @@ if __name__ == "__main__":
     print(f"Original prediction: {pred_t_list[0][:3]}...")
     print(f"Loaded model prediction: {test_pred[:3]}...")
 
-    # Test Case 2: Example of using the new auto_train and generate methods
-    print("\n" + "="*50)
-    print("Example of using auto_train and generate methods")
-    print("="*50)
-
-    # Create a new model for auto-training
-    auto_model = HierDDLab(
-        input_dim=input_dim,
-        model_dims=[10, 20, 10],
-        basis_dims=basis_dims,
-        linker_dims=linker_dims,
-        input_seq_len=input_seq_len,
-        linker_trainable=[True, False, True],
-        use_residual=['separate', 'shared', None],  # Different residual for each layer
-        device=device
-    )
+    # Compare parameter counts
+    print("\nOriginal model parameters:")
+    total_orig, trainable_orig = model_self.count_parameters()
     
-    # Auto-train the model in 'gap' mode
-    print("\nAuto-training model in 'gap' mode...")
-    auto_history = auto_model.auto_train(
-        seqs[:10],
-        max_iters=20,
-        learning_rate=0.01,
-        auto_mode='gap',
-        print_every=5
-    )
+    print("\nLoaded model parameters:")
+    total_loaded, trainable_loaded = loaded_model.count_parameters()
     
-    # Generate new sequences
-    print("\nGenerating new sequences...")
-    generated_seq = auto_model.generate(L=5, tau=0.1)
-    print(f"Generated sequence shape: {generated_seq.shape}")
-    print("First 5 generated vectors:")
-    for i, vec in enumerate(generated_seq):
-        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")
+    if total_orig == total_loaded and trainable_orig == trainable_loaded:
+        print("✓ Parameter counts match between original and loaded models")
+    else:
+        print("✗ Parameter counts do not match")
     
-    # Save and load model
-    print("\nSaving and loading model...")
-    auto_model.save("auto_model.pth")
-    loaded_model = HierDDLab.load("auto_model.pth", device=device)
-    
-    # Generate with loaded model
-    loaded_generated = loaded_model.generate(L=3, tau=0.05)
-    print("Generated with loaded model:")
-    for i, vec in enumerate(loaded_generated):
-        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")    
-    
-    print("Training and testing completed!")
+    print("\n=== Hierarchical Vector Sequence Processing with Linker Matrices Demo Completed ===")

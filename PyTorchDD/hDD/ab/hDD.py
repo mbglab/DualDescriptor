@@ -2,7 +2,7 @@
 # The Hierarchical Numeric Dual Descriptor (AB matrix form) implemented with PyTorch
 # With layer normalization and residual connections and generation capability
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26 ~ 2026-1-13
 
 import math
 import random
@@ -10,6 +10,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import copy
+import os
 
 class Layer(nn.Module):
     """
@@ -70,11 +72,13 @@ class Layer(nn.Module):
         Forward pass through the layer with residual connections
         
         Args:
-            x (torch.Tensor): Input sequence of shape (seq_len, in_dim)
+            x (torch.Tensor): Input sequence of shape (batch_size, seq_len, in_dim)
         
         Returns:
-            torch.Tensor: Output sequence of shape (seq_len, out_dim)
+            torch.Tensor: Output sequence of shape (batch_size, seq_len, out_dim)
         """
+        batch_size, seq_len, _ = x.shape
+        
         # Compute residual based on mode
         residual = 0
         if self.use_residual == 'separate':
@@ -91,24 +95,25 @@ class Layer(nn.Module):
         # Apply layer normalization
         normalized = self.norm(transformed)
         
-        # Get sequence length
-        seq_len = x.size(0)
-        
         # Compute basis indices: j = k % basis_dim for each position
         j_indices = torch.arange(seq_len) % self.basis_dim
         j_indices = j_indices.to(self.device)
         
         # Select basis vectors: (seq_len, out_dim)
-        B_vectors = self.Bbasis[j_indices]
+        B_vectors = self.Bbasis[j_indices]  # (seq_len, out_dim)
+        
+        # Expand for batch processing
+        B_vectors_exp = B_vectors.unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, seq_len, out_dim)
         
         # Compute scalars: dot product of normalized and B_vectors
-        scalars = torch.einsum('sd,sd->s', normalized, B_vectors)
+        scalars = torch.einsum('bsd,bsd->bs', normalized, B_vectors_exp)  # (batch_size, seq_len)
         
         # Select coefficient vectors: (seq_len, out_dim)
-        A_vectors = self.Acoeff[:, j_indices].t()
+        A_vectors = self.Acoeff[:, j_indices].t()  # (seq_len, out_dim)
+        A_vectors_exp = A_vectors.unsqueeze(0).expand(batch_size, -1, -1)  # (batch_size, seq_len, out_dim)
         
         # Compute new features: scalars * A_vectors
-        new_features = scalars.unsqueeze(1) * A_vectors
+        new_features = scalars.unsqueeze(2) * A_vectors_exp  # (batch_size, seq_len, out_dim)
         
         # Add residual connection
         output = new_features + residual
@@ -134,7 +139,7 @@ class HierDDab(nn.Module):
         self.model_dims = model_dims
         self.basis_dims = basis_dims
         self.num_layers = len(model_dims)
-        self.device = device
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.trained = False
         
         # Validate dimensions
@@ -155,21 +160,27 @@ class HierDDab(nn.Module):
             basis_dim = basis_dims[i]
             use_residual = use_residual_list[i]
             layer = Layer(in_dim, out_dim, basis_dim, 
-                                     use_residual, device)
+                                     use_residual, self.device)
             self.layers.append(layer)
             in_dim = out_dim  # Next layer input is current layer output
         
-        self.to(device)
+        # Mean target vector for reconstruction
+        self.mean_target = None
+        
+        # Training statistics
+        self.mean_t = None
+        
+        self.to(self.device)
     
     def forward(self, x):
         """
         Forward pass through the entire hierarchical model
         
         Args:
-            x (torch.Tensor): Input sequence of shape (seq_len, input_dim)
+            x (torch.Tensor): Input sequence of shape (batch_size, seq_len, input_dim)
         
         Returns:
-            torch.Tensor: Output sequence of shape (seq_len, model_dims[-1])
+            torch.Tensor: Output sequence of shape (batch_size, seq_len, model_dims[-1])
         """
         current = x
         for layer in self.layers:
@@ -187,10 +198,15 @@ class HierDDab(nn.Module):
             list: List of output vectors from the final layer
         """
         # Convert to tensor and move to device
-        input_tensor = torch.tensor(vec_seq, dtype=torch.float32).to(self.device)
+        if isinstance(vec_seq, list):
+            vec_seq = torch.tensor(vec_seq, dtype=torch.float32).to(self.device)
+        
+        # Add batch dimension if needed
+        if vec_seq.dim() == 2:
+            vec_seq = vec_seq.unsqueeze(0)
         
         # Forward pass
-        output_tensor = self.forward(input_tensor)
+        output_tensor = self.forward(vec_seq)
         
         # Convert back to list of vectors
         return output_tensor.cpu().detach().numpy().tolist()
@@ -215,7 +231,7 @@ class HierDDab(nn.Module):
             target_tensor = torch.tensor(t, dtype=torch.float32).to(self.device)
             
             # Forward pass
-            outputs = self.forward(input_tensor)
+            outputs = self.forward(input_tensor.unsqueeze(0)).squeeze(0)
             
             # Compute MSE for each position
             for pos in range(len(seq)):
@@ -225,8 +241,10 @@ class HierDDab(nn.Module):
         
         return total_loss / total_positions if total_positions > 0 else 0.0
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-18,
-                    learning_rate=0.01, decay_rate=1.0, print_every=10):
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8,
+                    learning_rate=0.01, decay_rate=1.0, print_every=10,
+                    continued=False, batch_size=256, checkpoint_file=None, 
+                    checkpoint_interval=10):
         """
         Train the model using Adam optimizer with learning rate decay and early stopping
         
@@ -238,45 +256,100 @@ class HierDDab(nn.Module):
             learning_rate (float): Initial learning rate
             decay_rate (float): Learning rate decay factor
             print_every (int): Print progress every N iterations
+            continued (bool): Whether to continue from existing parameters
+            batch_size (int): Batch size for training
+            checkpoint_file (str): Path to save/load checkpoint file for resuming training
+            checkpoint_interval (int): Interval (in iterations) for saving checkpoints
         
         Returns:
             list: Training loss history
         """
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        history = []
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
         best_loss = float('inf')
-        best_state = self.state_dict()
+        best_model_state = None
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6e}")
+        else:
+            if not continued:
+                self.reset_parameters() 
+            history = []
         
         # Convert targets to tensors
-        target_tensors = [torch.tensor(t, dtype=torch.float32).to(self.device) for t in t_list]
+        target_tensors = torch.tensor(t_list, dtype=torch.float32, device='cpu')
         
-        for it in range(max_iters):
+        # Pre-process data: convert sequences to tensors on CPU
+        seqs_tensors = [torch.tensor(seq, dtype=torch.float32) for seq in seqs]
+        max_len = max(len(seq) for seq in seqs)
+        
+        # Pad sequences to same length for batch processing
+        padded_seqs = []
+        for seq_tensor in seqs_tensors:
+            if len(seq_tensor) < max_len:
+                padding = torch.zeros(max_len - len(seq_tensor), self.input_dim)
+                padded = torch.cat([seq_tensor, padding], dim=0)
+            else:
+                padded = seq_tensor
+            padded_seqs.append(padded)
+        
+        all_seqs_tensor = torch.stack(padded_seqs)  # [num_seqs, max_len, input_dim]
+        
+        # Set up optimizer
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
+        
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_positions = 0
+            num_samples = len(seqs)
             
-            # Training pass
-            self.train()
-            for seq, target in zip(seqs, target_tensors):
-                # Convert sequence to tensor
-                input_tensor = torch.tensor(seq, dtype=torch.float32).to(self.device)
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
+            
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = all_seqs_tensor[batch_idx].to(self.device)
+                batch_targets = target_tensors[batch_idx].to(self.device)
                 
-                # Forward pass
-                outputs = self.forward(input_tensor)
+                optimizer.zero_grad()
+                
+                # Forward pass for the whole batch
+                outputs = self.forward(batch_seqs)  # [batch_size, max_len, output_dim]
                 
                 # Compute loss (mean across positions and dimensions)
-                loss = torch.mean((outputs - target) ** 2)
-                total_loss += loss.item() * len(seq)
-                total_positions += len(seq)
+                # Average over sequence dimension
+                pred_targets = outputs.mean(dim=1)  # [batch_size, output_dim]
                 
-                # Backward pass
-                optimizer.zero_grad()
+                # Compute MSE loss
+                loss = torch.mean((pred_targets - batch_targets) ** 2)
+                
                 loss.backward()
-                optimizer.step()               
+                optimizer.step()
+                
+                total_loss += loss.item() * len(batch_idx)
             
             # Calculate average loss
-            avg_loss = total_loss / total_positions
+            avg_loss = total_loss / num_samples
             history.append(avg_loss)
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
@@ -286,17 +359,34 @@ class HierDDab(nn.Module):
             # Update learning rate
             scheduler.step()
             
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
+            
             # Check for improvement
-            if avg_loss < best_loss - tol:
-                best_loss = avg_loss
-                best_state = self.state_dict()
-            else:
-                # No improvement - revert to best state and stop
-                self.load_state_dict(best_state)
+            if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it} iterations")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > best_loss:
+                    self.load_state_dict(best_model_state)                    
+                    print(f"Restored best model state with loss = {best_loss:.8f}")
+                    history[-1] = best_loss
                 break
+            prev_loss = avg_loss
         
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)  
+            print(f"Training ended. Restored best model state with loss = {best_loss:.8f}")
+            history[-1] = best_loss
+        
+        # Store training statistics and compute mean target
+        self._compute_training_statistics(seqs)
+        self._compute_mean_target(seqs)
         self.trained = True
+        
         return history
     
     def predict_t(self, vec_seq):
@@ -309,15 +399,21 @@ class HierDDab(nn.Module):
         Returns:
             list: Predicted target vector
         """
-        outputs = self.describe(vec_seq)
-        if not outputs:
-            return [0.0] * self.model_dims[-1]
-        
-        # Compute average across positions
-        return np.array(outputs).mean(axis=0).tolist()     
+        with torch.no_grad():
+            if isinstance(vec_seq, list):
+                vec_seq = torch.tensor(vec_seq, dtype=torch.float32).to(self.device)
+            
+            if vec_seq.dim() == 2:
+                vec_seq = vec_seq.unsqueeze(0)
+            
+            outputs = self.forward(vec_seq)
+            pred = outputs.mean(dim=1).squeeze(0)
+            
+            return pred.cpu().numpy().tolist()
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
-                  continued=False, auto_mode='gap', decay_rate=1.0, print_every=10):
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                  continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                  batch_size=256, checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training for the hierarchical model with two modes:
           - 'gap': Predicts current input vector (self-consistency)
@@ -329,129 +425,171 @@ class HierDDab(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: Training mode ('gap' or 'reg')
+            self_mode: Training mode ('gap' or 'reg')
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            batch_size: Batch size for training
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
         
         Returns:
             Training loss history
         """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
-        # Convert sequences to tensors
-        seqs_tensor = [torch.tensor(seq, dtype=torch.float32, device=self.device) for seq in seqs]
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
         
-        # Initialize all layers if not continuing training
-        if not continued:
-            for layer in self.layers:
-                # Reinitialize parameters with small random values
-                nn.init.uniform_(layer.linear.weight, -0.1, 0.1)
-                nn.init.uniform_(layer.Acoeff, -0.1, 0.1)
-                
-                # Reinitialize residual components if using 'separate' mode
-                if layer.use_residual == 'separate' and hasattr(layer, 'residual_proj'):
-                    if isinstance(layer.residual_proj, nn.Linear):
-                        nn.init.uniform_(layer.residual_proj.weight, -0.1, 0.1)
-            
-            # Calculate global mean vector of input sequences
-            total = torch.zeros(self.input_dim, device=self.device)
-            total_vectors = 0
-            for seq in seqs_tensor:
-                total += torch.sum(seq, dim=0)
-                total_vectors += seq.size(0)
-            self.mean_t = (total / total_vectors).cpu().numpy()
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+        else:
+            if not continued:
+                self.reset_parameters()   
+            history = []
         
-        # Calculate total training samples
-        total_samples = 0
-        for seq in seqs_tensor:
-            if auto_mode == 'gap':
-                total_samples += seq.size(0)  # All positions are samples
-            else:  # 'reg' mode
-                total_samples += max(0, seq.size(0) - 1)  # All except last position
+        # Convert sequences to tensors on CPU
+        seqs_tensors = [torch.tensor(seq, dtype=torch.float32) for seq in seqs]
+        max_len = max(len(seq) for seq in seqs)
         
-        if total_samples == 0:
-            raise ValueError("No training samples found")
+        # Pad sequences to same length for batch processing
+        padded_seqs = []
+        for seq_tensor in seqs_tensors:
+            if len(seq_tensor) < max_len:
+                padding = torch.zeros(max_len - len(seq_tensor), self.input_dim)
+                padded = torch.cat([seq_tensor, padding], dim=0)
+            else:
+                padded = seq_tensor
+            padded_seqs.append(padded)
         
-        # Setup optimizer
+        all_seqs_tensor = torch.stack(padded_seqs)  # [num_seqs, max_len, input_dim]
+        num_samples = len(seqs)
+        
+        # Set up optimizer
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
             
-            for seq in seqs_tensor:
+            # Shuffle indices
+            perm = torch.randperm(num_samples)
+            
+            # Process each batch
+            for i in range(0, num_samples, batch_size):
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = all_seqs_tensor[batch_idx].to(self.device)
+                
                 optimizer.zero_grad()
                 
                 # Forward pass
-                outputs = self.forward(seq)
+                outputs = self.forward(batch_seqs)  # [batch_size, seq_len, output_dim]
                 
-                # Calculate loss based on auto_mode
+                # Calculate loss based on self_mode
                 loss = 0.0
-                valid_positions = 0
                 
-                for k in range(outputs.size(0)):
-                    # Skip last position in 'reg' mode
-                    if auto_mode == 'reg' and k == seq.size(0) - 1:
-                        continue
-                    
-                    # Determine target based on mode
-                    if auto_mode == 'gap':
-                        target = seq[k]
-                    else:  # 'reg' mode
-                        target = seq[k + 1]
-                    
-                    # Calculate MSE loss
-                    loss += torch.sum((outputs[k] - target) ** 2)
-                    valid_positions += 1
+                if self_mode == 'gap':
+                    # ||Hier[k] - Input[k]||^2
+                    diff = outputs - batch_seqs[:, :, :self.model_dims[-1]]  # Ensure dimensions match
+                    loss = torch.mean(diff ** 2)
+                else:  # 'reg' mode
+                    # Predict next: Hier[k] vs Input[k+1]
+                    if max_len > 1:
+                        # Targets: Input 1 to max_len
+                        targets = batch_seqs[:, 1:, :self.model_dims[-1]]
+                        # Preds: Hier 0 to max_len-1
+                        preds = outputs[:, :-1, :]
+                        
+                        diff = preds - targets
+                        loss = torch.mean(diff ** 2)
+                    else:
+                        loss = torch.tensor(0.0, device=self.device)
                 
-                if valid_positions > 0:
-                    loss = loss / valid_positions
-                    total_loss += loss.item()
-                    loss.backward()
-                    optimizer.step()
+                loss.backward()
+                optimizer.step()
+                
+                total_loss += loss.item() * len(batch_idx)
             
             # Average loss
-            avg_loss = total_loss / len(seqs_tensor)
-            history.append(avg_loss)             
+            avg_loss = total_loss / num_samples
+            history.append(avg_loss)
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
 
             # Update learning rate
             if it % 5 == 0:  # Decay every 5 iterations
                 scheduler.step()
             
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
+            
             # Check convergence
             if prev_loss - avg_loss < tol:
                 print(f"Converged after {it+1} iterations")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > prev_loss:
+                    self.load_state_dict(best_model_state)
+                    print(f"Restored best model state with loss = {best_loss:.6f}")
+                    history[-1] = best_loss                    
                 break
             prev_loss = avg_loss
         
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6f}")            
+            history[-1] = best_loss
+        
+        # Store training statistics and compute mean target
+        self._compute_training_statistics(seqs)
+        self._compute_mean_target(seqs)
         self.trained = True
+        
         return history
     
-    def generate(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
+    def reconstruct(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
         """
-        Generate sequence of vectors with temperature-controlled randomness.
-        Supports both continuous and discrete generation modes.
+        Reconstruct sequence of vectors with temperature-controlled randomness.
+        Supports both continuous and discrete reconstruction modes.
         
         Args:
-            L (int): Number of vectors to generate
+            L (int): Number of vectors to reconstruct
             tau (float): Temperature parameter
             discrete_mode (bool): If True, use discrete sampling
             vocab_size (int): Required for discrete mode
         
         Returns:
-            Generated sequence as numpy array
+            Reconstructed sequence as numpy array
         """
-        assert self.trained and hasattr(self, 'mean_t'), "Model must be auto-trained first"
+        assert self.trained and hasattr(self, 'mean_t'), "Model must be self-trained first"
         if tau < 0:
             raise ValueError("Temperature must be non-negative")
         if discrete_mode and vocab_size is None:
@@ -460,18 +598,18 @@ class HierDDab(nn.Module):
         # Set model to evaluation mode
         self.eval()
         
-        generated = []
+        reconstructed = []
         # Create initial sequence with proper shape and values
-        seq_len = 10  # Fixed sequence length for generation
+        seq_len = 10  # Fixed sequence length for reconstruction
         current_seq = torch.normal(
             mean=0.0,
             std=0.1,
-            size=(seq_len, self.input_dim),
+            size=(1, seq_len, self.input_dim),
             device=self.device
         )
         # Add the learned mean vector to the initial sequence
         mean_tensor = torch.tensor(self.mean_t, device=self.device, dtype=torch.float32)
-        current_seq = current_seq + mean_tensor.unsqueeze(0)  # Broadcast mean to all positions
+        current_seq = current_seq + mean_tensor.unsqueeze(0).unsqueeze(0)  # Broadcast mean to all positions
         
         with torch.no_grad():
             for _ in range(L):
@@ -479,10 +617,10 @@ class HierDDab(nn.Module):
                 outputs = self.forward(current_seq)
                 
                 # Get the last output vector
-                output_vector = outputs[-1]
+                output_vector = outputs[0, -1]
                 
                 if discrete_mode:
-                    # Discrete generation mode
+                    # Discrete reconstruction mode
                     discrete_vector = []
                     for value in output_vector:
                         # Create logits and sample
@@ -500,55 +638,196 @@ class HierDDab(nn.Module):
                     
                     output_vector = torch.tensor(discrete_vector, device=self.device).float()
                 else:
-                    # Continuous generation mode
+                    # Continuous reconstruction mode
                     if tau > 0:
                         noise = torch.normal(0, tau * torch.abs(output_vector) + 0.01)
                         output_vector = output_vector + noise
                 
-                generated.append(output_vector.cpu().numpy())
+                reconstructed.append(output_vector.cpu().numpy())
                 
                 # Update current sequence (shift window)
-                current_seq = torch.cat([current_seq[1:], output_vector.unsqueeze(0)])
+                current_seq = torch.cat([current_seq[:, 1:, :], output_vector.unsqueeze(0).unsqueeze(0)], dim=1)
         
-        return np.array(generated)
+        return np.array(reconstructed)
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint with complete training state
+        
+        Args:
+            checkpoint_file: Path to save checkpoint file
+            iteration: Current training iteration
+            history: Training loss history
+            optimizer: Optimizer instance
+            scheduler: Learning rate scheduler instance
+            best_loss: Best loss achieved so far
+        """
+        # Convert mean_target to numpy for saving
+        mean_target_np = self.mean_target.cpu().numpy() if self.mean_target is not None else None
+        
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'config': {
+                'input_dim': self.input_dim,
+                'model_dims': self.model_dims,
+                'basis_dims': self.basis_dims,
+                'use_residual_list': [layer.use_residual for layer in self.layers],
+            },
+            'training_stats': {
+                'mean_t': self.mean_t,
+                'mean_target': mean_target_np
+            }
+        }
+        torch.save(checkpoint, checkpoint_file)
+        #print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
+
+    def _compute_training_statistics(self, seqs, batch_size=256):
+        """Compute and store statistics for reconstruction"""
+        # Flatten all sequences to compute mean
+        all_vectors = []
+        for seq in seqs:
+            all_vectors.extend(seq)
+        
+        if all_vectors:
+            all_vectors_tensor = torch.tensor(all_vectors, dtype=torch.float32, device=self.device)
+            self.mean_t = all_vectors_tensor.mean(dim=0).cpu().numpy()
+        else:
+            self.mean_t = np.zeros(self.input_dim)
+
+    def _compute_mean_target(self, seqs, batch_size=256):
+        """
+        Compute the mean target vector in the final hierarchical layer output space
+        This represents the average pattern learned by the entire hierarchical model
+        """
+        if not seqs:
+            self.mean_target = None
+            return
+            
+        final_dim = self.model_dims[-1] if self.model_dims else self.input_dim
+        total_output = torch.zeros(final_dim, device=self.device)
+        total_sequences = 0
+        
+        # Process sequences in batches
+        for i in range(0, len(seqs), batch_size):
+            batch_seqs = seqs[i:i+batch_size]
+            batch_tensors = []
+            
+            for seq in batch_seqs:
+                seq_tensor = torch.tensor(seq, dtype=torch.float32, device=self.device)
+                batch_tensors.append(seq_tensor)
+            
+            # Find max length in batch
+            max_len = max(len(seq) for seq in batch_seqs)
+            
+            # Pad sequences in batch
+            padded_batch = []
+            for seq_tensor in batch_tensors:
+                if len(seq_tensor) < max_len:
+                    padding = torch.zeros(max_len - len(seq_tensor), self.input_dim, device=self.device)
+                    padded = torch.cat([seq_tensor, padding], dim=0)
+                else:
+                    padded = seq_tensor
+                padded_batch.append(padded.unsqueeze(0))
+            
+            if padded_batch:
+                batch_tensor = torch.cat(padded_batch, dim=0)
+                
+                with torch.no_grad():
+                    output = self.forward(batch_tensor)
+                    
+                    # Mean over sequence, Sum over batch
+                    batch_means = output.mean(dim=1)
+                    total_output += batch_means.sum(dim=0)
+                    total_sequences += len(batch_seqs)
+        
+        if total_sequences > 0:
+            self.mean_target = total_output / total_sequences
+        else:
+            self.mean_target = None
+    
+    def reset_parameters(self):
+        """Reset all model parameters"""
+        for layer in self.layers:
+            # Reinitialize parameters with small random values
+            nn.init.uniform_(layer.linear.weight, -0.1, 0.1)
+            nn.init.uniform_(layer.Acoeff, -0.1, 0.1)
+            
+            # Reinitialize residual components if using 'separate' mode
+            if layer.use_residual == 'separate' and hasattr(layer, 'residual_proj'):
+                if isinstance(layer.residual_proj, nn.Linear):
+                    nn.init.uniform_(layer.residual_proj.weight, -0.1, 0.1)
+        
+        # Reset training state        
+        self.mean_target = None
+        self.trained = False
+        self.mean_t = None
 
     def count_parameters(self):
         """
-        Calculate and print the number of learnable parameters
+        Calculate and print the number of learnable parameters in table format
         """
         total_params = 0
-        print("Model Parameter Counts:")
         
-        in_dim = self.input_dim
+        print("="*70)
+        print(f"{'Component':<15} | {'Layer/Param':<25} | {'Count':<15} | {'Shape':<20}")
+        print("-"*70)
+        
+        # Count parameters for each layer
         for l_idx, layer in enumerate(self.layers):
+            in_dim = self.input_dim if l_idx == 0 else self.model_dims[l_idx-1]
             out_dim = self.model_dims[l_idx]
             basis_dim = self.basis_dims[l_idx]
+            layer_params = 0
+            layer_name = f"Layer {l_idx}"
             
-            # Parameter counts
-            linear_params = sum(p.numel() for p in layer.linear.parameters())
-            A_params = layer.Acoeff.numel()
+            # Linear parameters
+            num = layer.linear.weight.numel()
+            shape = str(tuple(layer.linear.weight.shape))
+            print(f"{layer_name:<15} | {'linear':<25} | {num:<15} | {shape:<20}")
+            layer_params += num
+            total_params += num
+            
+            # Acoeff parameters
+            num = layer.Acoeff.numel()
+            shape = str(tuple(layer.Acoeff.shape))
+            print(f"{layer_name:<15} | {'Acoeff':<25} | {num:<15} | {shape:<20}")
+            layer_params += num
+            total_params += num
+            
+            # LayerNorm parameters
             norm_params = sum(p.numel() for p in layer.norm.parameters())
-            residual_params = sum(p.numel() for p in layer.residual_proj.parameters()) if layer.residual_proj else 0
+            shape = f"({out_dim},)"  # LayerNorm has parameters of size out_dim
+            print(f"{layer_name:<15} | {'LayerNorm':<25} | {norm_params:<15} | {shape:<20}")
+            layer_params += norm_params
+            total_params += norm_params
             
-            layer_params = linear_params + A_params + norm_params + residual_params
-            total_params += layer_params
+            # Residual projection parameters if using 'separate' mode
+            if layer.use_residual == 'separate' and hasattr(layer, 'residual_proj'):
+                if isinstance(layer.residual_proj, nn.Linear):
+                    num = layer.residual_proj.weight.numel()
+                    shape = str(tuple(layer.residual_proj.weight.shape))
+                    print(f"{layer_name:<15} | {'residual_proj':<25} | {num:<15} | {shape:<20}")
+                    layer_params += num
+                    total_params += num
             
-            print(f"  Layer {l_idx} (in_dim: {in_dim}, out_dim: {out_dim}, basis_dim: {basis_dim}, residual: {layer.use_residual}):")
-            print(f"    Linear: {linear_params} params")
-            print(f"    Acoeff: {A_params} params")
-            print(f"    Bbasis: Fixed (non-trainable)")
-            print(f"    LayerNorm: {norm_params} params")
-            if layer.use_residual == 'separate':
-                print(f"    Residual projection: {residual_params} params")
-            print(f"    Layer total: {layer_params}")
-            
-            in_dim = out_dim  # Update for next layer
+            print(f"{layer_name:<15} | {'TOTAL':<25} | {layer_params:<15} |")
+            print("-"*70)
         
-        print(f"Total parameters: {total_params}")
+        print(f"{'TOTAL':<15} | {'ALL PARAMETERS':<25} | {total_params:<15} |")
+        print("="*70)
+        
         return total_params
     
     def save(self, filename):
         """Save model state to file"""
+        # Convert mean_target to numpy for saving
+        mean_target_np = self.mean_target.cpu().numpy() if self.mean_target is not None else None
+        
         torch.save({
             'model_state_dict': self.state_dict(),
             'config': {
@@ -557,7 +836,10 @@ class HierDDab(nn.Module):
                 'basis_dims': self.basis_dims,
                 'use_residual_list': [layer.use_residual for layer in self.layers]
             },
-            'mean_t': self.mean_t if hasattr(self, 'mean_t') else None
+            'training_stats': {
+                'mean_t': self.mean_t if hasattr(self, 'mean_t') else None,
+                'mean_target': mean_target_np
+            }
         }, filename)
         print(f"Model saved to {filename}")
     
@@ -585,11 +867,15 @@ class HierDDab(nn.Module):
         # Load state
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # Load additional attributes
-        if 'mean_t' in checkpoint:
-            model.mean_t = checkpoint['mean_t']
+        # Load training statistics
+        if 'training_stats' in checkpoint:
+            stats = checkpoint['training_stats']
+            if stats['mean_t'] is not None:
+                model.mean_t = stats['mean_t']
+            if stats['mean_target'] is not None:
+                model.mean_target = torch.tensor(stats['mean_target'], device=device)
+            model.trained = True
             
-        model.trained = True
         print(f"Model loaded from {filename}")
         return model
     
@@ -644,19 +930,22 @@ if __name__ == "__main__":
     )
     
     # Show model structure
-    print("\nModel structure:")
+    print("\nModel parameter counts (table format):")
     model.count_parameters()
     
-    # Train model
-    print("\nTraining model...")
-    history = model.grad_train(
+    # Train model with batch processing and checkpointing
+    print("\nTraining model with batch processing and checkpointing...")
+    history = model.reg_train(
         seqs,
         t_list,
         learning_rate=0.01,
-        max_iters=50,
-        tol=1e-88,
-        decay_rate=0.98,
-        print_every=10
+        max_iters=100,
+        tol=1e-8,
+        decay_rate=0.99,
+        print_every=10,
+        batch_size=32,
+        checkpoint_file='hierddab_gd_checkpoint.pth',
+        checkpoint_interval=10
     )
     
     # Evaluate predictions
@@ -675,7 +964,7 @@ if __name__ == "__main__":
     print(f"Average correlation: {np.mean(corrs):.4f}")     
     
     # Save and load demonstration
-    print("\n Save and load demonstration:")
+    print("\nSave and load demonstration:")
     model.save("hierarchical_model.pth")
     
     # Load the model
@@ -690,13 +979,13 @@ if __name__ == "__main__":
     print(f"Loaded model prediction: {loaded_output}")
     print(f"Predictions match: {np.allclose(original_output, loaded_output, atol=1e-6)}")
 
-    # Example of using the new auto_train and generate methods
+    # Example of using the new self_train and reconstruct methods
     print("\n" + "="*50)
-    print("Example of using auto_train and generate methods")
+    print("Example of using self_train and reconstruct methods")
     print("="*50)
 
-    # Create a new model for auto-training
-    auto_model = HierDDab(
+    # Create a new model for self-training
+    self_model = HierDDab(
         input_dim=input_dim,
         model_dims=[10, 20, 10],
         basis_dims=basis_dims,
@@ -704,35 +993,89 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Auto-train the model in 'gap' mode
-    print("\nAuto-training model in 'gap' mode...")
-    auto_history = auto_model.auto_train(
+    # Self-train the model in 'gap' mode with checkpointing
+    print("\nSelf-training model in 'gap' mode with checkpointing...")
+    self_history = self_model.self_train(
         seqs[:10],
         max_iters=20,
         learning_rate=0.01,
-        auto_mode='gap',
-        print_every=5
+        self_mode='gap',
+        print_every=5,
+        batch_size=16,
+        checkpoint_file='hierddab_self_checkpoint.pth',
+        checkpoint_interval=5
     )
     
-    # Generate new sequences
-    print("\nGenerating new sequences...")
-    generated_seq = auto_model.generate(L=5, tau=0.1)
-    print(f"Generated sequence shape: {generated_seq.shape}")
-    print("First 5 generated vectors:")
-    for i, vec in enumerate(generated_seq):
+    # Reconstruct new sequences
+    print("\nReconstructing new sequences...")
+    reconstructed_seq = self_model.reconstruct(L=5, tau=0.1)
+    print(f"Reconstructed sequence shape: {reconstructed_seq.shape}")
+    print("First 5 reconstructed vectors:")
+    for i, vec in enumerate(reconstructed_seq):
         print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")
     
-    # Save and load model
-    print("\nSaving and loading model...")
-    auto_model.save("auto_model.pth")
-    loaded_model = HierDDab.load("auto_model.pth", device=device)
+    # Test self-training in 'reg' mode
+    print("\n" + "="*50)
+    print("Testing self-training in 'reg' mode")
+    print("="*50)
     
-    # Generate with loaded model
-    loaded_generated = loaded_model.generate(L=3, tau=0.05)
-    print("Generated with loaded model:")
-    for i, vec in enumerate(loaded_generated):
-        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")    
+    reg_model = HierDDab(
+        input_dim=input_dim,
+        model_dims=[8, 6, 4],
+        basis_dims=basis_dims,
+        use_residual_list=use_residual_list,
+        device=device
+    )
     
-    print("Training and testing completed!")
+    # Self-train in 'reg' mode
+    reg_history = reg_model.self_train(
+        seqs[:5],
+        max_iters=10,
+        learning_rate=0.01,
+        self_mode='reg',
+        print_every=2,
+        batch_size=8
+    )
+    
+    # Save and load model with checkpoint resume capability
+    print("\nTesting checkpoint resume capability...")
+    
+    # Train a model and save checkpoint
+    checkpoint_model = HierDDab(
+        input_dim=input_dim,
+        model_dims=[8, 6, 3],
+        basis_dims=[100, 80, 60],
+        use_residual_list=['separate', 'separate', 'separate'],
+        device=device
+    )
+    
+    # First training session (10 iterations)
+    print("\nFirst training session (10 iterations)...")
+    checkpoint_model.reg_train(
+        seqs[:3],
+        t_list[:3],
+        max_iters=10,
+        learning_rate=0.01,
+        print_every=5,
+        batch_size=4,
+        checkpoint_file='hierddab_resume_checkpoint.pth',
+        checkpoint_interval=5
+    )
+    
+    # Resume training from checkpoint
+    print("\nResuming training from checkpoint...")
+    checkpoint_model.reg_train(
+        seqs[:3],
+        t_list[:3],
+        max_iters=20,
+        learning_rate=0.01,
+        continued=True,
+        print_every=5,
+        batch_size=4,
+        checkpoint_file='hierddab_resume_checkpoint.pth',
+        checkpoint_interval=5
+    )
+    
+    print("\nAll training and testing completed successfully!")
         
     print("\n=== Hierarchical Vector Sequence Processing with Residual Connections Completed ===")
