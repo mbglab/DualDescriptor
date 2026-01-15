@@ -2,7 +2,7 @@
 # Hierarchical Dual Descriptor (P Matrix form) and Character Sequence Input (HierDDpmC)
 # Combines character-level processing and hierarchical vector processing
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-10-11 ~ 2026-1-13
 
 import math
 import random
@@ -409,7 +409,7 @@ class HierDDpmC(nn.Module):
             target = output.mean(dim=1)  # Average over sequence length
             return target.squeeze(0).cpu().numpy()
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
                    continued=False, decay_rate=1.0, print_every=10, batch_size=1024,
                    checkpoint_file=None, checkpoint_interval=10):
         """
@@ -541,11 +541,11 @@ class HierDDpmC(nn.Module):
         
         return history
     
-    def auto_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
-                   continued=False, auto_mode='gap', decay_rate=1.0, print_every=10,
-                   checkpoint_file=None, checkpoint_interval=5):
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+                   continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                   batch_size=1024, checkpoint_file=None, checkpoint_interval=5):
         """
-        Self-training method for the hierarchical model
+        Self-training method for the hierarchical model with batch processing
         
         Args:
             seqs: List of character sequences
@@ -553,21 +553,23 @@ class HierDDpmC(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: 'gap' or 'reg' training mode
+            self_mode: 'gap' or 'reg' training mode
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            batch_size: Batch size for training (improves vector parallelization and reduces CPU-GPU data transfer)
             checkpoint_file: Path to save/load checkpoint file for resuming training
             checkpoint_interval: Interval (in iterations) for saving checkpoints
             
         Returns:
             list: Training loss history
         """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
         
         # Load checkpoint if continuing and checkpoint file exists
         start_iter = 0
         best_loss = float('inf')
+        best_model_state = None
         
         if continued and checkpoint_file and os.path.exists(checkpoint_file):
             checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
@@ -577,7 +579,7 @@ class HierDDpmC(nn.Module):
             history = checkpoint['history']
             start_iter = checkpoint['iteration'] + 1
             best_loss = checkpoint.get('best_loss', float('inf'))
-            print(f"Resumed auto-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
         else:
             if not continued:
                 self.reset_parameters()   
@@ -596,56 +598,74 @@ class HierDDpmC(nn.Module):
         
         for it in range(start_iter, max_iters):
             total_loss = 0.0
-            total_samples = 0
+            total_batches = 0
             
-            # Process each sequence
-            for seq in seqs:
-                # Convert to tensor through char layer
-                char_output = self.char_sequence_to_tensor(seq)  # [1, seq_len, vec_dim]
-                seq_len = char_output.shape[1]
+            # Shuffle sequences for batch processing
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+            
+            # Process in batches
+            for batch_start in range(0, len(seqs), batch_size):
+                batch_end = min(batch_start + batch_size, len(seqs))
+                batch_indices = indices[batch_start:batch_end]
+                batch_seqs = [seqs[idx] for idx in batch_indices]
                 
-                if seq_len <= 1 and auto_mode == 'reg':
-                    continue  # Skip sequences that are too short for reg mode
+                optimizer.zero_grad()
+                batch_loss = 0.0
+                batch_valid_samples = 0
                 
-                # Forward pass through hierarchical layers
-                positions = torch.arange(seq_len, device=self.device)
-                hierarchical_output = char_output
-                for layer in self.hierarchical_layers:
-                    hierarchical_output = layer(hierarchical_output, positions)
-                
-                # Compute loss based on auto_mode
-                seq_loss = 0.0
-                valid_positions = 0
-                
-                for k in range(seq_len):
-                    if auto_mode == 'gap':
-                        # Self-consistency: output should match char layer output
-                        target = char_output[0, k]
-                        pred = hierarchical_output[0, k]
-                        seq_loss += torch.sum((pred - target) ** 2)
-                        valid_positions += 1
-                    else:  # 'reg' mode
-                        if k < seq_len - 1:
-                            # Predict next position's char layer output
-                            target = char_output[0, k + 1]
+                # Process each sequence in the batch
+                for seq in batch_seqs:
+                    # Convert to tensor through char layer
+                    char_output = self.char_sequence_to_tensor(seq)  # [1, seq_len, vec_dim]
+                    seq_len = char_output.shape[1]
+                    
+                    if seq_len <= 1 and self_mode == 'reg':
+                        continue  # Skip sequences that are too short for reg mode
+                    
+                    # Forward pass through hierarchical layers
+                    positions = torch.arange(seq_len, device=self.device)
+                    hierarchical_output = char_output
+                    for layer in self.hierarchical_layers:
+                        hierarchical_output = layer(hierarchical_output, positions)
+                    
+                    # Compute loss based on self_mode
+                    seq_loss = 0.0
+                    valid_positions = 0
+                    
+                    for k in range(seq_len):
+                        if self_mode == 'gap':
+                            # Self-consistency: output should match char layer output
+                            target = char_output[0, k]
                             pred = hierarchical_output[0, k]
                             seq_loss += torch.sum((pred - target) ** 2)
                             valid_positions += 1
-                
-                if valid_positions > 0:
-                    seq_loss = seq_loss / valid_positions
-                    total_loss += seq_loss.item()
-                    total_samples += 1
+                        else:  # 'reg' mode
+                            if k < seq_len - 1:
+                                # Predict next position's char layer output
+                                target = char_output[0, k + 1]
+                                pred = hierarchical_output[0, k]
+                                seq_loss += torch.sum((pred - target) ** 2)
+                                valid_positions += 1
                     
-                    # Backward pass
-                    optimizer.zero_grad()
-                    seq_loss.backward()
+                    if valid_positions > 0:
+                        seq_loss = seq_loss / valid_positions
+                        batch_loss += seq_loss
+                        batch_valid_samples += 1
+                
+                # Only backpropagate if we have valid samples
+                if batch_valid_samples > 0:
+                    batch_loss = batch_loss / batch_valid_samples
+                    batch_loss.backward()
                     optimizer.step()
+                    
+                    total_loss += batch_loss.item() * batch_valid_samples
+                    total_batches += 1
             
-            if total_samples == 0:
+            if total_batches == 0:
                 avg_loss = 0.0
             else:
-                avg_loss = total_loss / total_samples
+                avg_loss = total_loss / len(seqs)
                 
             history.append(avg_loss)
             
@@ -656,8 +676,8 @@ class HierDDpmC(nn.Module):
             
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
             
             # Save checkpoint at specified intervals
             if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
@@ -818,79 +838,9 @@ class HierDDpmC(nn.Module):
         else:
             self.mean_target = None
     
-    def reconstruct(self):
+    def reconstruct(self, L, tau=0.0):
         """
-        Reconstruct representative character sequence using the entire hierarchical model.
-        
-        This method leverages the complete model architecture including both the character layer
-        and all hierarchical layers to reconstruct a sequence that best represents the learned
-        patterns from the training data.
-        
-        Returns:
-            str: Reconstructed character sequence
-        """
-        assert self.trained, "Model must be trained first"
-        assert self.mean_target is not None, "Mean target vector must be computed first"
-        
-        # Determine sequence length based on training statistics
-        n_tokens = round(self.mean_token_count)
-        if n_tokens <= 0:
-            n_tokens = 10  # Default minimum length
-        
-        # Get the target vector from the final hierarchical layer output space
-        final_dim = self.model_dims[-1] if self.model_dims else self.vec_dim
-        
-        # Precompute all token embeddings
-        all_token_indices = torch.arange(len(self.tokens), device=self.device)
-        seq_tokens = []
-        
-        # Track current sequence state for hierarchical processing
-        current_sequence = ""
-        
-        for k in range(n_tokens):
-            best_tok = None
-            min_error = float('inf')
-            
-            # Evaluate each possible token at this position
-            for token_idx, token in enumerate(self.tokens):
-                # Build candidate sequence
-                candidate_seq = current_sequence + token
-                
-                # Process through entire hierarchical model
-                with torch.no_grad():
-                    model_output = self.forward(candidate_seq)
-                    
-                    # Get the prediction (average over sequence)
-                    if model_output.numel() > 0:
-                        pred_target = model_output.mean(dim=1).squeeze(0)
-                        
-                        # Compute error compared to mean target
-                        error = torch.sum((pred_target - self.mean_target) ** 2).item()
-                        
-                        if error < min_error:
-                            min_error = error
-                            best_tok = token
-            
-            # Add best token to sequence
-            if best_tok is not None:
-                seq_tokens.append(best_tok)
-                current_sequence = ''.join(seq_tokens)
-            else:
-                # Fallback: use character layer reconstruction
-                char_layer_recon = self.char_reconstruct()
-                return char_layer_recon
-        
-        reconstructed_seq = ''.join(seq_tokens)
-        
-        # Remove padding characters if present
-        if '_' in reconstructed_seq:
-            reconstructed_seq = reconstructed_seq.replace('_', '')
-        
-        return reconstructed_seq
-
-    def generate(self, L, tau=0.0):
-        """
-        Generate character sequence of length L using the entire hierarchical model.
+        Reconstruct character sequence of length L using the entire hierarchical model.
         
         This method uses temperature-controlled sampling based on the complete model's
         predictions, incorporating both character-level and hierarchical patterns.
@@ -902,7 +852,7 @@ class HierDDpmC(nn.Module):
                         tau>0: stochastic selection with temperature
             
         Returns:
-            str: Generated character sequence
+            str: Reconstructed character sequence
         """
         assert self.trained, "Model must be trained first"
         assert self.mean_target is not None, "Mean target vector must be computed first"
@@ -1170,7 +1120,7 @@ if __name__ == "__main__":
     print("Gradient Descent Training")
     print("="*50)
     
-    gd_history = model.grad_train(
+    reg_history = model.reg_train(
         seqs, t_list,
         max_iters=100,
         learning_rate=0.1,
@@ -1206,30 +1156,21 @@ if __name__ == "__main__":
     print("Sequence Reconstruction")
     print("="*50)
     
-    reconstructed_seq = model.reconstruct()
-    print(f"Reconstructed sequence (length {len(reconstructed_seq)}):")
-    print(f"First 100 chars: {reconstructed_seq[:100]}")
+    # Deterministic reconstruction
+    det_seq = model.reconstruct(L=100, tau=0.0)
+    print(f"Deterministic reconstruction (tau=0.0): {det_seq}")
     
-    # Sequence generation
+    # Stochastic reconstruction
+    stoch_seq = model.reconstruct(L=100, tau=0.5)
+    print(f"Stochastic reconstruction (tau=0.5): {stoch_seq}")
+    
+    # Self-training example
     print("\n" + "="*50)
-    print("Sequence Generation")
+    print("Self-Training Example")
     print("="*50)
     
-    # Deterministic generation
-    det_seq = model.generate(L=100, tau=0.0)
-    print(f"Deterministic generation (tau=0.0): {det_seq}")
-    
-    # Stochastic generation
-    stoch_seq = model.generate(L=100, tau=0.5)
-    print(f"Stochastic generation (tau=0.5): {stoch_seq}")
-    
-    # Auto-training example
-    print("\n" + "="*50)
-    print("Auto-Training Example")
-    print("="*50)
-    
-    # Create a new model for auto-training
-    auto_model = HierDDpmC(
+    # Create a new model for self-training
+    self_model = HierDDpmC(
         charset=charset,
         rank=rank,
         vec_dim=vec_dim,
@@ -1239,27 +1180,28 @@ if __name__ == "__main__":
         device=device
     )
     
-    # Use shorter sequences for auto-training
-    auto_seqs = []
+    # Use shorter sequences for self-training
+    self_seqs = []
     for _ in range(100):
         L = random.randint(100, 200)
-        auto_seqs.append(''.join(random.choices(charset, k=L)))
+        self_seqs.append(''.join(random.choices(charset, k=L)))
     
-    # Auto-train in gap mode
-    print("\nAuto-training in 'gap' mode...")
-    auto_history_gap = auto_model.auto_train(
-        auto_seqs,
+    # Self-train in gap mode
+    print("\nSelf-training in 'gap' mode...")
+    self_history_gap = self_model.self_train(
+        self_seqs,
         max_iters=30,
         learning_rate=0.01,
-        auto_mode='gap',
+        self_mode='gap',
         print_every=5,
-        checkpoint_file='auto_checkpoint.pth',
+        batch_size=256,
+        checkpoint_file='self_checkpoint.pth',
         checkpoint_interval=5
     )
     
-    # Generate from auto-trained model
-    auto_gen_seq = auto_model.generate(L=80, tau=0.2)
-    print(f"Generated from auto-trained model: {auto_gen_seq}")
+    # Reconstruct from self-trained model
+    self_rec_seq = self_model.reconstruct(L=80, tau=0.2)
+    print(f"Reconstructed from self-trained model: {self_rec_seq}")
     
     # Model save and load test
     print("\n" + "="*50)
@@ -1288,18 +1230,33 @@ if __name__ == "__main__":
     else:
         print("✗ Model save/load test FAILED")
     
-    # Test generation consistency
+    # Test reconstruction consistency
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    original_gen = model.generate(L=50, tau=0.1)
+    original_rec = model.reconstruct(L=50, tau=0.1)
     
     torch.manual_seed(123); random.seed(123); np.random.seed(123)
-    loaded_gen = loaded_model.generate(L=50, tau=0.1)
+    loaded_rec = loaded_model.reconstruct(L=50, tau=0.1)
     
-    if original_gen == loaded_gen:
-        print("✓ Generation consistency test PASSED")
+    if original_rec == loaded_rec:
+        print("✓ Reconstruction consistency test PASSED")
     else:
-        print("✗ Generation consistency test FAILED")
-        print(f"Original: {original_gen}")
-        print(f"Loaded:   {loaded_gen}")
+        print("✗ Reconstruction consistency test FAILED")
+        print(f"Original: {original_rec}")
+        print(f"Loaded:   {loaded_rec}")
+    
+    # Character-level functionality test
+    print("\n" + "="*50)
+    print("Character-Level Functionality Test")
+    print("="*50)
+    
+    test_seq = "ACGTACGTACGT"
+    char_vectors = model.char_describe(test_seq)
+    print(f"Character vectors for '{test_seq}': shape {char_vectors.shape}")
+    
+    char_recon = model.char_reconstruct()
+    print(f"Character-level reconstruction: {char_recon[:50]}...")
+    
+    char_gen = model.char_generate(L=30, tau=0.1)
+    print(f"Character-level generation: {char_gen}")
     
     print("\nAll tests completed successfully!")

@@ -2,7 +2,7 @@
 # The Hierarchical Numeric Dual Descriptor (P Matrix form) implemented with PyTorch
 # With layer normalization and residual connections and generation capability
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-26 ~ 2026-1-13
 
 import math
 import random
@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import copy
+import os
 
 class Layer(nn.Module):
     """Single layer of Hierarchical Dual Descriptor (with 2D P matrix)"""
@@ -129,7 +131,7 @@ class HierDDpm(nn.Module):
         else:
             self.use_residual_list = use_residual_list            
         self.num_layers = len(model_dims)
-        self.device = device
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.trained = False  # Track training status
         
         # Create hierarchical layers
@@ -140,7 +142,7 @@ class HierDDpm(nn.Module):
             in_dim = out_dim  # Next layer input is current layer output
         
         self.layers = nn.ModuleList(layers)
-        self.to(device)
+        self.to(self.device)
     
     def forward(self, seq):
         """
@@ -189,10 +191,11 @@ class HierDDpm(nn.Module):
         
         return total_loss / count if count else 0.0
     
-    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
-                    decay_rate=0.999, print_every=10):
+    def reg_train(self, seqs, t_list, max_iters=1000, tol=1e-88, lr=0.01, 
+                    decay_rate=0.999, print_every=10, continued=False,
+                    checkpoint_file=None, checkpoint_interval=10):
         """
-        Train model using Adam optimizer
+        Train model using Adam optimizer with checkpoint support
         
         Args:
             seqs (list): List of training sequences
@@ -201,16 +204,43 @@ class HierDDpm(nn.Module):
             lr (float): Learning rate
             decay_rate (float): Learning rate decay rate
             print_every (int): Print progress every N iterations
+            continued (bool): Whether to continue from existing parameters
+            checkpoint_file (str): Path to save/load checkpoint file for resuming training
+            checkpoint_interval (int): Interval (in iterations) for saving checkpoints
         
         Returns:
             list: Training loss history
         """
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6e}")
+        else:
+            if not continued:
+                self.reset_parameters()
+            history = []
+        
         optimizer = optim.Adam(self.parameters(), lr=lr)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        history = []
-        prev_loss = float('inf')
         
-        for it in range(max_iters):
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
+        
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
             count = 0
             
@@ -235,21 +265,43 @@ class HierDDpm(nn.Module):
             # Record and print progress
             avg_loss = total_loss / count
             history.append(avg_loss)
-
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"Iter {it:4d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
-
+            
             # Update learning rate
             scheduler.step()
-
+            
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
+            
             # Check convergence
             if abs(prev_loss - avg_loss) < tol:
                 print(f"Converged after {it+1} iterations.")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > prev_loss:
+                    self.load_state_dict(best_model_state)                    
+                    print(f"Restored best model state with loss = {best_loss:.6e}")
+                    history[-1] = best_loss
                 break
                 
             prev_loss = avg_loss
+        
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)  
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6e}")
+            history[-1] = best_loss
         
         self.trained = True
         return history
@@ -268,8 +320,9 @@ class HierDDpm(nn.Module):
         outputs = self.forward(seq)
         return outputs.mean(dim=1)  # Average over sequence length
 
-    def auto_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
-                  continued=False, auto_mode='gap', decay_rate=1.0, print_every=10):
+    def self_train(self, seqs, max_iters=100, tol=1e-16, learning_rate=0.01, 
+                  continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
+                  checkpoint_file=None, checkpoint_interval=5):
         """
         Self-training for the hierarchical model with two modes:
           - 'gap': Predicts current input vector (self-consistency)
@@ -281,15 +334,34 @@ class HierDDpm(nn.Module):
             tol: Convergence tolerance
             learning_rate: Initial learning rate
             continued: Whether to continue from existing parameters
-            auto_mode: Training mode ('gap' or 'reg')
+            self_mode: Training mode ('gap' or 'reg')
             decay_rate: Learning rate decay rate
             print_every: Print interval
+            checkpoint_file: Path to save/load checkpoint file for resuming training
+            checkpoint_interval: Interval (in iterations) for saving checkpoints
         
         Returns:
             Training loss history
         """
-        if auto_mode not in ('gap', 'reg'):
-            raise ValueError("auto_mode must be either 'gap' or 'reg'")
+        if self_mode not in ('gap', 'reg'):
+            raise ValueError("self_mode must be either 'gap' or 'reg'")
+        
+        # Load checkpoint if continuing and checkpoint file exists
+        start_iter = 0
+        best_loss = float('inf')
+        best_model_state = None
+        
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            checkpoint = torch.load(checkpoint_file, map_location=self.device, weights_only=False)
+            self.load_state_dict(checkpoint['model_state_dict'])
+            optimizer_state = checkpoint['optimizer_state_dict']
+            scheduler_state = checkpoint['scheduler_state_dict']
+            history = checkpoint['history']
+            start_iter = checkpoint['iteration'] + 1
+            best_loss = checkpoint.get('best_loss', float('inf'))
+            print(f"Resumed self-training from checkpoint at iteration {start_iter}, best loss: {best_loss:.6f}")
+        else:
+            history = []
         
         # Convert sequences to tensors
         seqs_tensor = [torch.tensor(seq, dtype=torch.float32, device=self.device) for seq in seqs]
@@ -317,7 +389,7 @@ class HierDDpm(nn.Module):
         # Calculate total training samples
         total_samples = 0
         for seq in seqs_tensor:
-            if auto_mode == 'gap':
+            if self_mode == 'gap':
                 total_samples += seq.size(0)  # All positions are samples
             else:  # 'reg' mode
                 total_samples += max(0, seq.size(0) - 1)  # All except last position
@@ -329,10 +401,14 @@ class HierDDpm(nn.Module):
         optimizer = optim.Adam(self.parameters(), lr=learning_rate)
         scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
         
-        history = []
-        prev_loss = float('inf')
+        # Load optimizer and scheduler states if resuming
+        if continued and checkpoint_file and os.path.exists(checkpoint_file):
+            optimizer.load_state_dict(optimizer_state)
+            scheduler.load_state_dict(scheduler_state)
         
-        for it in range(max_iters):
+        prev_loss = float('inf') if start_iter == 0 else history[-1] if history else float('inf')
+        
+        for it in range(start_iter, max_iters):
             total_loss = 0.0
             
             for seq in seqs_tensor:
@@ -350,17 +426,17 @@ class HierDDpm(nn.Module):
                 # Remove batch dimension
                 current = current.squeeze(0)
                 
-                # Calculate loss based on auto_mode
+                # Calculate loss based on self_mode
                 loss = 0.0
                 valid_positions = 0
                 
                 for k in range(current.size(0)):
                     # Skip last position in 'reg' mode
-                    if auto_mode == 'reg' and k == seq.size(0) - 1:
+                    if self_mode == 'reg' and k == seq.size(0) - 1:
                         continue
                     
                     # Determine target based on mode
-                    if auto_mode == 'gap':
+                    if self_mode == 'gap':
                         target = seq[k]
                     else:  # 'reg' mode
                         target = seq[k + 1]
@@ -377,42 +453,64 @@ class HierDDpm(nn.Module):
             
             # Average loss
             avg_loss = total_loss / len(seqs_tensor)
-            history.append(avg_loss)             
+            history.append(avg_loss)
+            
+            # Update best model state if current loss is lower
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
             
             # Print progress
             if it % print_every == 0 or it == max_iters - 1:
                 current_lr = scheduler.get_last_lr()[0]
-                mode_display = "Gap" if auto_mode == 'gap' else "Reg"
-                print(f"AutoTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-
+                mode_display = "Gap" if self_mode == 'gap' else "Reg"
+                print(f"SelfTrain({mode_display}) Iter {it:3d}: loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
+            
             # Update learning rate
             if it % 5 == 0:  # Decay every 5 iterations
                 scheduler.step()
             
+            # Save checkpoint at specified intervals
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(
+                    checkpoint_file, it, history, optimizer, scheduler, best_loss
+                )
+            
             # Check convergence
             if prev_loss - avg_loss < tol:
                 print(f"Converged after {it+1} iterations")
+                # Restore the best model state before breaking
+                if best_model_state is not None and avg_loss > prev_loss:
+                    self.load_state_dict(best_model_state)
+                    print(f"Restored best model state with loss = {best_loss:.6f}")
+                    history[-1] = best_loss                    
                 break
             prev_loss = avg_loss
+        
+        # If training ended without convergence, restore best model state
+        if best_model_state is not None and best_loss < history[-1]:
+            self.load_state_dict(best_model_state)
+            print(f"Training ended. Restored best model state with loss = {best_loss:.6f}")            
+            history[-1] = best_loss
         
         self.trained = True
         return history
     
-    def generate(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
+    def reconstruct(self, L, tau=0.0, discrete_mode=False, vocab_size=None):
         """
-        Generate sequence of vectors with temperature-controlled randomness.
-        Supports both continuous and discrete generation modes.
+        Reconstruct sequence of vectors with temperature-controlled randomness.
+        Supports both continuous and discrete reconstruction modes.
         
         Args:
-            L (int): Number of vectors to generate
+            L (int): Number of vectors to reconstruct
             tau (float): Temperature parameter
             discrete_mode (bool): If True, use discrete sampling
             vocab_size (int): Required for discrete mode
         
         Returns:
-            Generated sequence as numpy array
+            Reconstructed sequence as numpy array
         """
-        assert self.trained and hasattr(self, 'mean_t'), "Model must be auto-trained first"
+        assert self.trained and hasattr(self, 'mean_t'), "Model must be self-trained first"
         if tau < 0:
             raise ValueError("Temperature must be non-negative")
         if discrete_mode and vocab_size is None:
@@ -421,9 +519,9 @@ class HierDDpm(nn.Module):
         # Set model to evaluation mode
         self.eval()
         
-        generated = []
+        reconstructed = []
         # Create initial sequence with proper shape and values
-        seq_len = 10  # Fixed sequence length for generation
+        seq_len = 10  # Fixed sequence length for reconstruction
         current_seq = torch.normal(
             mean=0.0,
             std=0.1,
@@ -451,7 +549,7 @@ class HierDDpm(nn.Module):
                 output_vector = current[-1]
                 
                 if discrete_mode:
-                    # Discrete generation mode
+                    # Discrete reconstruction mode
                     discrete_vector = []
                     for value in output_vector:
                         # Create logits and sample
@@ -469,17 +567,61 @@ class HierDDpm(nn.Module):
                     
                     output_vector = torch.tensor(discrete_vector, device=self.device).float()
                 else:
-                    # Continuous generation mode
+                    # Continuous reconstruction mode
                     if tau > 0:
                         noise = torch.normal(0, tau * torch.abs(output_vector) + 0.01)
                         output_vector = output_vector + noise
                 
-                generated.append(output_vector.cpu().numpy())
+                reconstructed.append(output_vector.cpu().numpy())
                 
                 # Update current sequence (shift window)
                 current_seq = torch.cat([current_seq[1:], output_vector.unsqueeze(0)])
         
-        return np.array(generated)
+        return np.array(reconstructed)
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        """
+        Save training checkpoint with complete training state
+        
+        Args:
+            checkpoint_file: Path to save checkpoint file
+            iteration: Current training iteration
+            history: Training loss history
+            optimizer: Optimizer instance
+            scheduler: Learning rate scheduler instance
+            best_loss: Best loss achieved so far
+        """
+        checkpoint = {
+            'iteration': iteration,
+            'model_state_dict': self.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'history': history,
+            'best_loss': best_loss,
+            'config': {
+                'input_dim': self.input_dim,
+                'model_dims': self.model_dims,
+                'use_residual_list': self.use_residual_list
+            }
+        }
+        if hasattr(self, 'mean_t'):
+            checkpoint['mean_t'] = self.mean_t
+        
+        torch.save(checkpoint, checkpoint_file)
+        # print(f"Checkpoint saved at iteration {iteration} to {checkpoint_file}")
+
+    def reset_parameters(self):
+        """Reset all model parameters"""
+        for layer in self.layers:
+            nn.init.uniform_(layer.M, -0.5, 0.5)
+            nn.init.uniform_(layer.P, -0.1, 0.1)
+            
+            if hasattr(layer, 'residual_proj') and isinstance(layer.residual_proj, nn.Linear):
+                nn.init.uniform_(layer.residual_proj.weight, -0.1, 0.1)
+        
+        if hasattr(self, 'mean_t'):
+            delattr(self, 'mean_t')
+        self.trained = False
 
     def count_parameters(self):
         """Count and print learnable parameters in the model by layer and parameter type"""
@@ -612,15 +754,17 @@ if __name__ == "__main__":
     )
     model.count_parameters()
     
-    # Train model
-    print("\nTraining model...")
-    history = model.grad_train(
+    # Train model with checkpoint support
+    print("\nTraining model with checkpoint support...")
+    history = model.reg_train(
         seqs, 
         t_list,
         max_iters=100,
         lr=0.1,
         decay_rate=0.97,
-        print_every=10
+        print_every=10,
+        checkpoint_file='gd_checkpoint.pth',
+        checkpoint_interval=10
     )
     
     # Predict targets
@@ -673,46 +817,90 @@ if __name__ == "__main__":
     diff = torch.sum((original_pred - loaded_pred) ** 2).item()
     print(f"Prediction difference between original and loaded model: {diff:.6e}")
 
-    # Example of using the new auto_train and generate methods
+    # Example of using the new self_train and reconstruct methods
     print("\n" + "="*50)
-    print("Example of using auto_train and generate methods")
+    print("Example of using self_train and reconstruct methods")
     print("="*50)
 
-    # Create a new model for auto-training
-    auto_model = HierDDpm(
+    # Create a new model for self-training
+    self_model = HierDDpm(
         input_dim=input_dim,
         model_dims=[10, 20, 10],
         use_residual_list=use_residual_list,
         device=device
     )
     
-    # Auto-train the model in 'gap' mode
-    print("\nAuto-training model in 'gap' mode...")
-    auto_history = auto_model.auto_train(
+    # Self-train the model in 'gap' mode with checkpoint support
+    print("\nSelf-training model in 'gap' mode...")
+    self_history = self_model.self_train(
         seqs[:10],
         max_iters=20,
         learning_rate=0.01,
-        auto_mode='gap',
-        print_every=5
+        self_mode='gap',
+        print_every=5,
+        checkpoint_file='self_checkpoint.pth',
+        checkpoint_interval=5
     )
     
-    # Generate new sequences
-    print("\nGenerating new sequences...")
-    generated_seq = auto_model.generate(L=5, tau=0.1)
-    print(f"Generated sequence shape: {generated_seq.shape}")
-    print("First 5 generated vectors:")
-    for i, vec in enumerate(generated_seq):
+    # Reconstruct new sequences
+    print("\nReconstructing new sequences...")
+    reconstructed_seq = self_model.reconstruct(L=5, tau=0.1)
+    print(f"Reconstructed sequence shape: {reconstructed_seq.shape}")
+    print("First 5 reconstructed vectors:")
+    for i, vec in enumerate(reconstructed_seq):
         print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")
     
     # Save and load model
     print("\nSaving and loading model...")
-    auto_model.save("auto_model.pth")
-    loaded_model = HierDDpm.load("auto_model.pth", device=device)
+    self_model.save("self_model.pth")
+    loaded_self_model = HierDDpm.load("self_model.pth", device=device)
     
-    # Generate with loaded model
-    loaded_generated = loaded_model.generate(L=3, tau=0.05)
-    print("Generated with loaded model:")
-    for i, vec in enumerate(loaded_generated):
-        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")    
+    # Reconstruct with loaded model
+    loaded_reconstructed = loaded_self_model.reconstruct(L=3, tau=0.05)
+    print("Reconstructed with loaded model:")
+    for i, vec in enumerate(loaded_reconstructed):
+        print(f"Vector {i+1}: {[f'{x:.4f}' for x in vec]}")
     
-    print("Training and testing completed!")
+    # Test checkpoint resuming functionality
+    print("\n" + "="*50)
+    print("Testing checkpoint resuming functionality")
+    print("="*50)
+    
+    # Create another model and train for a few iterations
+    resume_model = HierDDpm(
+        input_dim=input_dim,
+        model_dims=model_dims,
+        use_residual_list=use_residual_list,
+        device=device
+    )
+    
+    print("Training for 5 iterations with checkpoint saving...")
+    resume_history_partial = resume_model.reg_train(
+        seqs[:5], 
+        t_list[:5],
+        max_iters=5,
+        lr=0.1,
+        decay_rate=0.97,
+        print_every=1,
+        checkpoint_file='resume_checkpoint.pth',
+        checkpoint_interval=2
+    )
+    
+    print("Resuming training from checkpoint...")
+    resume_history_full = resume_model.reg_train(
+        seqs[:5], 
+        t_list[:5],
+        max_iters=10,
+        lr=0.1,
+        decay_rate=0.97,
+        print_every=1,
+        continued=True,
+        checkpoint_file='resume_checkpoint.pth',
+        checkpoint_interval=2
+    )
+    
+    print(f"Partial training history: {resume_history_partial}")
+    print(f"Full training history: {resume_history_full}")
+    print(f"Total iterations completed: {len(resume_history_full)}")
+    
+    print("\nTraining and testing completed!")
