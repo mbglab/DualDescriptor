@@ -2,7 +2,7 @@
 # The Hierarchical Numeric Dual Descriptor (Random AB matrix form) with Linker matrices in PyTorch
 # With layer normalization and residual connections and generation capability
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-22 ~ 2026-1-13
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-22 ~ 2026-1-17
 
 import random
 import numpy as np
@@ -189,6 +189,14 @@ class HierDDLrn(nn.Module):
         self.num_layers = len(model_dims)
         self.trained = False
         self.device = device
+        
+        # Classification head for multi-class tasks
+        self.num_classes = None
+        self.classifier = None
+        
+        # Label head for multi-label tasks
+        self.num_labels = None
+        self.labeller = None
         
         # Validate dimensions
         if len(basis_dims) != self.num_layers:
@@ -471,7 +479,390 @@ class HierDDLrn(nn.Module):
         
         # Compute average vector
         return np.mean(outputs, axis=0).tolist()
-
+    
+    def cls_train(self, seqs, labels, num_classes, max_iters=1000, tol=1e-8, learning_rate=0.01,
+                  continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+                  checkpoint_file=None, checkpoint_interval=10):
+        """
+        Train the model for multi-class classification using cross-entropy loss.
+        
+        Args:
+            seqs: List of vector sequences for training
+            labels: List of integer class labels (0 to num_classes-1)
+            num_classes: Number of classes in the classification problem
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            
+        Returns:
+            list: Training loss history
+        """
+        # Initialize classification head if not already done
+        if self.classifier is None or self.num_classes != num_classes:
+            self.classifier = nn.Linear(self.model_dims[-1], num_classes).to(self.device)
+            self.num_classes = num_classes
+        
+        if not continued:
+            # Reset parameters if not continuing
+            for layer in self.layers:
+                nn.init.uniform_(layer.M, -0.5, 0.5)
+                nn.init.uniform_(layer.Acoeff, -0.1, 0.1)
+                nn.init.uniform_(layer.Bbasis, -0.1, 0.1)
+                nn.init.uniform_(layer.Linker, -0.1, 0.1)
+            nn.init.normal_(self.classifier.weight, 0, 0.01)
+            nn.init.constant_(self.classifier.bias, 0)
+        
+        # Convert data to tensors
+        seqs_tensor = torch.tensor(np.array(seqs), dtype=torch.float32, device=self.device)
+        label_tensors = torch.tensor(labels, dtype=torch.long, device=self.device)
+        num_samples = len(seqs)
+        
+        # Setup optimizer and scheduler
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        # Cross-entropy loss
+        criterion = nn.CrossEntropyLoss()
+        
+        # Training state variables
+        history = []
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
+        
+        for it in range(max_iters):
+            total_loss = 0.0
+            total_sequences = 0
+            correct_predictions = 0
+            
+            # Shuffle sequences for each epoch
+            perm = torch.randperm(num_samples)
+            
+            # Process sequences in batches
+            for i in range(0, num_samples, batch_size):
+                # Get batch indices
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = seqs_tensor[batch_idx]
+                batch_labels = label_tensors[batch_idx]
+                
+                optimizer.zero_grad()
+                
+                # Forward pass through all layers
+                outputs = self.forward(batch_seqs)  # (batch_size, out_seq, out_dim)
+                
+                # Compute average vector for each sequence
+                avg_vectors = outputs.mean(dim=1)  # (batch_size, out_dim)
+                
+                # Get logits through classification head
+                logits = self.classifier(avg_vectors)
+                
+                # Compute loss
+                loss = criterion(logits, batch_labels)
+                
+                # Backward pass and optimization
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                optimizer.step()
+                
+                # Calculate batch statistics
+                batch_loss = loss.item()
+                total_loss += batch_loss * len(batch_idx)
+                total_sequences += len(batch_idx)
+                
+                # Calculate accuracy
+                with torch.no_grad():
+                    predictions = torch.argmax(logits, dim=1)
+                    correct_predictions += (predictions == batch_labels).sum().item()
+            
+            # Calculate average loss and accuracy for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+                accuracy = correct_predictions / total_sequences
+            else:
+                avg_loss = 0.0
+                accuracy = 0.0
+                
+            history.append(avg_loss)
+            
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"CLS-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {accuracy:.4f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                checkpoint = {
+                    'iteration': it,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'history': history,
+                    'best_loss': best_loss,
+                    'num_classes': self.num_classes
+                }
+                torch.save(checkpoint, checkpoint_file)
+                print(f"Checkpoint saved at iteration {it}")
+            
+            # Check convergence
+            if abs(prev_loss - avg_loss) < tol:
+                print(f"Converged after {it+1} iterations.")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                break
+                
+            prev_loss = avg_loss
+            
+            # Learning rate scheduling
+            scheduler.step()
+        
+        self.trained = True
+        
+        return history
+    
+    def predict_c(self, vec_seq):
+        """
+        Predict class label for a sequence using the classification head.
+        
+        Args:
+            vec_seq (list or Tensor): Input vector sequence (seq_len, input_dim)
+            
+        Returns:
+            tuple: (predicted_class, class_probabilities)
+        """
+        if self.classifier is None:
+            raise ValueError("Model must be trained first for classification")
+        
+        # Convert to tensor and add batch dimension
+        if not isinstance(vec_seq, torch.Tensor):
+            vec_seq = torch.tensor(vec_seq, dtype=torch.float32, device=self.device)
+        x = vec_seq.unsqueeze(0)  # (1, seq_len, input_dim)
+        
+        # Forward pass
+        with torch.no_grad():
+            output = self.forward(x)  # (1, out_seq, out_dim)
+            avg_vector = output.mean(dim=1)  # (1, out_dim)
+            logits = self.classifier(avg_vector)
+            probabilities = torch.softmax(logits, dim=1)
+            predicted_class = torch.argmax(probabilities, dim=1).item()
+            
+        return predicted_class, probabilities[0].cpu().numpy()
+    
+    def lbl_train(self, seqs, labels, num_labels, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+                 continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+                 checkpoint_file=None, checkpoint_interval=10, pos_weight=None):
+        """
+        Train the model for multi-label classification using binary cross-entropy loss.
+        
+        Args:
+            seqs: List of vector sequences for training
+            labels: List of binary label vectors (list of lists) or 2D numpy array/torch tensor
+            num_labels: Number of labels for multi-label prediction task
+            max_iters: Maximum number of training iterations
+            tol: Convergence tolerance
+            learning_rate: Initial learning rate for optimizer
+            continued: Whether to continue training from existing parameters
+            decay_rate: Learning rate decay rate
+            print_every: Print progress every N iterations
+            batch_size: Number of sequences to process in each batch
+            checkpoint_file: Path to save training checkpoints
+            checkpoint_interval: Save checkpoint every N iterations
+            pos_weight: Weight for positive class (torch.Tensor of shape [num_labels])
+            
+        Returns:
+            list: Training loss history
+            list: Training accuracy history
+        """
+        # Initialize label head if not already done
+        if self.labeller is None or self.num_labels != num_labels:
+            self.labeller = nn.Linear(self.model_dims[-1], num_labels).to(self.device)
+            self.num_labels = num_labels
+        
+        if not continued:
+            # Reset parameters if not continuing
+            for layer in self.layers:
+                nn.init.uniform_(layer.M, -0.5, 0.5)
+                nn.init.uniform_(layer.Acoeff, -0.1, 0.1)
+                nn.init.uniform_(layer.Bbasis, -0.1, 0.1)
+                nn.init.uniform_(layer.Linker, -0.1, 0.1)
+            nn.init.xavier_uniform_(self.labeller.weight)
+            nn.init.zeros_(self.labeller.bias)
+        
+        # Convert labels to tensor
+        if isinstance(labels, list):
+            labels_tensor = torch.tensor(labels, dtype=torch.float32, device=self.device)
+        else:
+            labels_tensor = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
+        
+        # Convert sequences to tensor
+        seqs_tensor = torch.tensor(np.array(seqs), dtype=torch.float32, device=self.device)
+        num_samples = len(seqs)
+        
+        # Setup loss function with optional positive class weighting
+        if pos_weight is not None:
+            pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=self.device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        else:
+            criterion = nn.BCEWithLogitsLoss()
+        
+        # Setup optimizer and scheduler
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+        
+        # Training state variables
+        loss_history = []
+        acc_history = []
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
+        
+        for it in range(max_iters):
+            total_loss = 0.0
+            total_correct = 0
+            total_predictions = 0
+            total_sequences = 0
+            
+            # Shuffle sequences for each epoch
+            perm = torch.randperm(num_samples)
+            
+            # Process sequences in batches
+            for i in range(0, num_samples, batch_size):
+                # Get batch indices
+                batch_idx = perm[i:i+batch_size]
+                batch_seqs = seqs_tensor[batch_idx]
+                batch_labels = labels_tensor[batch_idx]
+                
+                optimizer.zero_grad()
+                
+                # Forward pass through all layers
+                outputs = self.forward(batch_seqs)  # (batch_size, out_seq, out_dim)
+                
+                # Compute average vector for each sequence
+                avg_vectors = outputs.mean(dim=1)  # (batch_size, out_dim)
+                
+                # Pass through classification head to get logits
+                logits = self.labeller(avg_vectors)
+                
+                # Calculate loss
+                loss = criterion(logits, batch_labels)
+                
+                # Backward pass and optimization
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+                optimizer.step()
+                
+                # Calculate accuracy
+                with torch.no_grad():
+                    # Apply sigmoid to get probabilities
+                    probs = torch.sigmoid(logits)
+                    # Threshold at 0.5 for binary predictions
+                    predictions = (probs > 0.5).float()
+                    # Calculate number of correct predictions
+                    batch_correct = (predictions == batch_labels).sum().item()
+                    batch_predictions = batch_labels.numel()
+                
+                # Accumulate statistics
+                batch_loss = loss.item()
+                total_loss += batch_loss * len(batch_idx)
+                total_correct += batch_correct
+                total_predictions += batch_predictions
+                total_sequences += len(batch_idx)
+            
+            # Calculate average loss and accuracy for this iteration
+            if total_sequences > 0:
+                avg_loss = total_loss / total_sequences
+                avg_acc = total_correct / total_predictions if total_predictions > 0 else 0.0
+            else:
+                avg_loss = 0.0
+                avg_acc = 0.0
+                
+            loss_history.append(avg_loss)
+            acc_history.append(avg_acc)
+            
+            # Update best model state
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+            
+            # Print training progress
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                print(f"MLC-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {avg_acc:.4f}, LR = {current_lr:.6f}")
+            
+            # Save checkpoint if specified
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                checkpoint = {
+                    'iteration': it,
+                    'model_state_dict': self.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss_history': loss_history,
+                    'acc_history': acc_history,
+                    'best_loss': best_loss
+                }
+                torch.save(checkpoint, checkpoint_file)
+                print(f"Checkpoint saved at iteration {it}")
+            
+            # Check convergence
+            if abs(prev_loss - avg_loss) < tol:
+                print(f"Converged after {it+1} iterations.")
+                # Restore best model state
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                break
+                
+            prev_loss = avg_loss
+            
+            # Learning rate scheduling
+            scheduler.step()
+        
+        self.trained = True
+        
+        return loss_history, acc_history
+    
+    def predict_l(self, vec_seq, threshold=0.5):
+        """
+        Predict multi-label classification for a sequence.
+        
+        Args:
+            vec_seq (list or Tensor): Input vector sequence (seq_len, input_dim)
+            threshold (float): Probability threshold for binary classification (default: 0.5)
+            
+        Returns:
+            numpy.ndarray: Binary label predictions (0 or 1 for each label)
+            numpy.ndarray: Probability scores for each label
+        """
+        assert self.labeller is not None, "Model must be trained first for label prediction"
+        
+        # Convert to tensor and add batch dimension
+        if not isinstance(vec_seq, torch.Tensor):
+            vec_seq = torch.tensor(vec_seq, dtype=torch.float32, device=self.device)
+        x = vec_seq.unsqueeze(0)  # (1, seq_len, input_dim)
+        
+        # Forward pass
+        with torch.no_grad():
+            output = self.forward(x)  # (1, out_seq, out_dim)
+            avg_vector = output.mean(dim=1)  # (1, out_dim)
+            logits = self.labeller(avg_vector)
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(logits).cpu().numpy()
+        
+        # Apply threshold to get binary predictions
+        binary_preds = (probs > threshold).astype(np.float32)
+        
+        return binary_preds[0], probs[0]
+    
     def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
                    continued=False, self_mode='gap', decay_rate=1.0, print_every=10,
                    batch_size=256, checkpoint_file=None, checkpoint_interval=5):
@@ -841,7 +1232,7 @@ class HierDDLrn(nn.Module):
     
     def save(self, filename):
         """Save model state to file"""
-        torch.save({
+        save_dict = {
             'model_state_dict': self.state_dict(),
             'config': {
                 'input_dim': self.input_dim,
@@ -853,8 +1244,11 @@ class HierDDLrn(nn.Module):
                 'residual_mode_list': self.residual_mode_list,
                 'device': self.device
             },
-            'mean_t': self.mean_t if hasattr(self, 'mean_t') else None            
-        }, filename)
+            'mean_t': self.mean_t if hasattr(self, 'mean_t') else None,
+            'num_classes': self.num_classes,
+            'num_labels': self.num_labels
+        }
+        torch.save(save_dict, filename)
         print(f"Model saved to {filename}")
     
     @classmethod
@@ -887,6 +1281,16 @@ class HierDDLrn(nn.Module):
         # Load additional attributes
         if 'mean_t' in checkpoint:
             model.mean_t = checkpoint['mean_t']
+        if 'num_classes' in checkpoint:
+            model.num_classes = checkpoint['num_classes']
+        if 'num_labels' in checkpoint:
+            model.num_labels = checkpoint['num_labels']
+            
+        # Recreate classifier and labeller if needed
+        if model.num_classes is not None:
+            model.classifier = nn.Linear(model.model_dims[-1], model.num_classes).to(device)
+        if model.num_labels is not None:
+            model.labeller = nn.Linear(model.model_dims[-1], model.num_labels).to(device)
         
         model.trained = True
         print(f"Model loaded from {filename}")
@@ -974,8 +1378,132 @@ if __name__ == "__main__":
     
     print(f"Average correlation: {np.mean(corrs):.4f}")
     
-    # Test Case 2: Self-training and reconstruction
-    print("\n=== Test Case 2: Self-training and Reconstruction ===")
+    # Test Case 2: Classification Task
+    print("\n=== Test Case 2: Classification Task ===")
+    
+    # Generate classification data
+    num_classes = 3
+    class_seqs = []
+    class_labels = []
+    
+    # Create sequences with different patterns for each class
+    for class_id in range(num_classes):
+        for _ in range(50):  # 50 sequences per class
+            sequence = np.zeros((input_seq_len, input_dim))
+            if class_id == 0:
+                # Class 0: Positive values
+                sequence = np.random.uniform(0.5, 1.5, (input_seq_len, input_dim))
+            elif class_id == 1:
+                # Class 1: Negative values
+                sequence = np.random.uniform(-1.5, -0.5, (input_seq_len, input_dim))
+            else:
+                # Class 2: Mixed values
+                sequence = np.random.uniform(-1, 1, (input_seq_len, input_dim))
+            
+            class_seqs.append(sequence)
+            class_labels.append(class_id)
+    
+    # Initialize model for classification
+    model_cls = HierDDLrn(
+        input_dim=input_dim,
+        model_dims=model_dims,
+        basis_dims=basis_dims,
+        linker_dims=linker_dims,
+        input_seq_len=input_seq_len,
+        linker_trainable=True,
+        residual_mode_list='separate',
+        device=device
+    )
+    
+    # Train for classification
+    print("\nStarting classification training...")
+    cls_history = model_cls.cls_train(
+        class_seqs, class_labels, num_classes,
+        max_iters=50,
+        tol=1e-6,
+        learning_rate=0.01,
+        decay_rate=0.99,
+        print_every=5,
+        batch_size=32
+    )
+    
+    # Evaluate on training set
+    print("\nEvaluating classification accuracy...")
+    correct = 0
+    all_predictions = []
+    
+    for seq, true_label in zip(class_seqs, class_labels):
+        pred_class, probs = model_cls.predict_c(seq)
+        all_predictions.append(pred_class)
+        
+        if pred_class == true_label:
+            correct += 1
+    
+    accuracy = correct / len(class_seqs)
+    print(f"Accuracy: {accuracy:.4f} ({correct}/{len(class_seqs)})")
+    
+    # Show some example predictions
+    print("\nExample predictions:")
+    for i in range(min(3, len(class_seqs))):
+        pred_class, probs = model_cls.predict_c(class_seqs[i])
+        print(f"Seq {i+1}: True={class_labels[i]}, Pred={pred_class}, Probs={[f'{p:.3f}' for p in probs]}")
+    
+    # Test Case 3: Multi-Label Classification Task
+    print("\n=== Test Case 3: Multi-Label Classification Task ===")
+    
+    # Generate multi-label data
+    num_labels = 4
+    label_seqs = []
+    labels = []
+    
+    for _ in range(100):
+        # Create random vector sequence
+        sequence = np.random.uniform(-1, 1, (input_seq_len, input_dim))
+        label_seqs.append(sequence)
+        # Create random binary labels (each sequence can have 0-4 active labels)
+        label_vec = [(np.random.random() > 0.7) for _ in range(num_labels)]
+        labels.append([1.0 if x else 0.0 for x in label_vec])
+    
+    # Initialize model for multi-label classification
+    model_lbl = HierDDLrn(
+        input_dim=input_dim,
+        model_dims=model_dims,
+        basis_dims=basis_dims,
+        linker_dims=linker_dims,
+        input_seq_len=input_seq_len,
+        linker_trainable=True,
+        residual_mode_list='separate',
+        device=device
+    )
+    
+    # Train the model
+    print("\nStarting multi-label classification training...")
+    loss_history, acc_history = model_lbl.lbl_train(
+        label_seqs, labels, num_labels,
+        max_iters=30,
+        tol=1e-6,
+        learning_rate=0.01,
+        decay_rate=0.99,
+        print_every=5,
+        batch_size=32
+    )
+    
+    print(f"\nFinal training loss: {loss_history[-1]:.6f}")
+    print(f"Final training accuracy: {acc_history[-1]:.4f}")
+    
+    # Show prediction results
+    print("\nPrediction results (first 3 sequences):")
+    for i in range(min(3, len(label_seqs))):
+        pred_binary, pred_probs = model_lbl.predict_l(label_seqs[i], threshold=0.5)
+        print(f"\nSequence {i+1}:")
+        print(f"True labels: {labels[i]}")
+        print(f"Predicted binary: {pred_binary}")
+        print(f"Predicted probabilities: {[f'{p:.3f}' for p in pred_probs]}")
+        correct = np.all(pred_binary == np.array(labels[i]))
+        print(f"Correct: {correct}")
+    
+    # Test Case 4: Self-training and reconstruction
+    print("\n=== Test Case 4: Self-training and Reconstruction ===")
     
     # Create a fresh model for self-training
     model_self = HierDDLrn(
@@ -1014,7 +1542,7 @@ if __name__ == "__main__":
     print(f"First reconstructed vector: {reconstructed_seqs[0]}")
     
     # Test continued training
-    print("\n=== Test Case 3: Continued Training ===")
+    print("\n=== Test Case 5: Continued Training ===")
     
     # Continue training from checkpoint
     print("\nContinuing self-training from checkpoint...")
@@ -1033,8 +1561,8 @@ if __name__ == "__main__":
     print(f"Initial training had {len(self_history)} iterations")
     print(f"Continued training added {len(continued_history)} iterations")
     
-    # Test Case 4: Save and load model
-    print("\n=== Test Case 4: Save and Load Model ===")
+    # Test Case 6: Save and load model
+    print("\n=== Test Case 6: Save and Load Model ===")
     
     # Save model
     model_self.save("test_model.pth")
@@ -1044,18 +1572,6 @@ if __name__ == "__main__":
     
     # Verify loaded model works
     test_pred = loaded_model.predict_t(seqs[0])
-    print(f"Loaded model prediction: {test_pred[:3]}...")  # Show first 3 values
-    
-    # Compare parameter counts
-    print("\nOriginal model parameters:")
-    total_orig, trainable_orig = model_self.count_parameters()
-    
-    print("\nLoaded model parameters:")
-    total_loaded, trainable_loaded = loaded_model.count_parameters()
-    
-    if total_orig == total_loaded and trainable_orig == trainable_loaded:
-        print("✓ Parameter counts match between original and loaded models")
-    else:
-        print("✗ Parameter counts do not match")
-    
+    print(f"Loaded model prediction: {test_pred[:3]}...")  # Show first 3 values   
+   
     print("\n=== Hierarchical Vector Sequence Processing with Linker Matrices Demo Completed ===")
