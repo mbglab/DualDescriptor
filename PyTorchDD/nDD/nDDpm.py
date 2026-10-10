@@ -1,7 +1,23 @@
-# Copyright (C) 2005-2025, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
+# Copyright (C) 2005-2026, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
 # The Numerical Dual Descriptor Vector class (P Matrix form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2025-12-30
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2026-10-9
+#
+# Two interchangeable regression schemes are provided:
+#   (a) grad_train + predict_t / t_generate : the m-dimensional model output is fitted directly
+#   (b) reg_train  + predict_r / r_generate : a trainable linear regression head maps m -> target_dim
+#
+# Sequence generation methods (all assume rank_mode != 'pad' and a trained model):
+#   * generate(L, tau)         : after self_train  – target = global mean_t
+#   * t_generate(L, tau, t)    : after grad_train  – target vector t (default: mean_t)
+#   * r_generate(L, r, tau)    : after reg_train   – target vector r (required)
+#   * c_generate(L, c, tau)    : after cls_train   – target class c (required)
+#   * l_generate(L, l, tau)    : after lbl_train   – target multi-label vector l (required)
+#
+# Generation of a vector sequence means producing L vectors of dimension vec_dim. It is
+# performed by gradient-optimizing the window tensors so that N(k) matches the target at
+# each window position, then stitching the (possibly overlapping) windows by averaging
+# the contributions of all windows that cover a given position.
 
 import math
 import random
@@ -12,947 +28,652 @@ import torch.optim as optim
 import numpy as np
 import copy
 
+
 class NumDualDescriptorPM(nn.Module):
     """
-    Numerical Vector Dual Descriptor with GPU acceleration using PyTorch:
-      - Processes sequences of m-dimensional real vectors instead of character sequences
-      - matrix P ∈ R^{m×m} of basis coefficients (simplified 2D version)
-      - square mapping matrix M ∈ R^{m×m} for vector transformation (assumes input_dim = model_dim)
+    Numerical (vector-sequence) Dual Descriptor (P Matrix form) with GPU acceleration:
+      - input is a sequence of real m-dimensional vectors instead of characters
+      - tensor P ∈ R^{m×m} of basis coefficients (2D matrix form; num_basis fixed to 1)
+      - a trainable square linear map M ∈ R^{m×m} replaces the token embedding;
+        it is applied to each extracted window vector before the basis expansion
       - indexed periods: period[i,j] = i*m + j + 2
       - basis function phi_{i,j}(k) = cos(2π * k / period[i,j])
-      - supports 'linear' or 'nonlinear' (step-by-rank) vector extraction
+      - supports 'linear' or 'nonlinear' (step-by-rank) window extraction
+      - rank_op reduces each rank-length window of vectors into a single vector:
+        'avg', 'sum', 'max', or a user-supplied callable
+      - two interchangeable regression schemes, multi-class classification, and
+        multi-label classification, in one-to-one correspondence with DDvTS.py
     """
-    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop', mode='linear', user_step=None, device='cuda'):
+
+    # Maximum number of windows handled by a single chunk of batch_compute_Nk.
+    # The intermediate phi tensor has shape [windows, m, m]; chunking keeps its
+    # memory bounded independently of the training batch size.
+    NK_CHUNK = 16384
+
+    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop',
+                 mode='linear', user_step=None, device='cuda'):
+        """
+        Initialize the Numerical Dual Descriptor model (P Matrix form).
+
+        Args:
+            vec_dim (int): Dimension of input vectors and internal representation (m)
+            rank (int): Length of the vector window (r-per / k-mer length)
+            rank_op (str): 'avg', 'sum', 'max', or 'user_func' – how to reduce a window
+            rank_mode (str): 'pad' or 'drop' – how to handle incomplete fragments
+            mode (str): 'linear' or 'nonlinear' – window extraction mode
+            user_step (int, optional): Step size for nonlinear extraction
+            device (str): 'cuda' or 'cpu'
+        """
         super().__init__()
-        self.vec_dim = vec_dim          # Dimension of input vectors and internal representation
-        self.rank = rank              # r-per/k-mer length
-        self.rank_op = rank_op        # 'avg', 'sum', 'pick', 'user_func'
-        self.rank_mode = rank_mode    # 'pad' or 'drop'
+        self.vec_dim = vec_dim
+        self.rank = rank
+        self.rank_op = rank_op
+        self.rank_mode = rank_mode
+        self.m = vec_dim
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
         self.step = user_step
-        self.trained = False
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
-        # Mapping matrix M for vector transformation
-        self.M = nn.Linear(self.vec_dim, self.vec_dim, bias=False)
-        
-        # Position-weight matrix P[i][j] (simplified 2D version)
-        self.P = nn.Parameter(torch.empty(self.vec_dim, self.vec_dim))
-        
-        # Precompute indexed periods[i][j] (fixed, not trainable)
-        periods = torch.zeros(self.vec_dim, self.vec_dim, dtype=torch.float32)
-        for i in range(self.vec_dim):
-            for j in range(self.vec_dim):
-                periods[i, j] = i * self.vec_dim + j + 2
-        self.register_buffer('periods', periods)
 
-        # Class head (initialized later when num_classes is known)
-        self.num_classes = None # Number of classes in the multi-class prediction task
-        self.classifier = None        
-
-        # Label head (initialized later when num_labels is known)
-        self.num_labels = None  # Number of labels for multi-label prediction task
-        self.labeller = None
-
-        # User function for custom rank operation
+        # User function for the 'user_func' rank operation (set via set_user_func)
         self.user_func = None
 
-        # Initialize parameters
+        # Training statistics and the trained flag are buffers, so save() / load()
+        # preserves them and a reloaded model can reconstruct immediately.
+        self.register_buffer('_trained', torch.zeros(1, dtype=torch.bool))
+        self.register_buffer('_mean_t', torch.zeros(self.m))
+        self.register_buffer('_mean_vector_count', torch.zeros(1, dtype=torch.float64))
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+
+        # Trainable square linear map applied to each extracted window vector.
+        # This replaces the character-based token embedding.
+        self.M = nn.Linear(self.vec_dim, self.m, bias=False)
+
+        # Position-weight matrix P[i][j]
+        self.P = nn.Parameter(torch.empty(self.m, self.m))
+
+        # Indexed periods[i][j] (fixed, not trainable): a pure function of m,
+        # rebuilt in the constructor and never saved as part of state_dict.
+        periods = torch.zeros(self.m, self.m, dtype=torch.float32)
+        for i in range(self.m):
+            for j in range(self.m):
+                periods[i, j] = i * self.m + j + 2
+        self.register_buffer('periods', periods, persistent=False)
+
+        # Pre-scaled angular frequency omega[i,j] = 2*pi / period[i,j], so the basis
+        # function becomes cos(k * omega) with a single multiply inside cos().
+        # Computed in float64 and rounded once; also derived state, non-persistent.
+        self.register_buffer('omega', ((2 * math.pi) / periods.double()).float(),
+                             persistent=False)
+
+        # Lazily created prediction heads
+        self.num_classes = None
+        self.classifier = None
+        self.num_labels = None
+        self.labeller = None
+        self.target_dim = None
+        self.regresser = None
+
         self.reset_parameters()
         self.to(self.device)
-        
+
+    # ---------- buffer accessors ----------
+    @property
+    def trained(self):
+        """True once a training method has fitted this model (persisted)."""
+        return bool(self._trained.item())
+
+    @trained.setter
+    def trained(self, value):
+        self._trained.fill_(bool(value))
+
+    @property
+    def mean_t(self):
+        """Mean of N(k) over all training windows, as a numpy array (persisted)."""
+        return self._mean_t.detach().cpu().numpy()
+
+    @mean_t.setter
+    def mean_t(self, value):
+        flat = torch.as_tensor(value, dtype=torch.float32).detach().flatten()
+        if flat.numel() != self.m:
+            raise ValueError(f"mean_t must have {self.m} elements, got {flat.numel()}")
+        self._mean_t.copy_(flat.to(self._mean_t.device))
+
+    @property
+    def mean_vector_count(self):
+        """Average number of extracted windows per training sequence (persisted)."""
+        return float(self._mean_vector_count.item())
+
+    @mean_vector_count.setter
+    def mean_vector_count(self, value):
+        self._mean_vector_count.fill_(float(value))
+
+    def set_user_func(self, func):
+        """Set a custom user function for the 'user_func' rank operation."""
+        if callable(func):
+            self.user_func = func
+        else:
+            raise ValueError("User function must be callable")
+
     def reset_parameters(self):
-        """Initialize model parameters"""
+        """Initialize model parameters with appropriate distributions."""
         nn.init.uniform_(self.M.weight, -0.5, 0.5)
         nn.init.uniform_(self.P, -0.1, 0.1)
         if self.classifier is not None:
             nn.init.normal_(self.classifier.weight, 0, 0.01)
             if self.classifier.bias is not None:
                 nn.init.constant_(self.classifier.bias, 0)
-        if self.num_labels is not None:
+        if self.labeller is not None:
             nn.init.xavier_uniform_(self.labeller.weight)
             nn.init.zeros_(self.labeller.bias)
-    
-    def set_user_func(self, func):
-        """Set custom user function for rank operation"""
-        if callable(func):
-            self.user_func = func
+        if self.regresser is not None:
+            nn.init.xavier_uniform_(self.regresser.weight)
+            nn.init.zeros_(self.regresser.bias)
+
+    # ---------- window extraction & N(k) ----------
+    def _apply_op(self, windows):
+        """
+        Apply rank_op to a batch of vector windows.
+
+        Args:
+            windows (Tensor): shape [..., rank, vec_dim]
+
+        Returns:
+            Tensor of shape [..., vec_dim]
+        """
+        if self.rank_op == 'sum':
+            return windows.sum(dim=-2)
+        elif self.rank_op == 'avg':
+            return windows.mean(dim=-2)
+        elif self.rank_op == 'max':
+            return windows.max(dim=-2).values
+        elif self.rank_op == 'user_func':
+            if self.user_func is not None and callable(self.user_func):
+                shape = windows.shape[:-2]
+                flat = windows.reshape(-1, windows.shape[-2], self.vec_dim)
+                outs = [self.user_func(flat[i]) for i in range(flat.shape[0])]
+                return torch.stack(outs).reshape(*shape, self.vec_dim)
+            else:
+                return torch.sigmoid(windows.mean(dim=-2))
         else:
-            raise ValueError("User function must be callable")
+            raise ValueError(f"Unknown rank_op: {self.rank_op}")
 
     def extract_vectors(self, seq_vectors):
         """
-        Extract window vectors from sequence based on processing mode and rank operation.
-        
-        - 'linear': Slide window by 1 step, extracting contiguous vectors of length = rank
-        - 'nonlinear': Slide window by custom step (or rank length if step not specified)
-        
-        For nonlinear mode, handles incomplete trailing fragments using:
-        - 'pad': Pads with zero vectors to maintain group length
-        - 'drop': Discards incomplete fragments
-        
+        Extract window vectors from a vector sequence according to processing mode and
+        rank operation.
+
+        - 'linear': slide a window of length rank by step 1.
+        - 'nonlinear': slide by custom step (or rank if step is not specified).
+
+        For nonlinear mode, incomplete trailing fragments are handled as:
+        - 'pad': pad with zero vectors to maintain window length
+        - 'drop': discard incomplete fragments
+
         Args:
-            seq_vectors (list or tensor): Input vector sequence
-            
+            seq_vectors (list or tensor): Input vector sequence, shape [L, vec_dim]
+
         Returns:
-            list: List of vectors after applying rank operation to each extracted vector group
+            Tensor of shape [num_windows, vec_dim] on self.device.
         """
-        L = len(seq_vectors)
-        # Convert to tensor if needed
         if not isinstance(seq_vectors, torch.Tensor):
             seq_vectors = torch.tensor(seq_vectors, dtype=torch.float32, device=self.device)
-        
-        # Ensure device consistency
-        if seq_vectors.device != self.device:
+        else:
             seq_vectors = seq_vectors.to(self.device)
-        
-        def apply_op(vec_tensor):
-            """Apply rank operation (avg/sum/pick/user_func) to a list of vectors"""
-            
-            if self.rank_op == 'sum':
-                return torch.sum(vec_tensor, dim=0)
-                
-            elif self.rank_op == 'pick':
-                idx = random.randint(0, len(vec_tensor)-1)
-                return vec_tensor[idx]
-                
-            elif self.rank_op == 'user_func':
-                # Use custom function if provided, else default behavior
-                if self.user_func is not None and callable(self.user_func):
-                    return self.user_func(vec_tensor)
-                else:
-                    # Default: average + sigmoid
-                    avg = torch.mean(vec_tensor, dim=0)
-                    return torch.sigmoid(avg)
-                    
-            else:  # 'avg' is default
-                return torch.mean(vec_tensor, dim=0)
-        
-        # Linear mode: sliding window with step=1
-        if self.mode == 'linear':
-            vector_groups = [seq_vectors[i:i+self.rank] for i in range(L - self.rank + 1)]
-        
-        # Nonlinear mode: stepping with custom step size
-        else:
-            vector_groups = []
-            step = self.step or self.rank  # Use custom step if defined, else use rank length
-            
-            for i in range(0, L, step):
-                frag = seq_vectors[i:i+self.rank]
-                frag_len = len(frag)
-                
-                # Pad or drop based on rank_mode setting
-                if self.rank_mode == 'pad' and frag_len < self.rank:
-                    # Pad fragment with zero vectors if shorter than rank
-                    padding = torch.zeros(self.rank - frag_len, self.vec_dim, device=self.device)
-                    frag = torch.cat([frag, padding], dim=0)
-                    vector_groups.append(frag)
-                elif frag_len == self.rank:
-                    # Only add fragments that match full rank length
-                    vector_groups.append(frag)
-        
-        # Apply rank operation for each group
-        vectors = [apply_op(group) for group in vector_groups]
-        
-        # Convert list of tensors to single tensor if not empty
-        if vectors:
-            return torch.stack(vectors)
-        else:
-            # Return empty tensor with correct dimensions
+            if seq_vectors.dtype != torch.float32:
+                seq_vectors = seq_vectors.float()
+
+        L = seq_vectors.shape[0]
+        if L == 0:
             return torch.empty(0, self.vec_dim, device=self.device)
+
+        if self.mode == 'linear':
+            if L < self.rank:
+                return torch.empty(0, self.vec_dim, device=self.device)
+            windows = seq_vectors.unfold(0, self.rank, 1).transpose(1, 2)
+            return self._apply_op(windows)
+        else:
+            step = self.step if self.step is not None else self.rank
+            windows_list = []
+            for i in range(0, L, step):
+                frag = seq_vectors[i:i + self.rank]
+                fl = frag.shape[0]
+                if fl < self.rank:
+                    if self.rank_mode == 'pad':
+                        padding = torch.zeros(self.rank - fl, self.vec_dim, device=self.device)
+                        frag = torch.cat([frag, padding], dim=0)
+                        windows_list.append(frag)
+                    # 'drop': discard incomplete fragment
+                else:
+                    windows_list.append(frag)
+            if not windows_list:
+                return torch.empty(0, self.vec_dim, device=self.device)
+            windows = torch.stack(windows_list, dim=0)
+            return self._apply_op(windows)
 
     def batch_compute_Nk(self, k_tensor, vectors):
         """
-        Vectorized computation of N(k) vectors for a batch of positions and vectors
-        Optimized using einsum for better performance
-        
+        Vectorized computation of N(k) vectors for a batch of window positions and
+        window representations.
+
+        Batches larger than NK_CHUNK are split into chunks: the intermediate tensor phi
+        has shape [windows, m, m], so chunking bounds its memory without touching the
+        reduction (over j), i.e. without changing the result.
+
         Args:
-            k_tensor: Tensor of position indices [batch_size]
-            vectors: Tensor of vectors [batch_size, vec_dim]
-            
+            k_tensor (Tensor): Position indices [batch_size]
+            vectors (Tensor): Window representations [batch_size, vec_dim]
+
         Returns:
-            Tensor of N(k) vectors [batch_size, vec_dim]
+            Tensor of N(k) vectors [batch_size, m]
         """
-        # Apply square mapping matrix M to each vector
-        # vectors: [batch_size, vec_dim]
-        # After M transformation: [batch_size, vec_dim]
-        x = self.M(vectors)  # [batch_size, vec_dim]
-        
-        # Expand dimensions for broadcasting [batch_size, 1, 1]
-        k_expanded = k_tensor.view(-1, 1, 1)
-        
-        # Calculate basis functions: cos(2π*k/periods) [batch_size, vec_dim, vec_dim]
-        phi = torch.cos(2 * math.pi * k_expanded / self.periods)
-        
-        # Optimized computation using einsum
-        Nk = torch.einsum('bj,ij,bij->bi', x, self.P, phi)
-            
-        return Nk
+        n = k_tensor.numel()
+        if n <= self.NK_CHUNK:
+            return self._compute_Nk_chunk(k_tensor, vectors)
+        return torch.cat([self._compute_Nk_chunk(k_tensor[i:i + self.NK_CHUNK],
+                                                 vectors[i:i + self.NK_CHUNK])
+                          for i in range(0, n, self.NK_CHUNK)], dim=0)
+
+    def _compute_Nk_chunk(self, k_tensor, vectors):
+        """Compute N(k) for one chunk of windows (see batch_compute_Nk)."""
+        x = self.M(vectors)                            # [chunk, m]
+        k_expanded = k_tensor.view(-1, 1, 1)           # [chunk, 1, 1]
+        phi = torch.cos(k_expanded * self.omega)       # [chunk, m, m]
+        return torch.einsum('bj,ij,bij->bi', x, self.P, phi)
 
     def compute_Nk(self, k, vector):
-        """Compute N(k) for single position and vector (uses batch internally)"""
-        # Convert to tensors and ensure correct device
+        """Compute N(k) for a single position and a single window vector."""
         if not isinstance(vector, torch.Tensor):
             vector = torch.tensor(vector, dtype=torch.float32, device=self.device)
-        elif vector.device != self.device:
-            vector = vector.to(self.device)
-            
+        else:
+            vector = vector.to(self.device).float()
         k_tensor = torch.tensor([k], dtype=torch.float32, device=self.device)
-        vector_tensor = vector.unsqueeze(0)  # Add batch dimension
-        
-        # Use batch computation
-        result = self.batch_compute_Nk(k_tensor, vector_tensor)
-        return result[0]  # Return first element
+        return self.batch_compute_Nk(k_tensor, vector.unsqueeze(0))[0]
 
-    def describe(self, vectors):
-        """Compute N(k) vectors for each window in vector sequence"""
-        if len(vectors) == 0:
+    def describe(self, seq_vectors):
+        """Compute N(k) vectors for each window in a vector sequence."""
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
             return []
-        
-        # Extract and apply rank operation to vectors
-        extracted_vectors = self.extract_vectors(vectors)
-        if extracted_vectors.shape[0] == 0:
-            return []
-        
-        k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-        
-        # Batch compute all Nk vectors
-        N_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-        return N_batch.detach().cpu().numpy()
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            Nk_batch = self.batch_compute_Nk(k_positions, ex)
+        return Nk_batch.detach().cpu().numpy()
 
-    def S(self, vectors):
-        """
-        Compute list of S(l)=sum(N(k)) (k=1,...,l; l=1,...,L) for a given vector sequence.        
-        """
-        if len(vectors) == 0:
+    def S(self, seq_vectors):
+        """List of S(l) = sum(N(k)) for k=1..l, l=1..L for a given vector sequence."""
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
             return []
-        
-        # Extract and apply rank operation to vectors
-        extracted_vectors = self.extract_vectors(vectors)
-        if extracted_vectors.shape[0] == 0:
-            return []
-        
-        k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-        
-        # Batch compute all Nk vectors
-        N_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-        
-        # Compute cumulative sum (S vectors)
-        S_cum = torch.cumsum(N_batch, dim=0)
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            N_batch = self.batch_compute_Nk(k_positions, ex)
+            S_cum = torch.cumsum(N_batch, dim=0)
         return [s.detach().cpu().numpy() for s in S_cum]
 
     def D(self, vector_seqs, t_list):
         """
-        Compute mean squared deviation D across sequences:
-        D = average over all positions of (N(k)-t_seq)^2
+        Compute mean squared deviation D across vector sequences:
+        D = average over all window positions of (N(k) - t_seq)^2.
+        All sequences are processed in a single vectorized pass; batch_compute_Nk
+        chunks the work internally.
         """
-        total_loss = 0.0
-        total_positions = 0
-        
-        # Convert target vectors to tensor
-        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
-        
-        for vectors, t in zip(vector_seqs, t_tensors):
-            # Extract and apply rank operation to vectors
-            extracted_vectors = self.extract_vectors(vectors)
-            if extracted_vectors.shape[0] == 0:
+        extracted_list, target_list = [], []
+        for vs, t in zip(vector_seqs, t_list):
+            ex = self.extract_vectors(vs)
+            if ex.shape[0] == 0:
                 continue
-                
-            k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-            
-            # Batch compute all Nk vectors
-            N_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-            
-            # Compute loss for each position
-            losses = torch.sum((N_batch - t) ** 2, dim=1)
-            total_loss += losses.sum().item()
-            total_positions += extracted_vectors.shape[0]
-                
-        return total_loss / total_positions if total_positions else 0.0
+            extracted_list.append(ex)
+            target_list.append(torch.tensor(t, dtype=torch.float32, device=self.device))
+        if not extracted_list:
+            return 0.0
+        counts = torch.tensor([e.shape[0] for e in extracted_list],
+                              dtype=torch.long, device=self.device)
+        flat_vecs = torch.cat(extracted_list, dim=0)
+        starts = torch.cumsum(counts, dim=0) - counts
+        flat_k = (torch.arange(flat_vecs.shape[0], dtype=torch.float32, device=self.device)
+                  - torch.repeat_interleave(starts.float(), counts))
+        seq_indices = torch.repeat_interleave(
+            torch.arange(len(extracted_list), dtype=torch.long, device=self.device), counts)
+        targets = torch.stack(target_list)
+        with torch.no_grad():
+            Nk_batch = self.batch_compute_Nk(flat_k, flat_vecs)
+            per_position = torch.sum((Nk_batch - targets[seq_indices]) ** 2, dim=1)
+        return per_position.mean().item()
 
-    def d(self, vectors, t):
-        """
-        Compute pattern deviation value (d) for a single vector sequence. 
-        """
-        d_value = self.D([vectors], [t])
-        return d_value
+    def d(self, seq_vectors, t):
+        """Compute pattern deviation value (d) for a single vector sequence."""
+        return self.D([seq_vectors], [t])
 
-    def reg_train(self, vector_seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01, 
+    # ---------- shared training engine ----------
+    def _sequence_vectors(self, Nk_flat, seq_indices, counts, B):
+        """Average N(k) over the windows of each sequence -> (B, m)."""
+        seq_sums = torch.zeros(B, self.m, device=self.device)
+        seq_sums.scatter_add_(0, seq_indices.unsqueeze(1).expand(-1, self.m), Nk_flat)
+        return seq_sums / counts.unsqueeze(1)
+
+    def _train(self, seqs, step, *, max_iters=1000, tol=1e-8, learning_rate=0.01,
                continued=False, decay_rate=1.0, print_every=10, batch_size=32,
-               checkpoint_file=None, checkpoint_interval=10):
+               checkpoint_file=None, checkpoint_interval=10, tag='Train',
+               report=None, checkpoint_extra=None):
         """
-        Train the model using gradient descent with sequence-level batch processing.
-        Optimized for GPU memory efficiency by processing sequences individually.
-        
-        Args:
-            vector_seqs: List of vector sequences for training
-            t_list: List of target vectors corresponding to sequences
-            max_iters: Maximum number of training iterations
-            tol: Convergence tolerance
-            learning_rate: Initial learning rate for optimizer
-            continued: Whether to continue training from existing parameters
-            decay_rate: Learning rate decay rate
-            print_every: Print progress every N iterations
-            batch_size: Number of sequences to process in each batch
-            checkpoint_file: Path to save training checkpoints
-            checkpoint_interval: Save checkpoint every N iterations
-            
+        Shared training engine; every training method is a thin wrapper around this.
+
+        A task supplies only the two things that actually differ between tasks:
+
+          * ``step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices)`` turns one
+            batch into ``(loss, metrics)``, where metrics is a dict of plain numbers that
+            is summed over the batches of an epoch (use {} when there is nothing to count);
+          * ``report(it, avg_loss, current_lr, stats)`` formats the progress line, where
+            ``stats`` holds the summed metrics plus '_n', the sequences seen this epoch.
+
+        Everything else -- the per-sequence window cache, the vectorized batch scaffolding,
+        the optimizer and its schedule, best-state tracking, checkpointing and early
+        stopping -- lives here and is therefore identical for every task.
+
+        Returns ``(loss_history, epoch_metrics)``: the mean loss per iteration and the list
+        of per-iteration metric dicts.
+        """
+        if not continued:
+            self.reset_parameters()
+
+        # Pre-extract window vectors for all sequences (avoid repeated extraction).
+        all_extracted = [self.extract_vectors(seq) for seq in seqs]
+
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
+
+        if report is None:
+            def report(it, avg_loss, current_lr, stats):
+                return f"{tag} Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}"
+
+        history, epoch_metrics = [], []
+        prev_loss = float('inf')
+        best_loss = float('inf')
+        best_model_state = None
+
+        for it in range(max_iters):
+            total_loss = 0.0
+            total_sequences = 0
+            stats = {}
+            indices = list(range(len(seqs)))
+            random.shuffle(indices)
+
+            for batch_start in range(0, len(indices), batch_size):
+                batch_indices = indices[batch_start:batch_start + batch_size]
+                B = len(batch_indices)
+                batch_extracted = [all_extracted[i] for i in batch_indices]
+                flat_vecs = torch.cat(batch_extracted, dim=0)
+                if flat_vecs.shape[0] == 0:
+                    continue
+                # Vectorized per-window bookkeeping (no python loop over sequences)
+                batch_counts = torch.tensor([e.shape[0] for e in batch_extracted],
+                                            dtype=torch.long, device=self.device)
+                seq_indices = torch.repeat_interleave(
+                    torch.arange(B, dtype=torch.long, device=self.device), batch_counts)
+                starts = torch.cumsum(batch_counts, dim=0) - batch_counts
+                flat_k = (torch.arange(flat_vecs.shape[0], dtype=torch.float32, device=self.device)
+                          - torch.repeat_interleave(starts.float(), batch_counts))
+                counts = torch.clamp(batch_counts, min=1).float()
+                Nk_flat = self.batch_compute_Nk(flat_k, flat_vecs)
+
+                loss, batch_stats = step(Nk_flat, flat_vecs, seq_indices, counts,
+                                         B, batch_indices)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item() * B
+                total_sequences += B
+                for name, value in batch_stats.items():
+                    stats[name] = stats.get(name, 0.0) + value
+
+            avg_loss = total_loss / total_sequences if total_sequences else 0.0
+            history.append(avg_loss)
+            stats['_n'] = total_sequences
+            epoch_metrics.append(stats)
+
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_model_state = copy.deepcopy(self.state_dict())
+
+            if it % print_every == 0 or it == max_iters - 1:
+                current_lr = scheduler.get_last_lr()[0]
+                print(report(it, avg_loss, current_lr, stats))
+
+            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
+                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler,
+                                      best_loss, checkpoint_extra, epoch_metrics)
+
+            if abs(prev_loss - avg_loss) < tol:
+                print(f"Converged after {it+1} iterations.")
+                if best_model_state is not None:
+                    self.load_state_dict(best_model_state)
+                break
+
+            prev_loss = avg_loss
+            scheduler.step()
+
+        self._finish_training(seqs, history, optimizer, scheduler, best_loss,
+                              checkpoint_file, checkpoint_extra, epoch_metrics)
+        return history, epoch_metrics
+
+    # ---------- specific training methods ----------
+    def grad_train(self, seqs, t_list, max_iters=1000, tol=1e-8, learning_rate=0.01,
+                   continued=False, decay_rate=1.0, print_every=10, batch_size=32,
+                   checkpoint_file=None, checkpoint_interval=10):
+        """
+        Train the model for regression without any regression head, using gradient descent
+        with fully vectorized batch processing.
+
+        The m-dimensional model output (the mean of N(k) over the windows of a sequence)
+        is fitted directly against the target vectors, so every target vector must have
+        exactly m = vec_dim components. Meant to be paired with predict_t / t_generate;
+        any regression head created earlier by reg_train is not used here.
+
         Returns:
             list: Training loss history
         """
-        
-        if not continued:
-            self.reset_parameters()
-        
-        # Convert target vectors to tensor
         t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
-        
-        # Setup optimizer and scheduler
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        
-        # Training state variables
-        history = []
-        prev_loss = float('inf')
-        best_loss = float('inf')
-        best_model_state = None
-        
-        for it in range(max_iters):
-            total_loss = 0.0
-            total_sequences = 0
-            
-            # Shuffle sequences for each epoch
-            indices = list(range(len(vector_seqs)))
-            random.shuffle(indices)
-            
-            # Process sequences in batches
-            for batch_start in range(0, len(indices), batch_size):
-                batch_indices = indices[batch_start:batch_start + batch_size]
-                batch_seqs = [vector_seqs[idx] for idx in batch_indices]
-                batch_targets = [t_tensors[idx] for idx in batch_indices]
-                
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                
-                # Process each sequence in the batch
-                for vectors, target in zip(batch_seqs, batch_targets):
-                    # Extract and apply rank operation to vectors
-                    extracted_vectors = self.extract_vectors(vectors)
-                    if extracted_vectors.shape[0] == 0:
-                        continue
-                        
-                    k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-                    
-                    # Compute N(k) vectors for all extracted vectors in the sequence
-                    Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-                    
-                    # Compute sequence-level target: average of all N(k) vectors
-                    seq_pred = torch.mean(Nk_batch, dim=0)
-                    
-                    # Calculate loss for this sequence
-                    seq_loss = torch.sum((seq_pred - target) ** 2)
-                    batch_loss += seq_loss
-                    
-                    # Clean up intermediate tensors to free memory
-                    del Nk_batch, seq_pred, extracted_vectors, k_positions
-                
-                # Average loss over sequences in batch and backpropagate
-                if len(batch_seqs) > 0:
-                    batch_loss = batch_loss / len(batch_seqs)
-                    batch_loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += batch_loss.item() * len(batch_seqs)
-                    total_sequences += len(batch_seqs)
-                
-                # Clear GPU cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Calculate average loss for this iteration
-            if total_sequences > 0:
-                avg_loss = total_loss / total_sequences
-            else:
-                avg_loss = 0.0
-                
-            history.append(avg_loss)
-            
-            # Update best model state
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_model_state = copy.deepcopy(self.state_dict())
-            
-            # Print training progress
-            if it % print_every == 0 or it == max_iters - 1:
-                current_lr = scheduler.get_last_lr()[0]
-                print(f"GD Iter {it:3d}: Loss = {avg_loss:.6e}, LR = {current_lr:.6f}")
-            
-            # Save checkpoint if specified
-            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
-                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it+1} iterations.")
-                # Restore best model state
-                if best_model_state is not None:
-                    self.load_state_dict(best_model_state)
-                break
-                
-            prev_loss = avg_loss
-            
-            # Learning rate scheduling
-            scheduler.step()
-        
-        # Compute and store training statistics for reconstruction/generation
-        self._compute_training_statistics(vector_seqs)
-        self.trained = True
-        
+
+        def step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices):
+            """Sequence-mean of N(k) regressed on the target vectors (dimension m)."""
+            seq_preds = self._sequence_vectors(Nk_flat, seq_indices, counts, B)
+            batch_targets = torch.stack([t_tensors[i] for i in batch_indices], dim=0)
+            return torch.mean((seq_preds - batch_targets) ** 2), {}
+
+        history, _ = self._train(seqs, step, tag='GD', max_iters=max_iters, tol=tol,
+                                 learning_rate=learning_rate, continued=continued,
+                                 decay_rate=decay_rate, print_every=print_every,
+                                 batch_size=batch_size, checkpoint_file=checkpoint_file,
+                                 checkpoint_interval=checkpoint_interval)
         return history
 
-    def cls_train(self, vector_seqs, labels, num_classes, max_iters=1000, tol=1e-8, learning_rate=0.01,
-                  continued=False, decay_rate=1.0, print_every=10, batch_size=32,
-                  checkpoint_file=None, checkpoint_interval=10):
+    def reg_train(self, seqs, t_list, target_dim=None, max_iters=1000, tol=1e-8,
+                  learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10,
+                  batch_size=32, checkpoint_file=None, checkpoint_interval=10):
         """
-        Train the model for multi-class classification using cross-entropy loss.
-        Optimized for GPU memory efficiency by processing sequences individually.
-        
-        Args:
-            vector_seqs: List of vector sequences for training
-            labels: List of integer class labels (0 to num_classes-1)
-            num_classes: Number of classes in the classification problem
-            max_iters: Maximum number of training iterations
-            tol: Convergence tolerance
-            learning_rate: Initial learning rate for optimizer
-            continued: Whether to continue training from existing parameters
-            decay_rate: Learning rate decay rate
-            print_every: Print progress every N iterations
-            batch_size: Number of sequences to process in each batch
-            checkpoint_file: Path to save training checkpoints
-            checkpoint_interval: Save checkpoint every N iterations
-            
+        Train the model for regression using gradient descent with fully vectorized batch
+        processing.
+
+        A trainable regression head (regresser) is created if not already present, mapping
+        from model dimension (self.m) to the target dimension (target_dim). If target_dim
+        is not provided, it is inferred from t_list. Meant to be paired with
+        predict_r / r_generate.
+
         Returns:
             list: Training loss history
         """
-        
-        # Initialize classification head if not already done
-        if self.classifier is None or self.num_classes != num_classes:            
-            self.classifier = nn.Linear(self.vec_dim, num_classes).to(self.device)
+        if target_dim is None:
+            target_dim = len(t_list[0]) if t_list else self.m
+        if self.regresser is None or self.target_dim != target_dim:
+            self.regresser = nn.Linear(self.m, target_dim).to(self.device)
+            self.target_dim = target_dim
+            nn.init.xavier_uniform_(self.regresser.weight)
+            nn.init.zeros_(self.regresser.bias)
+        t_tensors = [torch.tensor(t, dtype=torch.float32, device=self.device) for t in t_list]
+
+        def step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices):
+            """The objective of grad_train, pushed through the regression head."""
+            seq_vectors = self._sequence_vectors(Nk_flat, seq_indices, counts, B)
+            pred_targets = self.regresser(seq_vectors)
+            batch_targets = torch.stack([t_tensors[i] for i in batch_indices], dim=0)
+            return torch.mean((pred_targets - batch_targets) ** 2), {}
+
+        history, _ = self._train(seqs, step, tag='GD', max_iters=max_iters, tol=tol,
+                                 learning_rate=learning_rate, continued=continued,
+                                 decay_rate=decay_rate, print_every=print_every,
+                                 batch_size=batch_size, checkpoint_file=checkpoint_file,
+                                 checkpoint_interval=checkpoint_interval)
+        return history
+
+    def cls_train(self, seqs, labels, num_classes, max_iters=1000, tol=1e-8,
+                  learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10,
+                  batch_size=32, checkpoint_file=None, checkpoint_interval=10):
+        """
+        Train for multi-class classification with fully vectorized batch processing.
+        Meant to be paired with predict_c / c_generate.
+        """
+        if self.classifier is None or self.num_classes != num_classes:
+            self.classifier = nn.Linear(self.m, num_classes).to(self.device)
             self.num_classes = num_classes
-        
-        if not continued:
-            self.reset_parameters()
-        
-        # Convert labels to tensor
         label_tensors = torch.tensor(labels, dtype=torch.long, device=self.device)
-        
-        # Setup optimizer and scheduler
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        
-        # Cross-entropy loss
         criterion = nn.CrossEntropyLoss()
-        
-        # Training state variables
-        history = []
-        prev_loss = float('inf')
-        best_loss = float('inf')
-        best_model_state = None
-        
-        for it in range(max_iters):
-            total_loss = 0.0
-            total_sequences = 0
-            correct_predictions = 0
-            
-            # Shuffle sequences for each epoch
-            indices = list(range(len(vector_seqs)))
-            random.shuffle(indices)
-            
-            # Process sequences in batches
-            for batch_start in range(0, len(indices), batch_size):
-                batch_indices = indices[batch_start:batch_start + batch_size]
-                batch_seqs = [vector_seqs[idx] for idx in batch_indices]
-                batch_labels = label_tensors[batch_indices]
-                
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                batch_logits = []
-                
-                # Process each sequence in the batch
-                for vectors in batch_seqs:
-                    # Extract and apply rank operation to vectors
-                    extracted_vectors = self.extract_vectors(vectors)
-                    if extracted_vectors.shape[0] == 0:
-                        # For empty sequences, use zero vector
-                        seq_vector = torch.zeros(self.vec_dim, device=self.device)
-                    else:
-                        k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-                        
-                        # Compute N(k) vectors for all extracted vectors in the sequence
-                        Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-                        
-                        # Compute sequence-level vector: average of all N(k) vectors
-                        seq_vector = torch.mean(Nk_batch, dim=0)
-                        
-                        # Clean up intermediate tensors to free memory
-                        del Nk_batch, extracted_vectors, k_positions
-                    
-                    # Get logits through classification head
-                    logits = self.classifier(seq_vector.unsqueeze(0))
-                    batch_logits.append(logits)
-                
-                # Stack all logits and compute loss
-                if batch_logits:
-                    all_logits = torch.cat(batch_logits, dim=0)
-                    loss = criterion(all_logits, batch_labels)
-                    loss.backward()
-                    optimizer.step()
-                    
-                    # Calculate batch statistics
-                    batch_loss = loss.item()
-                    total_loss += batch_loss * len(batch_seqs)
-                    total_sequences += len(batch_seqs)
-                    
-                    # Calculate accuracy
-                    with torch.no_grad():
-                        predictions = torch.argmax(all_logits, dim=1)
-                        correct_predictions += (predictions == batch_labels).sum().item()
-                
-                # Clear GPU cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Calculate average loss and accuracy for this iteration
-            if total_sequences > 0:
-                avg_loss = total_loss / total_sequences
-                accuracy = correct_predictions / total_sequences
-            else:
-                avg_loss = 0.0
-                accuracy = 0.0
-                
-            history.append(avg_loss)
-            
-            # Update best model state
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_model_state = copy.deepcopy(self.state_dict())
-            
-            # Print training progress
-            if it % print_every == 0 or it == max_iters - 1:
-                current_lr = scheduler.get_last_lr()[0]
-                print(f"CLS-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {accuracy:.4f}, LR = {current_lr:.6f}")
-            
-            # Save checkpoint if specified
-            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
-                checkpoint = {
-                    'iteration': it,
-                    'model_state_dict': self.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'history': history,
-                    'best_loss': best_loss,
-                    'num_classes': self.num_classes
-                }
-                torch.save(checkpoint, checkpoint_file)
-                print(f"Checkpoint saved at iteration {it}")
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it+1} iterations.")
-                # Restore best model state
-                if best_model_state is not None:
-                    self.load_state_dict(best_model_state)
-                break
-                
-            prev_loss = avg_loss
-            
-            # Learning rate scheduling
-            scheduler.step()
-        
-        self.trained = True
-        
+
+        def step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices):
+            """Cross-entropy on the class logits; also counts the correct sequences."""
+            logits = self.classifier(self._sequence_vectors(Nk_flat, seq_indices, counts, B))
+            batch_labels = label_tensors[batch_indices]
+            loss = criterion(logits, batch_labels)
+            with torch.no_grad():
+                correct = (torch.argmax(logits, dim=1) == batch_labels).sum().item()
+            return loss, {'correct': correct}
+
+        def report(it, avg_loss, current_lr, stats):
+            acc = stats['correct'] / stats['_n'] if stats['_n'] else 0.0
+            return (f"CLS-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {acc:.4f}, "
+                    f"LR = {current_lr:.6f}")
+
+        history, _ = self._train(seqs, step, tag='CLS-Train', report=report,
+                                 checkpoint_extra={'num_classes': self.num_classes},
+                                 max_iters=max_iters, tol=tol,
+                                 learning_rate=learning_rate, continued=continued,
+                                 decay_rate=decay_rate, print_every=print_every,
+                                 batch_size=batch_size, checkpoint_file=checkpoint_file,
+                                 checkpoint_interval=checkpoint_interval)
         return history
 
-    def lbl_train(self, vector_seqs, labels, num_labels, max_iters=1000, tol=1e-8, learning_rate=0.01, 
-                 continued=False, decay_rate=1.0, print_every=10, batch_size=32,
-                 checkpoint_file=None, checkpoint_interval=10, pos_weight=None):
+    def lbl_train(self, seqs, labels, num_labels, max_iters=1000, tol=1e-8,
+                  learning_rate=0.01, continued=False, decay_rate=1.0, print_every=10,
+                  batch_size=32, checkpoint_file=None, checkpoint_interval=10,
+                  pos_weight=None):
         """
-        Train the model for multi-label classification using binary cross-entropy loss.
-        
-        Args:
-            vector_seqs: List of vector sequences for training
-            labels: List of binary label vectors (list of lists) or 2D numpy array/torch tensor
-            num_labels: Number of labels for multi-label prediction task
-            max_iters: Maximum number of training iterations
-            tol: Convergence tolerance
-            learning_rate: Initial learning rate for optimizer
-            continued: Whether to continue training from existing parameters
-            decay_rate: Learning rate decay rate
-            print_every: Print progress every N iterations
-            batch_size: Number of sequences to process in each batch
-            checkpoint_file: Path to save training checkpoints
-            checkpoint_interval: Save checkpoint every N iterations
-            pos_weight: Weight for positive class (torch.Tensor of shape [num_labels])
-            
-        Returns:
-            list: Training loss history
-            list: Training accuracy history
+        Train for multi-label classification with fully vectorized batch processing.
+        Meant to be paired with predict_l / l_generate.
         """
-
-        # Initialize label head if not already done
         if self.labeller is None or self.num_labels != num_labels:
-            self.labeller = nn.Linear(self.vec_dim, num_labels).to(self.device)
+            self.labeller = nn.Linear(self.m, num_labels).to(self.device)
             self.num_labels = num_labels
-        
-        if not continued:
-            self.reset_parameters()
-        
-        # Convert labels to tensor
         if isinstance(labels, list):
             labels_tensor = torch.tensor(labels, dtype=torch.float32, device=self.device)
         else:
             labels_tensor = torch.as_tensor(labels, dtype=torch.float32, device=self.device)
-        
-        # Setup loss function with optional positive class weighting
         if pos_weight is not None:
             pos_weight_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=self.device)
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
         else:
             criterion = nn.BCEWithLogitsLoss()
-        
-        # Setup optimizer and scheduler
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        
-        # Training state variables
-        loss_history = []
-        acc_history = []
-        prev_loss = float('inf')
-        best_loss = float('inf')
-        best_model_state = None
-        
-        for it in range(max_iters):
-            total_loss = 0.0
-            total_correct = 0
-            total_predictions = 0
-            total_sequences = 0
-            
-            # Shuffle sequences for each epoch
-            indices = list(range(len(vector_seqs)))
-            random.shuffle(indices)
-            
-            # Process sequences in batches
-            for batch_start in range(0, len(indices), batch_size):
-                batch_indices = indices[batch_start:batch_start + batch_size]
-                batch_seqs = [vector_seqs[idx] for idx in batch_indices]
-                batch_labels = labels_tensor[batch_indices]
-                
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                batch_correct = 0
-                batch_predictions = 0
-                
-                # Process each sequence in the batch
-                batch_predictions_list = []
-                for vectors in batch_seqs:
-                    # Extract and apply rank operation to vectors
-                    extracted_vectors = self.extract_vectors(vectors)
-                    if extracted_vectors.shape[0] == 0:
-                        # If no vectors extracted, skip this sequence
-                        continue
-                        
-                    k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-                    
-                    # Compute N(k) vectors for all extracted vectors in the sequence
-                    Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-                    
-                    # Compute sequence representation: average of all N(k) vectors
-                    seq_representation = torch.mean(Nk_batch, dim=0)
-                    
-                    # Pass through classification head to get logits
-                    logits = self.labeller(seq_representation)
-                    batch_predictions_list.append(logits)
-                    
-                    # Clean up intermediate tensors to free memory
-                    del Nk_batch, seq_representation, extracted_vectors, k_positions
-                
-                # Stack predictions for the batch
-                if batch_predictions_list:
-                    batch_logits = torch.stack(batch_predictions_list, dim=0)
-                    
-                    # Calculate loss for the batch
-                    batch_loss = criterion(batch_logits, batch_labels)
-                    
-                    # Calculate accuracy
-                    with torch.no_grad():
-                        # Apply sigmoid to get probabilities
-                        probs = torch.sigmoid(batch_logits)
-                        # Threshold at 0.5 for binary predictions
-                        predictions = (probs > 0.5).float()
-                        # Calculate number of correct predictions
-                        batch_correct = (predictions == batch_labels).sum().item()
-                        batch_predictions = batch_labels.numel()
-                    
-                    # Backpropagate
-                    batch_loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += batch_loss.item() * len(batch_seqs)
-                    total_correct += batch_correct
-                    total_predictions += batch_predictions
-                    total_sequences += len(batch_seqs)
-                
-                # Clear GPU cache periodically
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Calculate average loss and accuracy for this iteration
-            if total_sequences > 0:
-                avg_loss = total_loss / total_sequences
-                avg_acc = total_correct / total_predictions if total_predictions > 0 else 0.0
-            else:
-                avg_loss = 0.0
-                avg_acc = 0.0
-                
-            loss_history.append(avg_loss)
-            acc_history.append(avg_acc)
-            
-            # Update best model state
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_model_state = copy.deepcopy(self.state_dict())
-            
-            # Print training progress
-            if it % print_every == 0 or it == max_iters - 1:
-                current_lr = scheduler.get_last_lr()[0]
-                print(f"MLC-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {avg_acc:.4f}, LR = {current_lr:.6f}")
-            
-            # Save checkpoint if specified
-            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
-                checkpoint = {
-                    'iteration': it,
-                    'model_state_dict': self.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'loss_history': loss_history,
-                    'acc_history': acc_history,
-                    'best_loss': best_loss
-                }
-                torch.save(checkpoint, checkpoint_file)
-                print(f"Checkpoint saved at iteration {it}")
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it+1} iterations.")
-                # Restore best model state
-                if best_model_state is not None:
-                    self.load_state_dict(best_model_state)
-                break
-                
-            prev_loss = avg_loss
-            
-            # Learning rate scheduling
-            scheduler.step()
-        
-        self.trained = True
-        
+
+        def step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices):
+            """BCE-with-logits on the label logits; also counts the correct label entries."""
+            logits = self.labeller(self._sequence_vectors(Nk_flat, seq_indices, counts, B))
+            batch_labels = labels_tensor[batch_indices]
+            loss = criterion(logits, batch_labels)
+            with torch.no_grad():
+                preds = (torch.sigmoid(logits) > 0.5).float()
+                correct = (preds == batch_labels).sum().item()
+            return loss, {'correct': correct, 'predictions': batch_labels.numel()}
+
+        def report(it, avg_loss, current_lr, stats):
+            acc = stats['correct'] / stats['predictions'] if stats['predictions'] else 0.0
+            return (f"MLC-Train Iter {it:3d}: Loss = {avg_loss:.6e}, Acc = {acc:.4f}, "
+                    f"LR = {current_lr:.6f}")
+
+        loss_history, epoch_stats = self._train(seqs, step, tag='MLC-Train', report=report,
+                                                max_iters=max_iters, tol=tol,
+                                                learning_rate=learning_rate, continued=continued,
+                                                decay_rate=decay_rate, print_every=print_every,
+                                                batch_size=batch_size, checkpoint_file=checkpoint_file,
+                                                checkpoint_interval=checkpoint_interval)
+        acc_history = [s['correct'] / s['predictions'] if s['predictions'] else 0.0
+                       for s in epoch_stats]
         return loss_history, acc_history
 
-    def self_train(self, vector_seqs, max_iters=100, tol=1e-6, learning_rate=0.01, 
+    def self_train(self, seqs, max_iters=100, tol=1e-6, learning_rate=0.01,
                    continued=False, decay_rate=1.0, print_every=10,
                    batch_size=32, checkpoint_file=None, checkpoint_interval=5):
         """
-        Self-training method for self-consistency (gap mode) with memory-efficient sequence processing.
-        Trains the model so that N(k) vectors match the transformed vector windows at each position.
-        
-        Args:
-            vector_seqs: List of vector sequences for training
-            max_iters: Maximum number of training iterations
-            tol: Convergence tolerance
-            learning_rate: Initial learning rate for optimizer
-            continued: Whether to continue training from existing parameters
-            decay_rate: Learning rate decay rate
-            print_every: Print progress every N iterations
-            batch_size: Number of sequences to process in each batch
-            checkpoint_file: Path to save training checkpoints
-            checkpoint_interval: Save checkpoint every N iterations
-            
-        Returns:
-            list: Training loss history
+        Self-training for self-consistency with fully vectorized batch processing:
+        N(k) is pulled towards the transformed window vector M(v) at each position.
+        Meant to be paired with generate().
         """
-        
-        if not continued:
-            self.reset_parameters()
-        
-        # Setup optimizer and scheduler
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=decay_rate)
-        
-        # Training state variables
-        history = []
-        prev_loss = float('inf')
-        best_loss = float('inf')
-        best_model_state = None
-        
-        for it in range(max_iters):
-            total_loss = 0.0
-            total_samples = 0
-            
-            # Shuffle sequences for each epoch
-            indices = list(range(len(vector_seqs)))
-            random.shuffle(indices)
-            
-            # Process sequences in batches
-            for batch_start in range(0, len(indices), batch_size):
-                batch_indices = indices[batch_start:batch_start + batch_size]
-                batch_seqs = [vector_seqs[idx] for idx in batch_indices]
-                
-                optimizer.zero_grad()
-                batch_loss = 0.0
-                batch_sample_count = 0
-                
-                # Process each sequence in the batch
-                for vectors in batch_seqs:
-                    # Extract and apply rank operation to vectors
-                    extracted_vectors = self.extract_vectors(vectors)
-                    if extracted_vectors.shape[0] == 0:
-                        continue
-                        
-                    k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-                    
-                    # Compute N(k) vectors for all extracted vectors
-                    Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-                    
-                    # Transform extracted vectors using M
-                    target_vectors = self.M(extracted_vectors)  # [num_vectors, vec_dim]
-                    
-                    # Self-consistency loss: N(k) should match transformed vector at position k
-                    seq_loss = 0.0
-                    valid_positions = 0
-                    
-                    for k in range(extracted_vectors.shape[0]):
-                        target = target_vectors[k]
-                        pred = Nk_batch[k]
-                        seq_loss += torch.sum((pred - target) ** 2)
-                        valid_positions += 1
-                    
-                    if valid_positions > 0:
-                        seq_loss = seq_loss / valid_positions
-                        batch_loss += seq_loss
-                        batch_sample_count += 1
-                    
-                    # Clean up intermediate tensors
-                    del Nk_batch, target_vectors, extracted_vectors, k_positions
-                
-                # Backpropagate batch loss
-                if batch_sample_count > 0:
-                    batch_loss = batch_loss / batch_sample_count
-                    batch_loss.backward()
-                    optimizer.step()
-                    
-                    total_loss += batch_loss.item() * batch_sample_count
-                    total_samples += batch_sample_count
-                
-                # Clear GPU cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            
-            # Calculate average loss for this iteration
-            if total_samples > 0:
-                avg_loss = total_loss / total_samples
-            else:
-                avg_loss = 0.0
-                
-            history.append(avg_loss)
-            
-            # Update best model state
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_model_state = copy.deepcopy(self.state_dict())
-            
-            # Print training progress
-            if it % print_every == 0 or it == max_iters - 1:
-                current_lr = scheduler.get_last_lr()[0]
-                print(f"Self-Train Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}")
-            
-            # Save checkpoint if specified
-            if checkpoint_file and (it % checkpoint_interval == 0 or it == max_iters - 1):
-                self._save_checkpoint(checkpoint_file, it, history, optimizer, scheduler, best_loss)
-            
-            # Check convergence
-            if abs(prev_loss - avg_loss) < tol:
-                print(f"Converged after {it+1} iterations")
-                # Restore best model state
-                if best_model_state is not None:
-                    self.load_state_dict(best_model_state)
-                break
-                
-            prev_loss = avg_loss
-            
-            # Learning rate scheduling
-            scheduler.step()
-        
-        # Compute and store training statistics
-        self._compute_training_statistics(vector_seqs)
-        self.trained = True
-        
+        def step(Nk_flat, flat_vecs, seq_indices, counts, B, batch_indices):
+            """Per-window squared error between N(k) and the transformed window vector."""
+            target_flat = self.M(flat_vecs)                             # [total, m]
+            pos_loss = torch.sum((Nk_flat - target_flat) ** 2, dim=1)   # (total_windows,)
+            seq_loss_sums = torch.zeros(B, device=self.device)
+            seq_loss_sums.scatter_add_(0, seq_indices, pos_loss)
+            return torch.mean(seq_loss_sums / counts), {}
+
+        def report(it, avg_loss, current_lr, stats):
+            return f"Self-Train Iter {it:3d}: Loss = {avg_loss:.6f}, LR = {current_lr:.6f}"
+
+        history, _ = self._train(seqs, step, tag='Self-Train', report=report,
+                                 max_iters=max_iters, tol=tol,
+                                 learning_rate=learning_rate, continued=continued,
+                                 decay_rate=decay_rate, print_every=print_every,
+                                 batch_size=batch_size, checkpoint_file=checkpoint_file,
+                                 checkpoint_interval=checkpoint_interval)
         return history
 
-    def _compute_training_statistics(self, vector_seqs, batch_size=50):
+    # ---------- statistics & checkpoints ----------
+    def _compute_training_statistics(self, seqs):
         """
         Compute training statistics for reconstruction and generation.
-        Processes sequences in batches to manage memory usage.
-        
-        Args:
-            vector_seqs: List of training vector sequences
-            batch_size: Number of sequences to process in each batch
-        """
-        total_vector_count = 0
-        total_t = torch.zeros(self.vec_dim, device=self.device)
-        
-        with torch.no_grad():
-            for i in range(0, len(vector_seqs), batch_size):
-                batch_seqs = vector_seqs[i:i + batch_size]
-                batch_vector_count = 0
-                batch_vec_sum = torch.zeros(self.vec_dim, device=self.device)
-                
-                for vectors in batch_seqs:
-                    # Extract and apply rank operation to vectors
-                    extracted_vectors = self.extract_vectors(vectors)
-                    if extracted_vectors.shape[0] == 0:
-                        continue
-                        
-                    batch_vector_count += extracted_vectors.shape[0]
-                    k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-                    
-                    Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-                    batch_vec_sum += Nk_batch.sum(dim=0)
-                    
-                    # Clean up
-                    del Nk_batch, extracted_vectors, k_positions
-                
-                total_vector_count += batch_vector_count
-                total_t += batch_vec_sum
-                
-                # Clear GPU cache between batches
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        self.mean_vector_count = total_vector_count / len(vector_seqs) if vector_seqs else 0
-        self.mean_t = (total_t / total_vector_count).cpu().numpy() if total_vector_count > 0 else np.zeros(self.vec_dim)
 
-    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler, best_loss):
+        The mean of N(k) over all windows of all sequences is accumulated in a single
+        vectorized pass; chunking is handled by NK_CHUNK inside batch_compute_Nk.
         """
-        Save training checkpoint with complete training state.
-        
-        Args:
-            checkpoint_file: Path to save checkpoint file
-            iteration: Current training iteration
-            history: Training loss history
-            optimizer: Optimizer instance
-            scheduler: Learning rate scheduler instance
-            best_loss: Best loss achieved so far
+        extracted_list = []
+        for seq in seqs:
+            ex = self.extract_vectors(seq)
+            if ex.shape[0] > 0:
+                extracted_list.append(ex)
+        total_window_count = sum(e.shape[0] for e in extracted_list)
+        self.mean_vector_count = total_window_count / len(seqs) if seqs else 0
+        if total_window_count == 0:
+            self.mean_t = np.zeros(self.m)
+            return
+        counts = torch.tensor([e.shape[0] for e in extracted_list],
+                              dtype=torch.long, device=self.device)
+        flat_vecs = torch.cat(extracted_list, dim=0)
+        starts = torch.cumsum(counts, dim=0) - counts
+        flat_k = (torch.arange(flat_vecs.shape[0], dtype=torch.float32, device=self.device)
+                  - torch.repeat_interleave(starts.float(), counts))
+        with torch.no_grad():
+            total_t = self.batch_compute_Nk(flat_k, flat_vecs).sum(dim=0)
+        self.mean_t = (total_t / total_window_count).cpu().numpy()
+
+    def _save_checkpoint(self, checkpoint_file, iteration, history, optimizer, scheduler,
+                         best_loss, extra=None, metrics=None):
+        """
+        Write a training checkpoint that torch.load(..., weights_only=True) can read.
+
+        Everything stored is a tensor or a plain scalar, so the file stays safe to load
+        from an untrusted source; the training statistics need no separate entry because
+        trained / mean_t / mean_vector_count are persistent buffers inside state_dict.
+        ``extra`` carries method-specific bookkeeping (such as num_classes) and
+        ``metrics`` the per-iteration metrics accumulated by the engine.
         """
         checkpoint = {
             'iteration': iteration,
@@ -960,462 +681,672 @@ class NumDualDescriptorPM(nn.Module):
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'history': history,
-            'best_loss': best_loss,
-            'training_stats': {
-                'mean_t': self.mean_t,
-                'mean_vector_count': self.mean_vector_count
-            }
+            'best_loss': best_loss
         }
+        if metrics is not None:
+            checkpoint['metrics'] = metrics
+        if extra:
+            checkpoint.update(extra)
         torch.save(checkpoint, checkpoint_file)
         print(f"Checkpoint saved at iteration {iteration}")
 
-    def predict_t(self, vectors):
+    def _finish_training(self, seqs, history, optimizer, scheduler, best_loss,
+                         checkpoint_file, extra=None, metrics=None):
         """
-        Predict target vector for a vector sequence
-        Returns the average of all N(k) vectors in the sequence
+        Close a training run: compute the training statistics, mark the model as trained
+        and, when checkpointing is on, rewrite the checkpoint file one last time.
         """
-        if len(vectors) == 0:
-            return [0.0] * self.vec_dim
-        
-        # Extract and apply rank operation to vectors
-        extracted_vectors = self.extract_vectors(vectors)
-        if extracted_vectors.shape[0] == 0:
-            return [0.0] * self.vec_dim
-        
-        k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-        
-        # Batch compute all Nk vectors
-        Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-        Nk_sum = torch.sum(Nk_batch, dim=0)
-        
-        return (Nk_sum / extracted_vectors.shape[0]).detach().cpu().numpy()
+        self._compute_training_statistics(seqs)
+        self.trained = True
+        if checkpoint_file:
+            self._save_checkpoint(checkpoint_file, len(history) - 1, history, optimizer,
+                                  scheduler, best_loss, extra, metrics)
+            print("Final checkpoint saved with the complete, reconstructable state")
 
-    def predict_c(self, vectors):
+    # ---------- predictors ----------
+    def predict_t(self, seq_vectors):
+        """
+        Predict target vector for a vector sequence as the mean of N(k) over all its
+        windows. This is the m-dimensional model output produced directly by the learned
+        M map and P matrix, with no regression head involved; paired with
+        grad_train / t_generate. If the sequence yields no window, a zero vector of
+        length m is returned.
+        """
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
+            return np.zeros(self.m, dtype=np.float32)
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            Nk_batch = self.batch_compute_Nk(k_positions, ex)
+        return Nk_batch.mean(dim=0).detach().cpu().numpy()
+
+    def predict_r(self, seq_vectors):
+        """
+        Predict target vector for a vector sequence through the regression head.
+        If a regression head (regresser) exists, the m-dimensional model output is mapped
+        to the target dimension; otherwise the original m-dimensional model vector is
+        returned. Paired with reg_train / r_generate.
+        """
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
+            if self.regresser is not None:
+                return np.zeros(self.target_dim, dtype=np.float32)
+            else:
+                return np.zeros(self.m, dtype=np.float32)
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            Nk_batch = self.batch_compute_Nk(k_positions, ex)
+            seq_rep = Nk_batch.mean(dim=0)
+            if self.regresser is not None:
+                out = self.regresser(seq_rep.unsqueeze(0)).squeeze(0)
+                return out.detach().cpu().numpy()
+            else:
+                return seq_rep.detach().cpu().numpy()
+
+    def predict_c(self, seq_vectors):
         """
         Predict class label for a vector sequence using the classification head.
-        
-        Args:
-            vectors: Input vector sequence
-            
-        Returns:
-            tuple: (predicted_class, class_probabilities)
+        Paired with cls_train / c_generate.
         """
         if self.classifier is None:
             raise ValueError("Model must be trained first for classification")
-        
-        # Get sequence vector representation
-        seq_vector = self.predict_t(vectors)
-        seq_vector_tensor = torch.tensor(seq_vector, dtype=torch.float32, device=self.device)
-        
-        # Get logits through classification head
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
+            raise ValueError("Empty vector sequence")
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        Nk_batch = self.batch_compute_Nk(k_positions, ex)
+        seq_rep = Nk_batch.mean(dim=0)
         with torch.no_grad():
-            logits = self.classifier(seq_vector_tensor.unsqueeze(0))
+            logits = self.classifier(seq_rep.unsqueeze(0))
             probabilities = torch.softmax(logits, dim=1)
             predicted_class = torch.argmax(probabilities, dim=1).item()
-            
         return predicted_class, probabilities[0].cpu().numpy()
 
-    def predict_l(self, vectors, threshold=0.5):
+    def predict_l(self, seq_vectors, threshold=0.5):
         """
         Predict multi-label classification for a vector sequence.
-        
-        Args:
-            vectors: Input vector sequence
-            threshold: Probability threshold for binary classification (default: 0.5)
-            
-        Returns:
-            numpy.ndarray: Binary label predictions (0 or 1 for each label)
-            numpy.ndarray: Probability scores for each label
+        Paired with lbl_train / l_generate.
         """
         assert self.labeller is not None, "Model must be trained first for label prediction"
-        
-        if len(vectors) == 0:
-            # Return zeros if no vectors
-            return np.zeros(self.num_labels, dtype=np.float32), np.zeros(self.num_labels, dtype=np.float32)
-        
-        # Extract and apply rank operation to vectors
-        extracted_vectors = self.extract_vectors(vectors)
-        if extracted_vectors.shape[0] == 0:
-            return np.zeros(self.num_labels, dtype=np.float32), np.zeros(self.num_labels, dtype=np.float32)
-        
-        k_positions = torch.arange(extracted_vectors.shape[0], dtype=torch.float32, device=self.device)
-        
-        # Compute N(k) vectors for all extracted vectors in the sequence
-        Nk_batch = self.batch_compute_Nk(k_positions, extracted_vectors)
-        
-        # Compute sequence representation: average of all N(k) vectors
-        seq_representation = torch.mean(Nk_batch, dim=0)
-        
-        # Pass through classification head to get logits
+        ex = self.extract_vectors(seq_vectors)
+        if ex.shape[0] == 0:
+            return (np.zeros(self.num_labels, dtype=np.float32),
+                    np.zeros(self.num_labels, dtype=np.float32))
+        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
+        Nk_batch = self.batch_compute_Nk(k_positions, ex)
+        seq_rep = Nk_batch.mean(dim=0)
         with torch.no_grad():
-            logits = self.labeller(seq_representation)
-            # Apply sigmoid to get probabilities
-            probs = torch.sigmoid(logits).cpu().numpy()
-        
-        # Apply threshold to get binary predictions
+            logits = self.labeller(seq_rep.unsqueeze(0))
+            probs = torch.sigmoid(logits).cpu().numpy()[0]
         binary_preds = (probs > threshold).astype(np.float32)
-        
         return binary_preds, probs
-    
-    def reconstruct(self, L, tau=0.0):
-        """Reconstruct representative vector sequence of length L by minimizing error with temperature-controlled randomness"""
+
+    # ==================================================================
+    # Vector-sequence generation
+    # ==================================================================
+    def _resolve_step(self):
+        """Return the window step used by extract_vectors, with sanity checks."""
+        if self.mode == 'linear':
+            step = 1
+        else:
+            step = self.step if self.step is not None else self.rank
+        if step <= 0:
+            raise ValueError("step must be positive")
+        return step
+
+    def _num_windows_for_length(self, L, step):
+        """Number of windows extract_vectors would produce for a sequence of length L."""
+        if L < self.rank:
+            return 0
+        if self.mode == 'linear':
+            return L - self.rank + 1
+        return (L - self.rank) // step + 1
+
+    def _Nk_from_windows(self, k_tensor, windows):
+        """
+        Apply rank_op to raw window tensors and evaluate N(k) for each window.
+
+        Args:
+            k_tensor (Tensor): [T] position indices
+            windows (Tensor): [T, rank, vec_dim] raw window tensors
+
+        Returns:
+            N(k) tensor of shape [T, m]
+        """
+        applied = self._apply_op(windows)
+        return self.batch_compute_Nk(k_tensor, applied)
+
+    def _Nk_scorer(self, k_tensor, windows, target_tensor):
+        """Negative squared error between N(k) of each window and a fixed target vector."""
+        Nk = self._Nk_from_windows(k_tensor, windows)
+        return -torch.sum((Nk - target_tensor) ** 2, dim=1)
+
+    def _generate_windows(self, L, scorer, tau=0.0, num_steps=300, opt_lr=0.05):
+        """
+        Shared generation engine used by all *_generate methods.
+
+        The length-L output vector sequence is produced by gradient-optimizing the
+        T window tensors (shape [T, rank, vec_dim]) so that the score returned by
+        ``scorer(k_tensor, windows)`` is maximized at each window position. The
+        optimized windows are then stitched into a full [L, vec_dim] sequence: each
+        window contributes its rank vectors to positions k*step .. k*step+rank-1,
+        and overlapping positions are averaged across all covering windows.
+
+        Stochastic sampling is achieved by adding Gaussian noise scaled by tau to the
+        optimized windows, so tau=0 is deterministic and tau>0 yields random variants.
+
+        Args:
+            L (int): desired sequence length (number of output vectors).
+            scorer (callable): scorer(k_tensor, windows) -> 1-D tensor of scores,
+                one per window; higher is better.
+            tau (float): temperature for stochastic sampling; tau=0 is deterministic.
+            num_steps (int): number of gradient steps per generation.
+            opt_lr (float): learning rate of the Adam optimizer used for generation.
+
+        Returns:
+            numpy.ndarray of shape [L, vec_dim].
+        """
         assert self.trained, "Model must be trained first"
+        assert self.rank_mode != 'pad', "generation is not applicable to rank_mode='pad'"
         if tau < 0:
             raise ValueError("Temperature must be non-negative")
-            
-        # For reconstruction, we need to generate rank-length vector windows
-        # Since we're dealing with continuous vectors, we need a different approach
-        # We'll generate random vectors and select the best ones
-        
-        num_windows = (L + self.rank - 1) // self.rank
-        mean_t_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
-        
-        # We need to generate candidate vectors
-        # For simplicity, we'll generate random vectors from a normal distribution
-        # In practice, you might want to use a more sophisticated generation method
-        
-        generated_vectors = []
-        
-        # Pre-generate some candidate vectors
-        num_candidates = 100
-        candidate_vectors = torch.randn(num_candidates, self.vec_dim, device=self.device)
-        
-        for k in range(num_windows):
-            # Compute Nk for all candidate vectors at position k
-            k_tensor = torch.tensor([k] * num_candidates, dtype=torch.float32, device=self.device)
-            Nk_all = self.batch_compute_Nk(k_tensor, candidate_vectors)
-            
-            # Compute scores
-            errors = torch.sum((Nk_all - mean_t_tensor) ** 2, dim=1)
-            scores = -errors  # Convert to score (higher = better)
-            
-            if tau == 0:  # Deterministic selection
-                max_idx = torch.argmax(scores).item()
-                best_vector = candidate_vectors[max_idx]
-            else:  # Stochastic selection
-                probs = torch.softmax(scores / tau, dim=0).detach().cpu().numpy()
-                chosen_idx = random.choices(range(num_candidates), weights=probs, k=1)[0]
-                best_vector = candidate_vectors[chosen_idx]
-            
-            generated_vectors.append(best_vector)
-        
-        # Concatenate all vectors to form the full sequence
-        full_sequence = torch.stack(generated_vectors)[:L]
-        return full_sequence.detach().cpu().numpy()
+        if L <= 0:
+            return np.zeros((0, self.vec_dim), dtype=np.float32)
 
+        step = self._resolve_step()
+        T = self._num_windows_for_length(L, step)
+        if T <= 0:
+            return (0.1 * np.random.randn(L, self.vec_dim)).astype(np.float32)
+
+        init = torch.randn(T, self.rank, self.vec_dim, device=self.device) * 0.1
+        v = nn.Parameter(init)
+        opt = torch.optim.Adam([v], lr=opt_lr)
+        k_tensor = torch.arange(T, dtype=torch.float32, device=self.device)
+
+        for _ in range(num_steps):
+            opt.zero_grad()
+            scores = scorer(k_tensor, v)
+            loss = -scores.mean()
+            loss.backward()
+            opt.step()
+
+        with torch.no_grad():
+            v_final = v.detach()
+            if tau > 0:
+                v_final = v_final + tau * torch.randn_like(v_final)
+
+            positions = (torch.arange(T, device=self.device).unsqueeze(1) * step
+                         + torch.arange(self.rank, device=self.device).unsqueeze(0))
+            mask = positions < L
+            flat_positions = positions[mask]
+            flat_v = v_final[mask]
+
+            out = torch.zeros(L, self.vec_dim, device=self.device)
+            cnt = torch.zeros(L, 1, device=self.device)
+            out.index_add_(0, flat_positions, flat_v)
+            cnt.index_add_(0, flat_positions,
+                           torch.ones(flat_positions.shape[0], 1, device=self.device))
+            out = out / cnt.clamp(min=1)
+
+        return out.cpu().numpy()
+
+    def generate(self, L, tau=0.0):
+        """
+        Generate a length-L vector sequence after self_train.
+        The global training mean_t is used as the reconstruction target for every window
+        position. rank_mode must not be 'pad'.
+        """
+        assert self.trained, "Model must be trained first"
+        target_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
+
+        def scorer(k_tensor, windows):
+            return self._Nk_scorer(k_tensor, windows, target_tensor)
+
+        return self._generate_windows(L, scorer, tau=tau)
+
+    def t_generate(self, L, tau=0.0, t=None):
+        """
+        Generate a length-L vector sequence after grad_train by matching the target
+        vector t. If t is None, the global mean_t is used (equivalent to generate).
+        """
+        assert self.trained, "Model must be trained first"
+        if t is None:
+            target = self.mean_t
+        else:
+            target = np.asarray(t, dtype=np.float32).flatten()
+        if target.size != self.m:
+            raise ValueError(f"Target vector must have {self.m} elements, got {target.size}")
+        target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
+
+        def scorer(k_tensor, windows):
+            return self._Nk_scorer(k_tensor, windows, target_tensor)
+
+        return self._generate_windows(L, scorer, tau=tau)
+
+    def r_generate(self, L, r, tau=0.0):
+        """
+        Generate a length-L vector sequence after reg_train by matching the target
+        vector r through the regression head. r must have length self.target_dim.
+        """
+        assert self.trained, "Model must be trained first"
+        if self.regresser is None:
+            raise ValueError("No regression head found; train with reg_train first")
+        target = np.asarray(r, dtype=np.float32).flatten()
+        if target.size != self.target_dim:
+            raise ValueError(
+                f"Target r must have {self.target_dim} elements, got {target.size}")
+        target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
+
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            preds = self.regresser(Nk)
+            return -torch.sum((preds - target_tensor) ** 2, dim=1)
+
+        return self._generate_windows(L, scorer, tau=tau)
+
+    def c_generate(self, L, c, tau=0.0):
+        """
+        Generate a length-L vector sequence after cls_train for a given class c.
+        """
+        assert self.trained, "Model must be trained first"
+        if self.classifier is None:
+            raise ValueError("No classifier found; train with cls_train first")
+        if not (0 <= c < self.num_classes):
+            raise ValueError(f"Class c must be in [0, {self.num_classes}), got {c}")
+
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            logits = self.classifier(Nk)
+            return logits[:, c]
+
+        return self._generate_windows(L, scorer, tau=tau)
+
+    def l_generate(self, L, l, tau=0.0):
+        """
+        Generate a length-L vector sequence after lbl_train for a target multi-label
+        vector l. l must have length self.num_labels.
+        """
+        assert self.trained, "Model must be trained first"
+        if self.labeller is None:
+            raise ValueError("No labeller found; train with lbl_train first")
+        target = np.asarray(l, dtype=np.float32).flatten()
+        if target.size != self.num_labels:
+            raise ValueError(
+                f"Target l must have {self.num_labels} elements, got {target.size}")
+        target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
+
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            probs = torch.sigmoid(self.labeller(Nk))
+            return -torch.sum((probs - target_tensor) ** 2, dim=1)
+
+        return self._generate_windows(L, scorer, tau=tau)
+
+    # ---------- persistence ----------
     def save(self, filename):
-        """Save model state to file"""
+        """Save model state to file."""
         torch.save(self.state_dict(), filename)
         print(f"Model saved to {filename}")
 
     def load(self, filename):
-        """Load model state from file"""        
-        # Use weights only=True to avoid security warnings
-        try:
-            # PyTorch 1.13+ supports the "weights only" parameter
-            state_dict = torch.load(filename, map_location=self.device, weights_only=True)
-        except TypeError:
-            # Rollback solution for old versions of PyTorch
-            state_dict = torch.load(filename, map_location=self.device)
-        
+        """
+        Load a model from file, accepting either format this class writes:
+
+          * a plain state dict, as written by save();
+          * a training checkpoint, as written by the training methods through
+            checkpoint_file, whose state is taken from its 'model_state_dict'.
+
+        The three prediction heads (regresser / classifier / labeller) are created
+        lazily, so any head carried by the file but missing here is rebuilt first.
+        The file is always read with weights_only=True: everything written is a tensor
+        or a plain scalar, which keeps loading an untrusted file safe.
+        """
+        state_dict = torch.load(filename, map_location=self.device, weights_only=True)
+        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+            state_dict = state_dict['model_state_dict']
+
+        for head, dim_attr in (('regresser', 'target_dim'),
+                               ('classifier', 'num_classes'),
+                               ('labeller', 'num_labels')):
+            weight = state_dict.get(f'{head}.weight')
+            if weight is None:
+                continue
+            out_dim = weight.shape[0]
+            if getattr(self, head) is None or getattr(self, dim_attr) != out_dim:
+                setattr(self, head, nn.Linear(self.m, out_dim).to(self.device))
+                setattr(self, dim_attr, out_dim)
+
         self.load_state_dict(state_dict)
         print(f"Model loaded from {filename}")
         return self
 
 
 # === Example Usage ===
-if __name__=="__main__":
-    import matplotlib.pyplot as plt
-    from scipy.stats import pearsonr
-    
-    print("="*50)
-    print("Numerical Dual Descriptor PM - PyTorch GPU Accelerated Version")
-    print("Processes sequences of m-dimensional real vectors with 2D matrix P")   
-    print("="*50)
-    
-    # Set random seeds to ensure reproducibility
+if __name__ == "__main__":
     torch.manual_seed(11)
     random.seed(11)
     np.random.seed(11)
-    
-    # Parameters
-    vec_dim = 10     # Dimension of input vectors and internal representation
-    rank = 1          # Window size for vector sequences
-    user_step = 1     # Step size for nonlinear mode
-    
-    # Initialize the model (using vec_dim instead of input_dim and model_dim)
-    ndd = NumDualDescriptorPM(
-        vec_dim=vec_dim,
-        rank=rank, 
-        mode='nonlinear', 
-        user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    
-    # Display device information
-    print(f"\nUsing device: {ndd.device}")
-    print(f"Vector dimension: {vec_dim}")
-    print(f"Rank (window size): {rank}")
-    print(f"P matrix shape: {ndd.P.shape}")  # Should be [vec_dim, vec_dim]
-    print(f"M matrix shape: {ndd.M.weight.shape}")  # Should be [vec_dim, vec_dim]
-    
-    # Generate 100 vector sequences with random target vectors
-    print("\nGenerating training data...")
-    seqs, t_list = [], []
-    for _ in range(100):
-        L = random.randint(200, 300)
-        # Generate random vector sequence
-        seq = torch.randn(L, vec_dim)
-        seqs.append(seq)
-        # Create a random vector target
-        t_list.append(np.random.uniform(-1.0, 1.0, vec_dim))
 
-    # Training model
-    print("\n" + "="*50)
-    print("Starting Gradient Descent Training")
-    print("="*50)
-    ndd.reg_train(seqs, t_list, max_iters=100, tol=1e-9, learning_rate=1.0, decay_rate=0.95, batch_size=32)  
-   
-    # Predict the target vector of the first sequence
-    aseq = seqs[0]
-    t_pred = ndd.predict_t(aseq)
-    print(f"\nPredicted t for first sequence: {[round(x.item(), 4) for x in t_pred[:5]]}...")    
-    
-    # Calculate the correlation between the predicted and the real target
-    print("\nCalculating prediction correlations...")
-    pred_t_list = [ndd.predict_t(seq) for seq in seqs]
-    
-    # The predicted values and actual values used for correlation calculation
-    corr_sum = 0.0
-    for i in range(ndd.vec_dim):
-        actu_t = [t_vec[i] for t_vec in t_list]
-        pred_t = [t_vec[i] for t_vec in pred_t_list]
-        corr, _ = pearsonr(actu_t, pred_t)
-        print(f"Dimension {i} prediction correlation: {corr:.4f}")
-        corr_sum += corr
-    corr_avg = corr_sum / ndd.vec_dim
-    print(f"Average correlation: {corr_avg:.4f}")         
-   
-    # Reconstruct representative sequences
-    print("\nGenerating reconstructed sequences...")
-    # Note: Reconstruction for continuous vectors generates new vector sequences
-    seq_det = ndd.reconstruct(L=100, tau=0.0)
-    seq_rand = ndd.reconstruct(L=100, tau=0.5)
-    print(f"Deterministic reconstruction shape: {seq_det.shape}")
-    print(f"Stochastic reconstruction shape: {seq_rand.shape}")
-    print(f"Deterministic mean: {np.mean(seq_det):.4f}, std: {np.std(seq_det):.4f}")
-    print(f"Stochastic mean: {np.mean(seq_rand):.4f}, std: {np.std(seq_rand):.4f}")
+    # ----- global settings -----
+    vec_dim = 15
+    rank = 3
+    user_step = 2
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Classification task 
-    print("\n" + "="*50)
-    print("Classification Task")
-    print("="*50)
-    
-    # Generate classification data
+    # ----- shared hyper-parameters for training -----
+    # Larger batches and fewer iterations: the same gradient signal with fewer steps.
+    BATCH_SIZE = 128
+    MAX_ITERS = 100
+
+    print("=" * 60)
+    print("Numerical Dual Descriptor PM - PyTorch GPU Accelerated Version")
+    print("=" * 60)
+    print(f"Device: {device}")
+    print(f"vec_dim = {vec_dim}, rank = {rank}, "
+          f"step = {user_step}, mode = nonlinear, rank_op = avg")
+    print(f"Shared training settings: batch_size = {BATCH_SIZE}, max_iters = {MAX_ITERS}")
+    print()
+    print("Synthetic data carries real signal:")
+    print("  * regression : target = fixed linear projection of the sequence mean")
+    print("  * multi-label: labels  = sign of the first four mean components")
+    print("  * classif.   : class-specific mean offsets")
+    print("So the models can actually be seen to learn.")
+
+    # ----- helpers -----
+    def corr(a, b):
+        """Pearson correlation via np.corrcoef; 0.0 if either input is constant."""
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+        if a.std() == 0 or b.std() == 0:
+            return 0.0
+        return float(np.corrcoef(a, b)[0, 1])
+
+    def show(seq):
+        return (f"shape={tuple(seq.shape)}, "
+                f"mean={float(np.mean(seq)):+.4f}, std={float(np.std(seq)):.4f}")
+
+    # ----- data generators with real signal -----
+    def make_latent_seqs(n_seqs, seed, latent_dim=4, noise_scale=0.2):
+        """
+        Generate vector sequences with a low-dimensional latent code.
+
+        Each sequence is (h @ H) repeated across all time steps plus i.i.d. Gaussian
+        noise, where h ∈ R^latent_dim is drawn fresh per sequence and H ∈ R^{latent_dim × m}
+        is a fixed basis. Thus the sequence mean ≈ h @ H is a learnable, non-trivial
+        target that the model can actually recover.
+        """
+        rng = np.random.RandomState(seed)
+        H = rng.randn(latent_dim, vec_dim).astype(np.float32) * 0.7
+        seqs = []
+        for _ in range(n_seqs):
+            L = rng.randint(200, 300)
+            h = rng.randn(latent_dim).astype(np.float32)
+            seq = (h @ H)[None, :] + rng.randn(L, vec_dim).astype(np.float32) * noise_scale
+            seqs.append(seq.astype(np.float32))
+        return seqs
+
+    # =====================================================================
+    # (1) grad_train + predict_t + t_generate (no regression head)
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(1) grad_train + predict_t + t_generate (no regression head)")
+    print("=" * 60)
+
+    seqs_grad = make_latent_seqs(100, seed=1)
+    # Target = the sequence mean itself; that is exactly what predict_t returns
+    # and is a fully learnable signal.
+    t_list_grad = [s.mean(axis=0).astype(np.float32).tolist() for s in seqs_grad]
+
+    dd_grad = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                  mode='nonlinear',
+                                  user_step=user_step, device=device)
+
+    print("\n" + "-" * 60)
+    print("Starting Gradient Descent Training (grad_train, no head)")
+    print("-" * 60)
+    dd_grad.grad_train(seqs_grad, t_list_grad,
+                       max_iters=MAX_ITERS, tol=1e-12,
+                       learning_rate=0.02, decay_rate=0.999,
+                       batch_size=BATCH_SIZE, print_every=20)
+
+    pred_t_arr = np.array([dd_grad.predict_t(seq) for seq in seqs_grad])   # (N, m)
+    true_t_arr = np.array(t_list_grad)                                      # (N, m)
+    corrs = [corr(true_t_arr[:, i], pred_t_arr[:, i]) for i in range(vec_dim)]
+    print(f"\nAverage prediction correlation: {np.mean(corrs):.4f} "
+          f"(min {np.min(corrs):.4f}, max {np.max(corrs):.4f})")
+
+    print("\n--- t_generate (default target = mean_t) ---")
+    seq_def = dd_grad.t_generate(L=60, tau=0.0)
+    print("Deterministic (tau=0):   ", show(seq_def))
+    seq_rand = dd_grad.t_generate(L=60, tau=0.5)
+    print("Stochastic  (tau=0.5):   ", show(seq_rand))
+
+    print("\n--- t_generate (explicit target = mean of sequence #0) ---")
+    my_target = seqs_grad[0].mean(axis=0).astype(np.float32)
+    seq_tgt = dd_grad.t_generate(L=60, tau=0.0, t=my_target)
+    print("Deterministic (tau=0):   ", show(seq_tgt))
+    print("Verification: correlation between mean(N(k)) of the generated sequence")
+    print(f"  and the target vector: "
+          f"{corr(dd_grad.predict_t(seq_tgt), my_target):.4f}")
+
+    # =====================================================================
+    # (2) reg_train + predict_r + r_generate (with a regression head)
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(2) reg_train + predict_r + r_generate (with a regression head)")
+    print("=" * 60)
+
+    seqs_reg = make_latent_seqs(100, seed=2)
+    target_dim_reg = 8
+    W_reg = np.random.RandomState(99).randn(target_dim_reg, vec_dim).astype(np.float32) * 0.5
+    t_list_reg = [(W_reg @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_reg]
+
+    dd = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                             mode='nonlinear',
+                             user_step=user_step, device=device)
+
+    print("\n" + "-" * 60)
+    print(f"Starting reg_train (target_dim = {target_dim_reg})")
+    print("-" * 60)
+    dd.reg_train(seqs_reg, t_list_reg, target_dim=target_dim_reg,
+                 max_iters=MAX_ITERS, tol=1e-12,
+                 learning_rate=0.02, decay_rate=0.999,
+                 batch_size=BATCH_SIZE, print_every=20)
+
+    pred_r_arr = np.array([dd.predict_r(seq) for seq in seqs_reg])   # (N, target_dim)
+    true_r_arr = np.array(t_list_reg)
+    corrs = [corr(true_r_arr[:, i], pred_r_arr[:, i]) for i in range(target_dim_reg)]
+    print(f"\nAverage prediction correlation (target_dim={target_dim_reg}): "
+          f"{np.mean(corrs):.4f} (min {np.min(corrs):.4f}, max {np.max(corrs):.4f})")
+
+    print("\n--- r_generate (target r must be provided) ---")
+    my_r = np.random.uniform(-1.0, 1.0, target_dim_reg).astype(np.float32)
+    seq_r = dd.r_generate(L=60, r=my_r, tau=0.0)
+    print("Deterministic (tau=0):   ", show(seq_r))
+    seq_r_rand = dd.r_generate(L=60, r=my_r, tau=0.5)
+    print("Stochastic  (tau=0.5):   ", show(seq_r_rand))
+    print(f"Verification: predicted r on the generated sequence vs target -> "
+          f"r-pred={np.round(dd.predict_r(seq_r), 3)}, r-target={np.round(my_r, 3)}")
+
+    # =====================================================================
+    # (3) Classification + c_generate
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(3) Classification Task")
+    print("=" * 60)
+
     num_classes = 3
-    class_seqs = []
-    class_labels = []
-    
-    # Create vector sequences with different patterns for each class
+    class_seqs, class_labels = [], []
+    rng = np.random.RandomState(7)
     for class_id in range(num_classes):
-        for _ in range(50):  # 50 sequences per class
-            L = random.randint(150, 250)
+        for _ in range(50):
+            L = rng.randint(150, 250)
             if class_id == 0:
-                # Class 0: Vectors with positive mean
-                seq = torch.randn(L, vec_dim) + 1.0
+                seq = rng.randn(L, vec_dim) + 1.0
             elif class_id == 1:
-                # Class 1: Vectors with negative mean
-                seq = torch.randn(L, vec_dim) - 1.0
+                seq = rng.randn(L, vec_dim) - 1.0
             else:
-                # Class 2: Standard normal vectors
-                seq = torch.randn(L, vec_dim)
-            
-            class_seqs.append(seq)
-            class_labels.append(class_id)    
+                seq = rng.randn(L, vec_dim)
+            class_seqs.append(seq.astype(np.float32))
+            class_labels.append(class_id)
 
-    # Initialize new model for classification
-    ndd_cls = NumDualDescriptorPM(
-        vec_dim=vec_dim,
-        rank=rank, 
-        mode='nonlinear', 
-        user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    
-    # Train for classification
-    print("\n" + "="*50)
+    dd_cls = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                 mode='nonlinear',
+                                 user_step=user_step, device=device)
+
+    print("\n" + "-" * 60)
     print("Starting Classification Training")
-    print("="*50)
-    history = ndd_cls.cls_train(class_seqs, class_labels, num_classes, 
-                               max_iters=50, tol=1e-8, learning_rate=0.05,
-                               decay_rate=0.99, batch_size=16, print_every=5)
-    
-    # Show prediction results on the training dataset
-    print("\n" + "="*50)
-    print("Prediction results")
-    print("="*50)
-    
+    print("-" * 60)
+    dd_cls.cls_train(class_seqs, class_labels, num_classes,
+                     max_iters=MAX_ITERS, tol=1e-10,
+                     learning_rate=0.05, decay_rate=0.995,
+                     batch_size=BATCH_SIZE, print_every=20)
+
     correct = 0
-    all_predictions = []
-    
     for seq, true_label in zip(class_seqs, class_labels):
-        pred_class, probs = ndd_cls.predict_c(seq)
-        all_predictions.append(pred_class)
-        
+        pred_class, _ = dd_cls.predict_c(seq)
         if pred_class == true_label:
             correct += 1
-    
-    accuracy = correct / len(class_seqs)
-    print(f"Accuracy: {accuracy:.4f} ({correct}/{len(class_seqs)})")
-    
-    # Show some example predictions
-    print("\nExample predictions:")
-    for i in range(min(5, len(class_seqs))):
-        pred_class, probs = ndd_cls.predict_c(class_seqs[i])
-        print(f"Seq {i+1}: True={class_labels[i]}, Pred={pred_class}, Probs={[f'{p:.3f}' for p in probs[:3]]}...")
+    print(f"\nTraining accuracy: {correct / len(class_seqs):.4f} "
+          f"({correct}/{len(class_seqs)})")
 
-    # Multi-label classification
-    print("\n\n" + "="*50)
-    print("Multi-Label Classification Model")
-    print("="*50)
+    print("\n--- c_generate: one sequence per class ---")
+    for c in range(num_classes):
+        seq_c = dd_cls.c_generate(L=60, c=c, tau=0.0)
+        pred_c, probs_c = dd_cls.predict_c(seq_c)
+        print(f"Class {c} (tau=0):   {show(seq_c)}  ->  predicted={pred_c}, "
+              f"probs={[f'{p:.3f}' for p in probs_c]}")
 
-    # Generate 100 vector sequences with random multi-labels for classification
-    num_labels = 4  # Example: 4 different functions    
-    label_seqs = []
-    labels = []
+    # =====================================================================
+    # (4) Multi-label classification + l_generate
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(4) Multi-Label Classification Model")
+    print("=" * 60)
+
+    num_labels = 4
+    label_seqs, labels = [], []
+    rng = np.random.RandomState(8)
+    H_lbl = rng.randn(4, vec_dim).astype(np.float32) * 0.7
     for _ in range(100):
-        L = random.randint(200, 300)
-        seq = torch.randn(L, vec_dim)
-        label_seqs.append(seq)
-        # Create random binary labels (multi-label classification)
-        # Each sequence can have 0-4 active labels
-        label_vec = [random.random() > 0.7 for _ in range(num_labels)]
-        labels.append([1.0 if x else 0.0 for x in label_vec])
+        L = rng.randint(200, 300)
+        h = rng.randn(4).astype(np.float32)
+        seq = (h @ H_lbl)[None, :] + rng.randn(L, vec_dim).astype(np.float32) * 0.2
+        m = seq.mean(axis=0)
+        # Labels are deterministic functions of the sequence mean -> learnable.
+        label_vec = [
+            1.0 if m[0] > 0 else 0.0,
+            1.0 if m[1] > 0 else 0.0,
+            1.0 if m[2] > 0 else 0.0,
+            1.0 if m[3] > 0 else 0.0,
+        ]
+        label_seqs.append(seq.astype(np.float32))
+        labels.append(label_vec)
 
-    
-    ndd_lbl = NumDualDescriptorPM(
-        vec_dim=vec_dim,
-        rank=rank, 
-        mode='nonlinear', 
-        user_step=user_step,        
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    
-    # Training multi-label classification model
-    print("\n" + "="*50)
-    print("Starting Gradient Descent Training for Multi-Label Classification")
-    print("="*50)
-       
-    # Train the model
-    loss_history, acc_history = ndd_lbl.lbl_train(
+    dd_lbl = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                 mode='nonlinear',
+                                 user_step=user_step, device=device)
+
+    print("\n" + "-" * 60)
+    print("Starting Multi-Label Training (lbl_train)")
+    print("-" * 60)
+    loss_history, acc_history = dd_lbl.lbl_train(
         label_seqs, labels, num_labels,
-        max_iters=50, 
-        tol=1e-16, 
-        learning_rate=0.05, 
-        decay_rate=0.99, 
-        print_every=10, 
-        batch_size=16
+        max_iters=MAX_ITERS, tol=1e-14,
+        learning_rate=0.02, decay_rate=0.995,
+        print_every=20, batch_size=BATCH_SIZE
     )
-    
     print(f"\nFinal training loss: {loss_history[-1]:.6f}")
-    print(f"Final training accuracy: {acc_history[-1]:.4f}")
-    
-    # Show prediction results on training set
-    print("\n" + "="*50)
-    print("Prediction Results")
-    print("="*50)
-    
-    all_correct = 0
-    total = 0
-    
-    for seq, true_labels in zip(label_seqs, labels):
-        pred_binary, pred_probs = ndd_lbl.predict_l(seq, threshold=0.5)
-        
-        # Convert true labels to numpy array
-        true_labels_np = np.array(true_labels)
-        
-        # Calculate accuracy for this sequence (exact match)
-        correct = np.all(pred_binary == true_labels_np)
-        all_correct += correct
-        total += 1
-        
-        # Print detailed results for first few sequences
-        if total <= 3:
-            print(f"\nSequence {total}:")
-            print(f"True labels: {true_labels_np}")
-            print(f"Predicted binary: {pred_binary}")
-            print(f"Predicted probabilities: {[f'{p:.4f}' for p in pred_probs]}")
-            print(f"Correct: {correct}")
-    
-    accuracy = all_correct / total if total > 0 else 0.0
-    print(f"\nOverall prediction accuracy: {accuracy:.4f} ({all_correct}/{total} sequences)")
-    
-    # Example of label prediction for a new sequence
-    print("\n" + "="*50)
-    print("Label Prediction Example")
-    print("="*50)
-    
-    # Create a test sequence
-    test_seq = torch.randn(250, vec_dim)
-    print(f"Test sequence shape: {test_seq.shape}")
-    
-    # Predict labels
-    binary_pred, probs_pred = ndd_lbl.predict_l(test_seq, threshold=0.5)
-    print(f"\nPredicted binary labels: {binary_pred}")
-    print(f"Predicted probabilities: {[f'{p:.4f}' for p in probs_pred]}")
-    
-    # Interpret the predictions
-    label_names = ["Function_A", "Function_B", "Function_C", "Function_D"]
-    print("\nLabel interpretation:")
-    for i, (binary, prob) in enumerate(zip(binary_pred, probs_pred)):
-        status = "ACTIVE" if binary > 0.5 else "INACTIVE"
-        print(f"  {label_names[i]}: {status} (confidence: {prob:.4f})")
+    print(f"Final training accuracy (per-label): {acc_history[-1]:.4f}")
 
-    # Self-training examples
-    print("\n" + "="*50)
-    print("Self-Training Example")
-    print("="*50)
-    
-    # Create a new model
-    ndd_self = NumDualDescriptorPM(
-        vec_dim=vec_dim,
-        rank=rank, 
-        mode='nonlinear', 
-        user_step=user_step,
-        device='cuda' if torch.cuda.is_available() else 'cpu'
-    )
-    
-    # Generate sample sequences
-    self_seqs = []
-    for _ in range(10):
-        L = random.randint(200, 300)
-        self_seqs.append(torch.randn(L, vec_dim))
-    
-    # Conduct self-consistency training
-    print("\nTraining for self-consistency:")
-    self_history = ndd_self.self_train(
-        self_seqs, 
-        max_iters=30, 
-        tol=1e-8, 
-        learning_rate=0.01,         
-        batch_size=4
-    )
-    
-    # Visualize training loss
-    plt.figure(figsize=(10, 6))
-    plt.plot(self_history)
-    plt.title('Self-Training Loss History')
-    plt.xlabel('Iteration')
-    plt.ylabel('Loss')
-    plt.grid(True)
-    plt.savefig('self_training_loss.png')
-    print("\nSelf-training loss plot saved as 'self_training_loss.png'")
-    
-    # Test reconstruction
-    print("\nTesting reconstruction...")
-    rec_vectors = ndd_self.reconstruct(L=100, tau=0.2)
-    print(f"Reconstructed vector sequence shape: {rec_vectors.shape}")
-    print(f"Mean: {np.mean(rec_vectors):.4f}, Std: {np.std(rec_vectors):.4f}")
+    exact = 0
+    for seq, true_labels in zip(label_seqs, labels):
+        pred_binary, _ = dd_lbl.predict_l(seq, threshold=0.5)
+        if np.all(pred_binary == np.array(true_labels)):
+            exact += 1
+    print(f"Sequence-level exact-match accuracy: "
+          f"{exact / len(label_seqs):.4f} ({exact}/{len(label_seqs)})")
+
+    print("\n--- a couple of example predictions ---")
+    for i in range(3):
+        pred_bin, pred_probs = dd_lbl.predict_l(label_seqs[i], threshold=0.5)
+        print(f"Seq {i+1}: true={labels[i]}  pred={pred_bin.tolist()}  "
+              f"probs={[f'{p:.3f}' for p in pred_probs]}")
+
+    print("\n--- l_generate (target multi-label vector is required) ---")
+    for target_l in ([1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]):
+        seq_l = dd_lbl.l_generate(L=60, l=target_l, tau=0.0)
+        pred_bin, pred_probs = dd_lbl.predict_l(seq_l, threshold=0.5)
+        print(f"Target l={target_l} (tau=0):   {show(seq_l)}")
+        print(f"  -> predicted labels: {pred_bin.tolist()}  "
+              f"probs={[f'{p:.4f}' for p in pred_probs]}")
+        seq_l_rand = dd_lbl.l_generate(L=60, l=target_l, tau=0.5)
+        pred_bin_r, _ = dd_lbl.predict_l(seq_l_rand, threshold=0.5)
+        print(f"Target l={target_l} (tau=0.5): {show(seq_l_rand)}")
+        print(f"  -> predicted labels: {pred_bin_r.tolist()}")
+
+    # =====================================================================
+    # (5) Self-training + generate
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(5) Self-Training + generate")
+    print("=" * 60)
+
+    dd_self = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                  mode='nonlinear',
+                                  user_step=user_step, device=device)
+
+    self_seqs = make_latent_seqs(20, seed=5)
+
+    print("\n" + "-" * 60)
+    print("Self-training for self-consistency")
+    print("-" * 60)
+    dd_self.self_train(self_seqs, max_iters=MAX_ITERS, tol=1e-10,
+                       learning_rate=0.02, decay_rate=0.999,
+                       batch_size=16, print_every=20)
+
+    print("\n--- generate ---")
+    for i in range(2):
+        gen_seq = dd_self.generate(L=60, tau=0.2)
+        print(f"Sequence {i+1} (tau=0.2): ", show(gen_seq))
+
+    # =====================================================================
+    # (6) reg_train with a target dimension different from m + r_generate
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(6) reg_train + r_generate with a different target dimension")
+    print("=" * 60)
+
+    seqs_diff = make_latent_seqs(100, seed=3)
+    target_dim_diff = 5
+    W_diff = np.random.RandomState(21).randn(target_dim_diff, vec_dim).astype(np.float32) * 0.5
+    t_list_diff = [(W_diff @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_diff]
+
+    print(f"Model dimension m = {vec_dim}, target dimension = {target_dim_diff}")
+    dd_reg_diff = NumDualDescriptorPM(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                      mode='nonlinear',
+                                      user_step=user_step, device=device)
+
+    print("\n" + "-" * 60)
+    print("Training regression (target_dim different from m)")
+    print("-" * 60)
+    dd_reg_diff.reg_train(seqs_diff, t_list_diff, target_dim=target_dim_diff,
+                          max_iters=MAX_ITERS, tol=1e-12,
+                          learning_rate=0.02, decay_rate=0.999,
+                          batch_size=BATCH_SIZE, print_every=20)
+
+    pred_diff = np.array([dd_reg_diff.predict_r(seq) for seq in seqs_diff])
+    true_diff = np.array(t_list_diff)
+    corrs = [corr(true_diff[:, i], pred_diff[:, i]) for i in range(target_dim_diff)]
+    print(f"\nAverage correlation (target_dim={target_dim_diff}): "
+          f"{np.mean(corrs):.4f} (min {np.min(corrs):.4f}, max {np.max(corrs):.4f})")
+
+    print("\n--- r_generate with a target_dim_diff-dimensional r ---")
+    my_r_diff = np.random.uniform(-1.0, 1.0, target_dim_diff).astype(np.float32)
+    seq_r_diff = dd_reg_diff.r_generate(L=60, r=my_r_diff, tau=0.0)
+    print("Deterministic (tau=0):   ", show(seq_r_diff))
+    print(f"Verification: predicted r vs target -> "
+          f"r-pred={np.round(dd_reg_diff.predict_r(seq_r_diff), 3)}, "
+          f"r-target={np.round(my_r_diff, 3)}")
 
     print("\nAll tests completed successfully!")
-    print("="*50)

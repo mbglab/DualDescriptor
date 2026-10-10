@@ -1,5 +1,5 @@
 # Copyright (C) 2005-2026, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
-# The Numerical Dual Descriptor Vector class (Random AB matrix form) implemented with PyTorch
+# The Numerical Dual Descriptor Vector class (PB Matrix form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
 # Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2026-10-9
 #
@@ -15,9 +15,9 @@
 #   * l_generate(L, l, tau)    : after lbl_train   – target multi-label vector l (required)
 #
 # Generation of a vector sequence means producing L vectors of dimension vec_dim. It is
-# performed by directly optimizing the full output sequence so that the sequence-level
-# prediction (mean N(k) passed through the appropriate head, if any) matches the target.
-# This guarantees that generation and prediction are fully consistent.
+# performed by gradient-optimizing the window tensors so that N(k) matches the target at
+# each window position, then stitching the (possibly overlapping) windows by averaging
+# the contributions of all windows that cover a given position.
 
 import math
 import random
@@ -29,57 +29,52 @@ import numpy as np
 import copy
 
 
-class NumDualDescriptorRN(nn.Module):
+class NumDualDescriptorPB(nn.Module):
     """
-    Numerical (vector-sequence) Dual Descriptor (Random AB matrix form) with GPU
-    acceleration:
+    Numerical (vector-sequence) Dual Descriptor (PB Matrix form) with GPU acceleration:
       - input is a sequence of real m-dimensional vectors instead of characters
-      - learnable coefficient matrix Acoeff in R^{m x L}
-      - learnable, randomly initialized basis matrix Bbasis in R^{L x m};
-        unlike the AB form, no deterministic closed-form basis is imposed, so the
-        basis itself is free to adapt to the data during training
+      - the position-weight matrix is factorized as the product of a coefficient
+        matrix P and a basis matrix B, both m×m and independent of position k
       - a trainable square linear map M ∈ R^{m×m} replaces the token embedding;
         it is applied to each extracted window vector before the basis expansion
-      - indexed basis: j = k mod L
-      - N(k)_i = Acoeff[i, j] * sum_l Bbasis[j, l] * x_l, with x = M(window vector)
+      - N(k) becomes position-independent, i.e., N(k) = N for every window
       - supports 'linear' or 'nonlinear' (step-by-rank) window extraction
       - rank_op reduces each rank-length window of vectors into a single vector:
         'avg', 'sum', 'max', or a user-supplied callable
       - two interchangeable regression schemes, multi-class classification, and
-        multi-label classification, in one-to-one correspondence with DDvAB.py
+        multi-label classification, in one-to-one correspondence with DDvTS.py
     """
 
     # Maximum number of windows handled by a single chunk of batch_compute_Nk.
-    # The intermediate A_columns / B_rows tensors have shape [windows, m]; chunking
-    # keeps their memory bounded independently of the training batch size.
+    # The intermediate tensor has shape [windows, m, m]; chunking keeps its memory
+    # bounded independently of the training batch size.
     NK_CHUNK = 16384
 
-    def __init__(self, vec_dim, bas_dim=50, rank=1, rank_op='avg', rank_mode='drop',
-                 mode='linear', user_step=None, device='cuda'):
+    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop',
+                 mode='linear', user_step=None, device='cuda', trainable_B=True):
         """
-        Initialize the Numerical Dual Descriptor model (Random AB Matrix form).
+        Initialize the Numerical Dual Descriptor model (PB Matrix form).
 
         Args:
             vec_dim (int): Dimension of input vectors and internal representation (m)
-            bas_dim (int): Basis dimension L of the coefficient matrix Acoeff and of
-                the random basis matrix Bbasis
             rank (int): Length of the vector window (r-per / k-mer length)
             rank_op (str): 'avg', 'sum', 'max', or 'user_func' – how to reduce a window
             rank_mode (str): 'pad' or 'drop' – how to handle incomplete fragments
             mode (str): 'linear' or 'nonlinear' – window extraction mode
             user_step (int, optional): Step size for nonlinear extraction
             device (str): 'cuda' or 'cpu'
+            trainable_B (bool): whether the basis matrix B is trainable
         """
         super().__init__()
         self.vec_dim = vec_dim
-        self.m = vec_dim
-        self.L = bas_dim
         self.rank = rank
         self.rank_op = rank_op
         self.rank_mode = rank_mode
+        self.m = vec_dim
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
         self.step = user_step
+        self.trainable_B = trainable_B
 
         # User function for the 'user_func' rank operation (set via set_user_func)
         self.user_func = None
@@ -95,13 +90,11 @@ class NumDualDescriptorRN(nn.Module):
         # This replaces the character-based token embedding.
         self.M = nn.Linear(self.vec_dim, self.m, bias=False)
 
-        # Learnable coefficient matrix Acoeff[i][j]
-        self.Acoeff = nn.Parameter(torch.empty(self.m, self.L))
+        # Coefficient matrix P (always trainable)
+        self.P = nn.Parameter(torch.empty(self.m, self.m))
 
-        # Learnable, randomly initialized basis matrix Bbasis[j][i].
-        # This is the key difference with respect to the AB form: the basis is a free
-        # parameter that is fitted by gradient descent, not a deterministic cosine table.
-        self.Bbasis = nn.Parameter(torch.empty(self.L, self.m))
+        # Basis matrix B (trainable only if trainable_B is True)
+        self.B = nn.Parameter(torch.empty(self.m, self.m), requires_grad=trainable_B)
 
         # Lazily created prediction heads
         self.num_classes = None
@@ -155,10 +148,8 @@ class NumDualDescriptorRN(nn.Module):
     def reset_parameters(self):
         """Initialize model parameters with appropriate distributions."""
         nn.init.uniform_(self.M.weight, -0.5, 0.5)
-        nn.init.uniform_(self.Acoeff, -0.1, 0.1)
-        # Random initialization of the (trainable) basis matrix: small values around
-        # zero, so that N(k) starts near the origin and training is well conditioned.
-        nn.init.normal_(self.Bbasis, mean=0.0, std=0.1)
+        nn.init.uniform_(self.P, -0.1, 0.1)
+        nn.init.uniform_(self.B, -0.1, 0.1)
         if self.classifier is not None:
             nn.init.normal_(self.classifier.weight, 0, 0.01)
             if self.classifier.bias is not None:
@@ -256,12 +247,14 @@ class NumDualDescriptorRN(nn.Module):
         Vectorized computation of N(k) vectors for a batch of window positions and
         window representations.
 
-        Batches larger than NK_CHUNK are split into chunks: the intermediate tensors
-        have shape [windows, m], so chunking bounds their memory without touching the
-        reduction, i.e. without changing the result.
+        Since N(k) is position-independent in the PB form, the k_tensor argument is
+        accepted for interface compatibility but is not used in the computation.
+        Batches larger than NK_CHUNK are split into chunks: the intermediate tensor
+        has shape [windows, m, m], so chunking bounds its memory without changing
+        the result.
 
         Args:
-            k_tensor (Tensor): Position indices [batch_size]
+            k_tensor (Tensor): Position indices [batch_size] (ignored)
             vectors (Tensor): Window representations [batch_size, vec_dim]
 
         Returns:
@@ -275,23 +268,10 @@ class NumDualDescriptorRN(nn.Module):
                           for i in range(0, n, self.NK_CHUNK)], dim=0)
 
     def _compute_Nk_chunk(self, k_tensor, vectors):
-        """
-        Compute N(k) for one chunk of windows (see batch_compute_Nk).
-
-        The RN-form N(k) is
-            x      = M(v)                (transformed window vector)
-            j      = k mod L
-            scalar = Bbasis[j] . x
-            N(k)   = scalar * Acoeff[:, j]
-        All three steps are vectorized over the chunk. Bbasis is a trainable parameter,
-        so gradients flow into both Acoeff and the random basis.
-        """
+        """Compute N(k) for one chunk of windows (see batch_compute_Nk)."""
         x = self.M(vectors)                            # [chunk, m]
-        j = (k_tensor.long() % self.L)                 # [chunk]
-        B_rows = self.Bbasis[j]                        # [chunk, m]
-        scalar = torch.sum(B_rows * x, dim=1)          # [chunk]
-        A_cols = self.Acoeff[:, j].t()                 # [chunk, m]
-        return A_cols * scalar.unsqueeze(1)            # [chunk, m]
+        # N[b,i] = sum_j x[b,j] * P[i,j] * B[i,j]
+        return torch.einsum('bj,ij,ij->bi', x, self.P, self.B)
 
     def compute_Nk(self, k, vector):
         """Compute N(k) for a single position and a single window vector."""
@@ -721,7 +701,7 @@ class NumDualDescriptorRN(nn.Module):
         """
         Predict target vector for a vector sequence as the mean of N(k) over all its
         windows. This is the m-dimensional model output produced directly by the learned
-        M map and the random AB matrices, with no regression head involved; paired with
+        M map and P/B matrices, with no regression head involved; paired with
         grad_train / t_generate. If the sequence yields no window, a zero vector of
         length m is returned.
         """
@@ -815,37 +795,43 @@ class NumDualDescriptorRN(nn.Module):
             return L - self.rank + 1
         return (L - self.rank) // step + 1
 
-    def _sequence_representation(self, seq_vectors):
+    def _Nk_from_windows(self, k_tensor, windows):
         """
-        Return the mean N(k) over all windows of a vector sequence. This is the
-        sequence-level representation used by all predict_* methods and therefore by
-        all generation methods, which guarantees that generation and prediction are
-        fully consistent.
-        """
-        ex = self.extract_vectors(seq_vectors)
-        if ex.shape[0] == 0:
-            return None
-        k_positions = torch.arange(ex.shape[0], dtype=torch.float32, device=self.device)
-        Nk_batch = self.batch_compute_Nk(k_positions, ex)
-        return Nk_batch.mean(dim=0)
+        Apply rank_op to raw window tensors and evaluate N(k) for each window.
 
-    def _generate_windows(self, L, loss_fn, tau=0.0, num_steps=300, opt_lr=0.05):
+        Args:
+            k_tensor (Tensor): [T] position indices
+            windows (Tensor): [T, rank, vec_dim] raw window tensors
+
+        Returns:
+            N(k) tensor of shape [T, m]
+        """
+        applied = self._apply_op(windows)
+        return self.batch_compute_Nk(k_tensor, applied)
+
+    def _Nk_scorer(self, k_tensor, windows, target_tensor):
+        """Negative squared error between N(k) of each window and a fixed target vector."""
+        Nk = self._Nk_from_windows(k_tensor, windows)
+        return -torch.sum((Nk - target_tensor) ** 2, dim=1)
+
+    def _generate_windows(self, L, scorer, tau=0.0, num_steps=300, opt_lr=0.05):
         """
         Shared generation engine used by all *_generate methods.
 
-        The length-L output vector sequence is produced by directly optimizing the full
-        sequence tensor (shape [L, vec_dim]) so that the sequence-level loss returned by
-        ``loss_fn(out)`` is minimized. The loss is computed by extracting windows from the
-        sequence, evaluating N(k), and passing the mean N(k) through the appropriate head
-        (if any), exactly as the corresponding predict_* method does. This guarantees that
-        generation and prediction are fully consistent.
+        The length-L output vector sequence is produced by gradient-optimizing the
+        T window tensors (shape [T, rank, vec_dim]) so that the score returned by
+        ``scorer(k_tensor, windows)`` is maximized at each window position. The
+        optimized windows are then stitched into a full [L, vec_dim] sequence: each
+        window contributes its rank vectors to positions k*step .. k*step+rank-1,
+        and overlapping positions are averaged across all covering windows.
 
         Stochastic sampling is achieved by adding Gaussian noise scaled by tau to the
-        optimized sequence, so tau=0 is deterministic and tau>0 yields random variants.
+        optimized windows, so tau=0 is deterministic and tau>0 yields random variants.
 
         Args:
             L (int): desired sequence length (number of output vectors).
-            loss_fn (callable): loss_fn(out) -> scalar tensor; lower is better.
+            scorer (callable): scorer(k_tensor, windows) -> 1-D tensor of scores,
+                one per window; higher is better.
             tau (float): temperature for stochastic sampling; tau=0 is deterministic.
             num_steps (int): number of gradient steps per generation.
             opt_lr (float): learning rate of the Adam optimizer used for generation.
@@ -865,43 +851,56 @@ class NumDualDescriptorRN(nn.Module):
         if T <= 0:
             return (0.1 * np.random.randn(L, self.vec_dim)).astype(np.float32)
 
-        init = torch.randn(L, self.vec_dim, device=self.device) * 0.1
-        out = nn.Parameter(init)
-        opt = torch.optim.Adam([out], lr=opt_lr)
+        init = torch.randn(T, self.rank, self.vec_dim, device=self.device) * 0.1
+        v = nn.Parameter(init)
+        opt = torch.optim.Adam([v], lr=opt_lr)
+        k_tensor = torch.arange(T, dtype=torch.float32, device=self.device)
 
         for _ in range(num_steps):
             opt.zero_grad()
-            loss = loss_fn(out)
+            scores = scorer(k_tensor, v)
+            loss = -scores.mean()
             loss.backward()
             opt.step()
 
         with torch.no_grad():
-            out_final = out.detach()
+            v_final = v.detach()
             if tau > 0:
-                out_final = out_final + tau * torch.randn_like(out_final)
+                v_final = v_final + tau * torch.randn_like(v_final)
 
-        return out_final.cpu().numpy()
+            positions = (torch.arange(T, device=self.device).unsqueeze(1) * step
+                         + torch.arange(self.rank, device=self.device).unsqueeze(0))
+            mask = positions < L
+            flat_positions = positions[mask]
+            flat_v = v_final[mask]
+
+            out = torch.zeros(L, self.vec_dim, device=self.device)
+            cnt = torch.zeros(L, 1, device=self.device)
+            out.index_add_(0, flat_positions, flat_v)
+            cnt.index_add_(0, flat_positions,
+                           torch.ones(flat_positions.shape[0], 1, device=self.device))
+            out = out / cnt.clamp(min=1)
+
+        return out.cpu().numpy()
 
     def generate(self, L, tau=0.0):
         """
         Generate a length-L vector sequence after self_train.
-        The global training mean_t is used as the reconstruction target for the
-        sequence-level mean N(k). rank_mode must not be 'pad'.
+        The global training mean_t is used as the reconstruction target for every window
+        position. rank_mode must not be 'pad'.
         """
         assert self.trained, "Model must be trained first"
         target_tensor = torch.tensor(self.mean_t, dtype=torch.float32, device=self.device)
 
-        def loss_fn(out):
-            seq_rep = self._sequence_representation(out)
-            return torch.sum((seq_rep - target_tensor) ** 2)
+        def scorer(k_tensor, windows):
+            return self._Nk_scorer(k_tensor, windows, target_tensor)
 
-        return self._generate_windows(L, loss_fn, tau=tau)
+        return self._generate_windows(L, scorer, tau=tau)
 
     def t_generate(self, L, tau=0.0, t=None):
         """
         Generate a length-L vector sequence after grad_train by matching the target
-        vector t at the sequence level (mean N(k)). If t is None, the global mean_t is
-        used (equivalent to generate).
+        vector t. If t is None, the global mean_t is used (equivalent to generate).
         """
         assert self.trained, "Model must be trained first"
         if t is None:
@@ -912,17 +911,15 @@ class NumDualDescriptorRN(nn.Module):
             raise ValueError(f"Target vector must have {self.m} elements, got {target.size}")
         target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
 
-        def loss_fn(out):
-            seq_rep = self._sequence_representation(out)
-            return torch.sum((seq_rep - target_tensor) ** 2)
+        def scorer(k_tensor, windows):
+            return self._Nk_scorer(k_tensor, windows, target_tensor)
 
-        return self._generate_windows(L, loss_fn, tau=tau)
+        return self._generate_windows(L, scorer, tau=tau)
 
     def r_generate(self, L, r, tau=0.0):
         """
         Generate a length-L vector sequence after reg_train by matching the target
-        vector r through the regression head at the sequence level. r must have length
-        self.target_dim.
+        vector r through the regression head. r must have length self.target_dim.
         """
         assert self.trained, "Model must be trained first"
         if self.regresser is None:
@@ -933,39 +930,34 @@ class NumDualDescriptorRN(nn.Module):
                 f"Target r must have {self.target_dim} elements, got {target.size}")
         target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
 
-        def loss_fn(out):
-            seq_rep = self._sequence_representation(out)
-            pred = self.regresser(seq_rep.unsqueeze(0)).squeeze(0)
-            return torch.sum((pred - target_tensor) ** 2)
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            preds = self.regresser(Nk)
+            return -torch.sum((preds - target_tensor) ** 2, dim=1)
 
-        return self._generate_windows(L, loss_fn, tau=tau)
+        return self._generate_windows(L, scorer, tau=tau)
 
     def c_generate(self, L, c, tau=0.0):
         """
         Generate a length-L vector sequence after cls_train for a given class c.
-        The sequence-level classifier logits are optimized so that class c is the
-        most probable one.
         """
         assert self.trained, "Model must be trained first"
         if self.classifier is None:
             raise ValueError("No classifier found; train with cls_train first")
         if not (0 <= c < self.num_classes):
             raise ValueError(f"Class c must be in [0, {self.num_classes}), got {c}")
-        criterion = nn.CrossEntropyLoss()
-        target = torch.tensor([c], dtype=torch.long, device=self.device)
 
-        def loss_fn(out):
-            seq_rep = self._sequence_representation(out)
-            logits = self.classifier(seq_rep.unsqueeze(0))
-            return criterion(logits, target)
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            logits = self.classifier(Nk)
+            return logits[:, c]
 
-        return self._generate_windows(L, loss_fn, tau=tau)
+        return self._generate_windows(L, scorer, tau=tau)
 
     def l_generate(self, L, l, tau=0.0):
         """
         Generate a length-L vector sequence after lbl_train for a target multi-label
-        vector l. The sequence-level label probabilities are optimized to match l.
-        l must have length self.num_labels.
+        vector l. l must have length self.num_labels.
         """
         assert self.trained, "Model must be trained first"
         if self.labeller is None:
@@ -975,14 +967,13 @@ class NumDualDescriptorRN(nn.Module):
             raise ValueError(
                 f"Target l must have {self.num_labels} elements, got {target.size}")
         target_tensor = torch.tensor(target, dtype=torch.float32, device=self.device)
-        criterion = nn.BCEWithLogitsLoss()
 
-        def loss_fn(out):
-            seq_rep = self._sequence_representation(out)
-            logits = self.labeller(seq_rep.unsqueeze(0))
-            return criterion(logits, target_tensor.unsqueeze(0))
+        def scorer(k_tensor, windows):
+            Nk = self._Nk_from_windows(k_tensor, windows)
+            probs = torch.sigmoid(self.labeller(Nk))
+            return -torch.sum((probs - target_tensor) ** 2, dim=1)
 
-        return self._generate_windows(L, loss_fn, tau=tau)
+        return self._generate_windows(L, scorer, tau=tau)
 
     # ---------- persistence ----------
     def save(self, filename):
@@ -1031,7 +1022,6 @@ if __name__ == "__main__":
 
     # ----- global settings -----
     vec_dim = 15
-    bas_dim = 50
     rank = 3
     user_step = 2
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1042,12 +1032,11 @@ if __name__ == "__main__":
     MAX_ITERS = 100
 
     print("=" * 60)
-    print("Numerical Dual Descriptor RN - PyTorch GPU Accelerated Version")
+    print("Numerical Dual Descriptor PB - PyTorch GPU Accelerated Version")
     print("=" * 60)
     print(f"Device: {device}")
-    print(f"vec_dim = {vec_dim}, bas_dim = {bas_dim}, rank = {rank}, "
+    print(f"vec_dim = {vec_dim}, rank = {rank}, "
           f"step = {user_step}, mode = nonlinear, rank_op = avg")
-    print("Bbasis is randomly initialized and trainable (RN form)")
     print(f"Shared training settings: batch_size = {BATCH_SIZE}, max_iters = {MAX_ITERS}")
     print()
     print("Synthetic data carries real signal:")
@@ -1101,9 +1090,9 @@ if __name__ == "__main__":
     # and is a fully learnable signal.
     t_list_grad = [s.mean(axis=0).astype(np.float32).tolist() for s in seqs_grad]
 
-    dd_grad = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                  rank_mode='drop', mode='nonlinear',
-                                  user_step=user_step, device=device)
+    dd_grad = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                  mode='nonlinear',
+                                  user_step=user_step, device=device, trainable_B=True)
 
     print("\n" + "-" * 60)
     print("Starting Gradient Descent Training (grad_train, no head)")
@@ -1145,9 +1134,9 @@ if __name__ == "__main__":
     W_reg = np.random.RandomState(99).randn(target_dim_reg, vec_dim).astype(np.float32) * 0.5
     t_list_reg = [(W_reg @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_reg]
 
-    dd = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                             rank_mode='drop', mode='nonlinear',
-                             user_step=user_step, device=device)
+    dd = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                             mode='nonlinear',
+                             user_step=user_step, device=device, trainable_B=True)
 
     print("\n" + "-" * 60)
     print(f"Starting reg_train (target_dim = {target_dim_reg})")
@@ -1194,9 +1183,9 @@ if __name__ == "__main__":
             class_seqs.append(seq.astype(np.float32))
             class_labels.append(class_id)
 
-    dd_cls = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                 rank_mode='drop', mode='nonlinear',
-                                 user_step=user_step, device=device)
+    dd_cls = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                 mode='nonlinear',
+                                 user_step=user_step, device=device, trainable_B=True)
 
     print("\n" + "-" * 60)
     print("Starting Classification Training")
@@ -1247,9 +1236,9 @@ if __name__ == "__main__":
         label_seqs.append(seq.astype(np.float32))
         labels.append(label_vec)
 
-    dd_lbl = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                 rank_mode='drop', mode='nonlinear',
-                                 user_step=user_step, device=device)
+    dd_lbl = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                 mode='nonlinear',
+                                 user_step=user_step, device=device, trainable_B=True)
 
     print("\n" + "-" * 60)
     print("Starting Multi-Label Training (lbl_train)")
@@ -1296,9 +1285,9 @@ if __name__ == "__main__":
     print("(5) Self-Training + generate")
     print("=" * 60)
 
-    dd_self = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                  rank_mode='drop', mode='nonlinear',
-                                  user_step=user_step, device=device)
+    dd_self = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                  mode='nonlinear',
+                                  user_step=user_step, device=device, trainable_B=True)
 
     self_seqs = make_latent_seqs(20, seed=5)
 
@@ -1316,9 +1305,11 @@ if __name__ == "__main__":
 
     # =====================================================================
     # (6) reg_train with a target dimension different from m + r_generate
+    #     and comparison between trainable_B=True and trainable_B=False
     # =====================================================================
     print("\n" + "=" * 60)
     print("(6) reg_train + r_generate with a different target dimension")
+    print("    (comparing trainable_B=True vs trainable_B=False)")
     print("=" * 60)
 
     seqs_diff = make_latent_seqs(100, seed=3)
@@ -1327,60 +1318,53 @@ if __name__ == "__main__":
     t_list_diff = [(W_diff @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_diff]
 
     print(f"Model dimension m = {vec_dim}, target dimension = {target_dim_diff}")
-    dd_reg_diff = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                      rank_mode='drop', mode='nonlinear',
-                                      user_step=user_step, device=device)
 
+    # --- trainable_B = True ---
     print("\n" + "-" * 60)
-    print("Training regression (target_dim different from m)")
+    print("Training regression with trainable_B = True")
     print("-" * 60)
-    dd_reg_diff.reg_train(seqs_diff, t_list_diff, target_dim=target_dim_diff,
-                          max_iters=MAX_ITERS, tol=1e-12,
-                          learning_rate=0.02, decay_rate=0.999,
-                          batch_size=BATCH_SIZE, print_every=20)
-
-    pred_diff = np.array([dd_reg_diff.predict_r(seq) for seq in seqs_diff])
+    dd_reg_trainable = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                           mode='nonlinear', user_step=user_step,
+                                           device=device, trainable_B=True)
+    dd_reg_trainable.reg_train(seqs_diff, t_list_diff, target_dim=target_dim_diff,
+                               max_iters=MAX_ITERS, tol=1e-12,
+                               learning_rate=0.02, decay_rate=0.999,
+                               batch_size=BATCH_SIZE, print_every=20)
+    pred_trainable = np.array([dd_reg_trainable.predict_r(seq) for seq in seqs_diff])
     true_diff = np.array(t_list_diff)
-    corrs = [corr(true_diff[:, i], pred_diff[:, i]) for i in range(target_dim_diff)]
-    print(f"\nAverage correlation (target_dim={target_dim_diff}): "
-          f"{np.mean(corrs):.4f} (min {np.min(corrs):.4f}, max {np.max(corrs):.4f})")
+    corrs_trainable = [corr(true_diff[:, i], pred_trainable[:, i]) for i in range(target_dim_diff)]
+    print(f"Average correlation (trainable_B=True): "
+          f"{np.mean(corrs_trainable):.4f} "
+          f"(min {np.min(corrs_trainable):.4f}, max {np.max(corrs_trainable):.4f})")
 
-    print("\n--- r_generate with a target_dim_diff-dimensional r ---")
+    # --- trainable_B = False ---
+    print("\n" + "-" * 60)
+    print("Training regression with trainable_B = False")
+    print("-" * 60)
+    dd_reg_frozen = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                        mode='nonlinear', user_step=user_step,
+                                        device=device, trainable_B=False)
+    dd_reg_frozen.reg_train(seqs_diff, t_list_diff, target_dim=target_dim_diff,
+                            max_iters=MAX_ITERS, tol=1e-12,
+                            learning_rate=0.02, decay_rate=0.999,
+                            batch_size=BATCH_SIZE, print_every=20)
+    pred_frozen = np.array([dd_reg_frozen.predict_r(seq) for seq in seqs_diff])
+    corrs_frozen = [corr(true_diff[:, i], pred_frozen[:, i]) for i in range(target_dim_diff)]
+    print(f"Average correlation (trainable_B=False): "
+          f"{np.mean(corrs_frozen):.4f} "
+          f"(min {np.min(corrs_frozen):.4f}, max {np.max(corrs_frozen):.4f})")
+
+    # --- r_generate comparison ---
+    print("\n--- r_generate comparison (target_dim_diff-dimensional r) ---")
     my_r_diff = np.random.uniform(-1.0, 1.0, target_dim_diff).astype(np.float32)
-    seq_r_diff = dd_reg_diff.r_generate(L=60, r=my_r_diff, tau=0.0)
-    print("Deterministic (tau=0):   ", show(seq_r_diff))
-    print(f"Verification: predicted r vs target -> "
-          f"r-pred={np.round(dd_reg_diff.predict_r(seq_r_diff), 3)}, "
-          f"r-target={np.round(my_r_diff, 3)}")
+    print(f"Target r = {np.round(my_r_diff, 3)}")
 
-    # =====================================================================
-    # (7) Inspect the trained random basis Bbasis
-    # =====================================================================
-    print("\n" + "=" * 60)
-    print("(7) Inspection: trained random Bbasis vs its initial values")
-    print("=" * 60)
+    seq_r_trainable = dd_reg_trainable.r_generate(L=60, r=my_r_diff, tau=0.0)
+    print(f"\ntrainable_B=True  (tau=0): {show(seq_r_trainable)}")
+    print(f"  Verification: r-pred = {np.round(dd_reg_trainable.predict_r(seq_r_trainable), 3)}")
 
-    # Rebuild a fresh RN model with the same seed and compare Bbasis before/after
-    # training on the regression data, to show the random basis has been reshaped.
-    torch.manual_seed(11)
-    dd_probe = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                   rank_mode='drop', mode='nonlinear',
-                                   user_step=user_step, device=device)
-    B_init = dd_probe.Bbasis.detach().clone().cpu().numpy()
-
-    seqs_probe = make_latent_seqs(50, seed=4)
-    t_list_probe = [s.mean(axis=0).astype(np.float32).tolist() for s in seqs_probe]
-    dd_probe.grad_train(seqs_probe, t_list_probe, max_iters=30, tol=1e-12,
-                        learning_rate=0.02, decay_rate=0.999,
-                        batch_size=BATCH_SIZE, print_every=10)
-    B_trained = dd_probe.Bbasis.detach().cpu().numpy()
-
-    delta = B_trained - B_init
-    print(f"Bbasis shape:              {B_trained.shape}")
-    print(f"Initial  Bbasis: mean={B_init.mean():+.4f}, std={B_init.std():.4f}")
-    print(f"Trained  Bbasis: mean={B_trained.mean():+.4f}, std={B_trained.std():.4f}")
-    print(f"Change (trained-initial): mean={delta.mean():+.4f}, "
-          f"std={delta.std():.4f}, ||delta||_F={np.linalg.norm(delta):.4f}")
-    print("Bbasis is a trainable parameter and has been updated during training.")
+    seq_r_frozen = dd_reg_frozen.r_generate(L=60, r=my_r_diff, tau=0.0)
+    print(f"\ntrainable_B=False (tau=0): {show(seq_r_frozen)}")
+    print(f"  Verification: r-pred = {np.round(dd_reg_frozen.predict_r(seq_r_frozen), 3)}")
 
     print("\nAll tests completed successfully!")

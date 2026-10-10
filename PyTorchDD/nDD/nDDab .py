@@ -1,5 +1,5 @@
 # Copyright (C) 2005-2026, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
-# The Numerical Dual Descriptor Vector class (Random AB matrix form) implemented with PyTorch
+# The Numerical Dual Descriptor Vector class (AB matrix form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
 # Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2026-10-9
 #
@@ -29,15 +29,12 @@ import numpy as np
 import copy
 
 
-class NumDualDescriptorRN(nn.Module):
+class NumDualDescriptorAB(nn.Module):
     """
-    Numerical (vector-sequence) Dual Descriptor (Random AB matrix form) with GPU
-    acceleration:
+    Numerical (vector-sequence) Dual Descriptor (AB matrix form) with GPU acceleration:
       - input is a sequence of real m-dimensional vectors instead of characters
       - learnable coefficient matrix Acoeff in R^{m x L}
-      - learnable, randomly initialized basis matrix Bbasis in R^{L x m};
-        unlike the AB form, no deterministic closed-form basis is imposed, so the
-        basis itself is free to adapt to the data during training
+      - fixed basis matrix Bbasis in R^{L x m}, Bbasis[j][i] = cos(2*pi*(j+1)/(i+2))
       - a trainable square linear map M ∈ R^{m×m} replaces the token embedding;
         it is applied to each extracted window vector before the basis expansion
       - indexed basis: j = k mod L
@@ -57,12 +54,11 @@ class NumDualDescriptorRN(nn.Module):
     def __init__(self, vec_dim, bas_dim=50, rank=1, rank_op='avg', rank_mode='drop',
                  mode='linear', user_step=None, device='cuda'):
         """
-        Initialize the Numerical Dual Descriptor model (Random AB Matrix form).
+        Initialize the Numerical Dual Descriptor model (AB Matrix form).
 
         Args:
             vec_dim (int): Dimension of input vectors and internal representation (m)
-            bas_dim (int): Basis dimension L of the coefficient matrix Acoeff and of
-                the random basis matrix Bbasis
+            bas_dim (int): Basis dimension L of the coefficient matrix Acoeff
             rank (int): Length of the vector window (r-per / k-mer length)
             rank_op (str): 'avg', 'sum', 'max', or 'user_func' – how to reduce a window
             rank_mode (str): 'pad' or 'drop' – how to handle incomplete fragments
@@ -98,10 +94,13 @@ class NumDualDescriptorRN(nn.Module):
         # Learnable coefficient matrix Acoeff[i][j]
         self.Acoeff = nn.Parameter(torch.empty(self.m, self.L))
 
-        # Learnable, randomly initialized basis matrix Bbasis[j][i].
-        # This is the key difference with respect to the AB form: the basis is a free
-        # parameter that is fitted by gradient descent, not a deterministic cosine table.
-        self.Bbasis = nn.Parameter(torch.empty(self.L, self.m))
+        # Fixed basis matrix Bbasis[j][i] = cos(2*pi*(j+1)/(i+2)); a pure function of
+        # m and L, rebuilt in the constructor and never saved as part of state_dict.
+        Bbasis = torch.empty(self.L, self.m, dtype=torch.float32)
+        for j in range(self.L):
+            for i in range(self.m):
+                Bbasis[j, i] = math.cos(2 * math.pi * (j + 1) / (i + 2))
+        self.register_buffer('Bbasis', Bbasis, persistent=False)
 
         # Lazily created prediction heads
         self.num_classes = None
@@ -156,9 +155,6 @@ class NumDualDescriptorRN(nn.Module):
         """Initialize model parameters with appropriate distributions."""
         nn.init.uniform_(self.M.weight, -0.5, 0.5)
         nn.init.uniform_(self.Acoeff, -0.1, 0.1)
-        # Random initialization of the (trainable) basis matrix: small values around
-        # zero, so that N(k) starts near the origin and training is well conditioned.
-        nn.init.normal_(self.Bbasis, mean=0.0, std=0.1)
         if self.classifier is not None:
             nn.init.normal_(self.classifier.weight, 0, 0.01)
             if self.classifier.bias is not None:
@@ -278,13 +274,12 @@ class NumDualDescriptorRN(nn.Module):
         """
         Compute N(k) for one chunk of windows (see batch_compute_Nk).
 
-        The RN-form N(k) is
+        The AB-form N(k) is
             x      = M(v)                (transformed window vector)
             j      = k mod L
             scalar = Bbasis[j] . x
             N(k)   = scalar * Acoeff[:, j]
-        All three steps are vectorized over the chunk. Bbasis is a trainable parameter,
-        so gradients flow into both Acoeff and the random basis.
+        All three steps are vectorized over the chunk.
         """
         x = self.M(vectors)                            # [chunk, m]
         j = (k_tensor.long() % self.L)                 # [chunk]
@@ -721,7 +716,7 @@ class NumDualDescriptorRN(nn.Module):
         """
         Predict target vector for a vector sequence as the mean of N(k) over all its
         windows. This is the m-dimensional model output produced directly by the learned
-        M map and the random AB matrices, with no regression head involved; paired with
+        M map and AB matrices, with no regression head involved; paired with
         grad_train / t_generate. If the sequence yields no window, a zero vector of
         length m is returned.
         """
@@ -819,8 +814,7 @@ class NumDualDescriptorRN(nn.Module):
         """
         Return the mean N(k) over all windows of a vector sequence. This is the
         sequence-level representation used by all predict_* methods and therefore by
-        all generation methods, which guarantees that generation and prediction are
-        fully consistent.
+        all generation methods to ensure consistency.
         """
         ex = self.extract_vectors(seq_vectors)
         if ex.shape[0] == 0:
@@ -1042,12 +1036,11 @@ if __name__ == "__main__":
     MAX_ITERS = 100
 
     print("=" * 60)
-    print("Numerical Dual Descriptor RN - PyTorch GPU Accelerated Version")
+    print("Numerical Dual Descriptor AB - PyTorch GPU Accelerated Version")
     print("=" * 60)
     print(f"Device: {device}")
     print(f"vec_dim = {vec_dim}, bas_dim = {bas_dim}, rank = {rank}, "
           f"step = {user_step}, mode = nonlinear, rank_op = avg")
-    print("Bbasis is randomly initialized and trainable (RN form)")
     print(f"Shared training settings: batch_size = {BATCH_SIZE}, max_iters = {MAX_ITERS}")
     print()
     print("Synthetic data carries real signal:")
@@ -1101,7 +1094,7 @@ if __name__ == "__main__":
     # and is a fully learnable signal.
     t_list_grad = [s.mean(axis=0).astype(np.float32).tolist() for s in seqs_grad]
 
-    dd_grad = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd_grad = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                                   rank_mode='drop', mode='nonlinear',
                                   user_step=user_step, device=device)
 
@@ -1145,7 +1138,7 @@ if __name__ == "__main__":
     W_reg = np.random.RandomState(99).randn(target_dim_reg, vec_dim).astype(np.float32) * 0.5
     t_list_reg = [(W_reg @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_reg]
 
-    dd = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                              rank_mode='drop', mode='nonlinear',
                              user_step=user_step, device=device)
 
@@ -1194,7 +1187,7 @@ if __name__ == "__main__":
             class_seqs.append(seq.astype(np.float32))
             class_labels.append(class_id)
 
-    dd_cls = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd_cls = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                                  rank_mode='drop', mode='nonlinear',
                                  user_step=user_step, device=device)
 
@@ -1247,7 +1240,7 @@ if __name__ == "__main__":
         label_seqs.append(seq.astype(np.float32))
         labels.append(label_vec)
 
-    dd_lbl = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd_lbl = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                                  rank_mode='drop', mode='nonlinear',
                                  user_step=user_step, device=device)
 
@@ -1296,7 +1289,7 @@ if __name__ == "__main__":
     print("(5) Self-Training + generate")
     print("=" * 60)
 
-    dd_self = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd_self = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                                   rank_mode='drop', mode='nonlinear',
                                   user_step=user_step, device=device)
 
@@ -1327,7 +1320,7 @@ if __name__ == "__main__":
     t_list_diff = [(W_diff @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_diff]
 
     print(f"Model dimension m = {vec_dim}, target dimension = {target_dim_diff}")
-    dd_reg_diff = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
+    dd_reg_diff = NumDualDescriptorAB(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
                                       rank_mode='drop', mode='nonlinear',
                                       user_step=user_step, device=device)
 
@@ -1352,35 +1345,5 @@ if __name__ == "__main__":
     print(f"Verification: predicted r vs target -> "
           f"r-pred={np.round(dd_reg_diff.predict_r(seq_r_diff), 3)}, "
           f"r-target={np.round(my_r_diff, 3)}")
-
-    # =====================================================================
-    # (7) Inspect the trained random basis Bbasis
-    # =====================================================================
-    print("\n" + "=" * 60)
-    print("(7) Inspection: trained random Bbasis vs its initial values")
-    print("=" * 60)
-
-    # Rebuild a fresh RN model with the same seed and compare Bbasis before/after
-    # training on the regression data, to show the random basis has been reshaped.
-    torch.manual_seed(11)
-    dd_probe = NumDualDescriptorRN(vec_dim, bas_dim=bas_dim, rank=rank, rank_op='avg',
-                                   rank_mode='drop', mode='nonlinear',
-                                   user_step=user_step, device=device)
-    B_init = dd_probe.Bbasis.detach().clone().cpu().numpy()
-
-    seqs_probe = make_latent_seqs(50, seed=4)
-    t_list_probe = [s.mean(axis=0).astype(np.float32).tolist() for s in seqs_probe]
-    dd_probe.grad_train(seqs_probe, t_list_probe, max_iters=30, tol=1e-12,
-                        learning_rate=0.02, decay_rate=0.999,
-                        batch_size=BATCH_SIZE, print_every=10)
-    B_trained = dd_probe.Bbasis.detach().cpu().numpy()
-
-    delta = B_trained - B_init
-    print(f"Bbasis shape:              {B_trained.shape}")
-    print(f"Initial  Bbasis: mean={B_init.mean():+.4f}, std={B_init.std():.4f}")
-    print(f"Trained  Bbasis: mean={B_trained.mean():+.4f}, std={B_trained.std():.4f}")
-    print(f"Change (trained-initial): mean={delta.mean():+.4f}, "
-          f"std={delta.std():.4f}, ||delta||_F={np.linalg.norm(delta):.4f}")
-    print("Bbasis is a trainable parameter and has been updated during training.")
 
     print("\nAll tests completed successfully!")
