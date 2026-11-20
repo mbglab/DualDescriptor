@@ -1,7 +1,7 @@
 # Copyright (C) 2005-2026, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
 # The Numerical Dual Descriptor Vector class (PB Matrix form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2026-10-9
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-8-28 ~ 2026-11-20
 #
 # Two interchangeable regression schemes are provided:
 #   (a) grad_train + predict_t / t_generate : the m-dimensional model output is fitted directly
@@ -34,7 +34,7 @@ class NumDualDescriptorPB(nn.Module):
     Numerical (vector-sequence) Dual Descriptor (PB Matrix form) with GPU acceleration:
       - input is a sequence of real m-dimensional vectors instead of characters
       - the position-weight matrix is factorized as the product of a coefficient
-        matrix P and a basis matrix B, both m×m and independent of position k
+        matrix P and a basis matrix B, both position-independent (see hidden_dim)
       - a trainable square linear map M ∈ R^{m×m} replaces the token embedding;
         it is applied to each extracted window vector before the basis expansion
       - N(k) becomes position-independent, i.e., N(k) = N for every window
@@ -43,6 +43,9 @@ class NumDualDescriptorPB(nn.Module):
         'avg', 'sum', 'max', or a user-supplied callable
       - two interchangeable regression schemes, multi-class classification, and
         multi-label classification, in one-to-one correspondence with DDvTS.py
+      - hidden_dim controls the shapes of P and B: with hidden_dim = h, P is m×h and
+        B is h×m (default h = m, i.e., both are m×m)
+      - init_B selects the initialization of the basis matrix B: 'random' or 'periodic'
     """
 
     # Maximum number of windows handled by a single chunk of batch_compute_Nk.
@@ -50,8 +53,9 @@ class NumDualDescriptorPB(nn.Module):
     # bounded independently of the training batch size.
     NK_CHUNK = 16384
 
-    def __init__(self, vec_dim, rank=1, rank_op='avg', rank_mode='drop',
-                 mode='linear', user_step=None, device='cuda', trainable_B=True):
+    def __init__(self, vec_dim, hidden_dim=None, rank=1, rank_op='avg', rank_mode='drop',
+                 mode='linear', user_step=None, init_B='periodic', trainable_B=True,
+                 device='cuda'):
         """
         Initialize the Numerical Dual Descriptor model (PB Matrix form).
 
@@ -64,6 +68,15 @@ class NumDualDescriptorPB(nn.Module):
             user_step (int, optional): Step size for nonlinear extraction
             device (str): 'cuda' or 'cpu'
             trainable_B (bool): whether the basis matrix B is trainable
+            init_B (str): 'random' or 'periodic' – how B is initialized:
+                'random'   -> uniform in [-0.1, 0.1]
+                'periodic' -> B[p, j] = cos(p) + sin(j), with row index p and
+                              column index j
+            hidden_dim (int, optional): hidden dimension h for the P/B factorization.
+                Defaults to vec_dim (m), giving P and B both m×m. For hidden_dim = h,
+                P is m×h and B is h×m, and N is computed as P @ (B @ x); when
+                hidden_dim == m the original elementwise form (P⊙B) @ x is retained
+                so that the default behavior is unchanged.
         """
         super().__init__()
         self.vec_dim = vec_dim
@@ -75,6 +88,9 @@ class NumDualDescriptorPB(nn.Module):
         self.mode = mode
         self.step = user_step
         self.trainable_B = trainable_B
+        assert init_B in ('random', 'periodic')
+        self.init_B = init_B
+        self.hidden_dim = hidden_dim if hidden_dim is not None else self.m
 
         # User function for the 'user_func' rank operation (set via set_user_func)
         self.user_func = None
@@ -90,11 +106,11 @@ class NumDualDescriptorPB(nn.Module):
         # This replaces the character-based token embedding.
         self.M = nn.Linear(self.vec_dim, self.m, bias=False)
 
-        # Coefficient matrix P (always trainable)
-        self.P = nn.Parameter(torch.empty(self.m, self.m))
+        # Coefficient matrix P (always trainable); m×l
+        self.P = nn.Parameter(torch.empty(self.m, self.hidden_dim))
 
-        # Basis matrix B (trainable only if trainable_B is True)
-        self.B = nn.Parameter(torch.empty(self.m, self.m), requires_grad=trainable_B)
+        # Basis matrix B (trainable only if trainable_B is True); l×m
+        self.B = nn.Parameter(torch.empty(self.hidden_dim, self.m), requires_grad=trainable_B)
 
         # Lazily created prediction heads
         self.num_classes = None
@@ -146,10 +162,22 @@ class NumDualDescriptorPB(nn.Module):
             raise ValueError("User function must be callable")
 
     def reset_parameters(self):
-        """Initialize model parameters with appropriate distributions."""
+        """Initialize model parameters with appropriate distributions.
+
+        The basis matrix B (shape hidden_dim×m) follows self.init_B:
+          * 'random'   -> uniform in [-0.1, 0.1] (the original behavior);
+          * 'periodic' -> B[p, j] = cos(p) + sin(j), p = row index, j = column index.
+        The coefficient matrix P (shape m×hidden_dim) is always uniform in [-0.1, 0.1].
+        """
         nn.init.uniform_(self.M.weight, -0.5, 0.5)
         nn.init.uniform_(self.P, -0.1, 0.1)
-        nn.init.uniform_(self.B, -0.1, 0.1)
+        if self.init_B == 'periodic':
+            p = torch.arange(self.hidden_dim, dtype=torch.float32, device=self.B.device).unsqueeze(1)
+            j = torch.arange(self.m, dtype=torch.float32, device=self.B.device).unsqueeze(0)
+            with torch.no_grad():
+                self.B.copy_(torch.cos(p) + torch.sin(j))
+        else:
+            nn.init.uniform_(self.B, -0.1, 0.1)
         if self.classifier is not None:
             nn.init.normal_(self.classifier.weight, 0, 0.01)
             if self.classifier.bias is not None:
@@ -268,10 +296,20 @@ class NumDualDescriptorPB(nn.Module):
                           for i in range(0, n, self.NK_CHUNK)], dim=0)
 
     def _compute_Nk_chunk(self, k_tensor, vectors):
-        """Compute N(k) for one chunk of windows (see batch_compute_Nk)."""
+        """Compute N(k) for one chunk of windows (see batch_compute_Nk).
+
+        When hidden_dim == m, P and B are both m×m and the original elementwise
+        form N[b, i] = sum_j x[b, j] * P[i, j] * B[i, j] is used, so the default
+        behavior is unchanged. When hidden_dim != m, P is m×l and B is l×m and
+        N = P @ (B @ x), i.e. N[b, i] = sum_p P[i, p] * sum_j B[p, j] * x[b, j].
+        """
         x = self.M(vectors)                            # [chunk, m]
-        # N[b,i] = sum_j x[b,j] * P[i,j] * B[i,j]
-        return torch.einsum('bj,ij,ij->bi', x, self.P, self.B)
+        if self.hidden_dim == self.m:
+            # Original elementwise product P⊙B (both matrices are m×m)
+            return torch.einsum('bj,ij,ij->bi', x, self.P, self.B)
+        else:
+            # P is m×l, B is l×m: N = P @ (B @ x)
+            return torch.einsum('ip,pj,bj->bi', self.P, self.B, x)
 
     def compute_Nk(self, k, vector):
         """Compute N(k) for a single position and a single window vector."""
@@ -1366,5 +1404,53 @@ if __name__ == "__main__":
     seq_r_frozen = dd_reg_frozen.r_generate(L=60, r=my_r_diff, tau=0.0)
     print(f"\ntrainable_B=False (tau=0): {show(seq_r_frozen)}")
     print(f"  Verification: r-pred = {np.round(dd_reg_frozen.predict_r(seq_r_frozen), 3)}")
+
+    # =====================================================================
+    # (7) Effect of hidden_dim on regression performance (h > m, h == m, h < m)
+    # =====================================================================
+    print("\n" + "=" * 60)
+    print("(7) Effect of hidden_dim (h < m, h == m, h > m) on regression")
+    print("=" * 60)
+
+    seqs_hid = make_latent_seqs(100, seed=4)
+    target_dim_hid = 5
+    W_hid = np.random.RandomState(31).randn(target_dim_hid, vec_dim).astype(np.float32) * 0.5
+    t_list_hid = [(W_hid @ s.mean(axis=0)).astype(np.float32).tolist() for s in seqs_hid]
+    true_hid = np.array(t_list_hid)
+
+    print(f"Model dimension m = {vec_dim}, target dimension = {target_dim_hid}")
+    print("For each hidden_dim, reg_train + predict_r + r_generate is run.")
+
+    hidden_dims = [max(1, vec_dim - 2), vec_dim, vec_dim + 2]
+    hidden_results = {}
+    for h in hidden_dims:
+        label = 'h=m' if h == vec_dim else ('h>m' if h > vec_dim else 'h<m')
+        print("\n" + "-" * 60)
+        print(f"Training with hidden_dim = {h} ({label}): "
+              f"P is {vec_dim}×{h}, B is {h}×{vec_dim}")
+        print("-" * 60)
+        dd_h = NumDualDescriptorPB(vec_dim, rank=rank, rank_op='avg', rank_mode='drop',
+                                   mode='nonlinear', user_step=user_step, device=device,
+                                   trainable_B=True, hidden_dim=h)
+        dd_h.reg_train(seqs_hid, t_list_hid, target_dim=target_dim_hid,
+                       max_iters=MAX_ITERS, tol=1e-12,
+                       learning_rate=0.02, decay_rate=0.999,
+                       batch_size=BATCH_SIZE, print_every=20)
+        pred_h = np.array([dd_h.predict_r(seq) for seq in seqs_hid])
+        corrs_h = [corr(true_hid[:, i], pred_h[:, i]) for i in range(target_dim_hid)]
+        avg_c = float(np.mean(corrs_h))
+        hidden_results[h] = avg_c
+        print(f"\nhidden_dim = {h:2d} ({label}): avg corr = {avg_c:.4f} "
+              f"(min {np.min(corrs_h):.4f}, max {np.max(corrs_h):.4f})")
+        my_r_h = np.random.uniform(-1.0, 1.0, target_dim_hid).astype(np.float32)
+        seq_r_h = dd_h.r_generate(L=60, r=my_r_h, tau=0.0)
+        print(f"  r_generate verification: r-pred = {np.round(dd_h.predict_r(seq_r_h), 3)}, "
+              f"r-target = {np.round(my_r_h, 3)}")
+
+    print("\n" + "-" * 60)
+    print("Summary of hidden_dim comparison (average prediction correlation):")
+    for h in hidden_dims:
+        label = 'h=m' if h == vec_dim else ('h>m' if h > vec_dim else 'h<m')
+        print(f"  hidden_dim = {h:2d} ({label}): {hidden_results[h]:.4f}")
 
     print("\nAll tests completed successfully!")
