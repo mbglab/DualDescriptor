@@ -1,7 +1,7 @@
 # Copyright (C) 2005-2026, Bin-Guang Ma (mbg@mail.hzau.edu.cn); SPDX-License-Identifier: MIT
 # The Dual Descriptor Vector class (PB matrix form) implemented with PyTorch
 # This program is for the demonstration of methodology and not fully refined.
-# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-29 ~ 2026-10-6
+# Author: Bin-Guang Ma (assisted by DeepSeek); Date: 2025-7-29 ~ 2026-11-20
 #
 # Two interchangeable regression schemes are provided:
 #   (a) grad_train + predict_t / t_generate : the m-dimensional model output is fitted directly
@@ -27,8 +27,9 @@ import copy
 class DualDescriptorPB(nn.Module):
     """
     Vector Dual Descriptor with GPU acceleration using PyTorch:
-      - coefficient matrix P ∈ R^{m×m} and basis matrix B ∈ R^{m×m}
-      - the effective position-weight matrix is P @ B
+      - coefficient matrix P ∈ R^{m×h} and basis matrix B ∈ R^{h×m}, h = hidden_dim
+        (default h = m, so P and B are both m×m)
+      - the effective position-weight matrix is P @ B ∈ R^{m×m}
       - embedding: k-mer token embeddings in R^m
       - N(k) = sum_j x_j * (P @ B)_{ij}, independent of position k
       - supports 'linear' or 'nonlinear' (step-by-rank) k-mer extraction
@@ -47,7 +48,7 @@ class DualDescriptorPB(nn.Module):
     # e.g. model.NK_CHUNK = 4096 for a smaller card.
     NK_CHUNK = 16384
 
-    def __init__(self, charset, rank=1, rank_mode='drop', vec_dim=2,
+    def __init__(self, charset, rank=1, rank_mode='drop', vec_dim=2, hidden_dim=None,
                  mode='linear', user_step=None, trainable_B=False, device='cuda'):
         """
         Initialize the Dual Descriptor model.
@@ -57,6 +58,8 @@ class DualDescriptorPB(nn.Module):
             rank (int): Length of k-mers
             rank_mode (str): 'pad' or 'drop' – how to handle incomplete fragments
             vec_dim (int): Embedding dimension (model dimension m)
+            hidden_dim (int, optional): Hidden dimension h of P and B. If None, h = m,
+                so P and B are both m×m; otherwise P is m×h and B is h×m.
             mode (str): 'linear' or 'nonlinear' – token extraction mode
             user_step (int, optional): Step size for nonlinear extraction
             trainable_B (bool): If True, the basis matrix B is trainable; otherwise it is fixed.
@@ -67,6 +70,8 @@ class DualDescriptorPB(nn.Module):
         self.rank = rank
         self.rank_mode = rank_mode
         self.m = vec_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else vec_dim
+        assert self.hidden_dim > 0, "hidden_dim must be positive"
         assert mode in ('linear', 'nonlinear')
         self.mode = mode
         self.step = user_step
@@ -95,10 +100,10 @@ class DualDescriptorPB(nn.Module):
         # Embedding layer for tokens
         self.embedding = nn.Embedding(len(self.tokens), self.m)
 
-        # Coefficient matrix P (always trainable)
-        self.P = nn.Parameter(torch.empty(self.m, self.m))
-        # Basis matrix B (trainable only if trainable_B is True)
-        self.B = nn.Parameter(torch.empty(self.m, self.m), requires_grad=trainable_B)
+        # Coefficient matrix P (always trainable): m × hidden_dim
+        self.P = nn.Parameter(torch.empty(self.m, self.hidden_dim))
+        # Basis matrix B (trainable only if trainable_B is True): hidden_dim × m
+        self.B = nn.Parameter(torch.empty(self.hidden_dim, self.m), requires_grad=trainable_B)
 
         # Lazily created prediction heads
         self.num_classes = None
@@ -1047,6 +1052,9 @@ class DualDescriptorPB(nn.Module):
         lazily, so any head carried by the file but missing here is rebuilt first.
         The file is always read with weights_only=True: everything written is a tensor
         or a plain scalar, which keeps loading an untrusted file safe.
+
+        Note: P and B shapes depend on hidden_dim, so the model must be constructed
+        with the same hidden_dim (or default m) before loading.
         """
         state_dict = torch.load(filename, map_location=self.device, weights_only=True)
         if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
@@ -1107,6 +1115,8 @@ if __name__ == "__main__":
 
     print(f"\nUsing device: {dd_grad.device}")
     print(f"Number of tokens: {len(dd_grad.tokens)}")
+    print(f"hidden_dim = {dd_grad.hidden_dim}, "
+          f"P shape = {tuple(dd_grad.P.shape)}, B shape = {tuple(dd_grad.B.shape)}")
 
     # grad_train fits the m-dimensional model output directly, so each target
     # vector must have exactly m = vec_dim components.
@@ -1170,6 +1180,8 @@ if __name__ == "__main__":
 
     print(f"\nUsing device: {dd.device}")
     print(f"Number of tokens: {len(dd.tokens)}")
+    print(f"hidden_dim = {dd.hidden_dim}, "
+          f"P shape = {tuple(dd.P.shape)}, B shape = {tuple(dd.B.shape)}")
 
     seqs, t_list = [], []
     for _ in range(100):
@@ -1458,5 +1470,88 @@ if __name__ == "__main__":
         print("Deterministic (tau=0):   ", seq_r_diff[:50] + "...")
         seq_r_diff_rand = dd_reg_diff.r_generate(L=120, r=my_r_diff, tau=0.5)
         print("Stochastic  (tau=0.5):   ", seq_r_diff_rand[:50] + "...")
+
+    # =====================================================================
+    # hidden_dim demo: compare h < m, h = m, h > m side by side
+    # =====================================================================
+    print("\n" + "=" * 50)
+    print("hidden_dim demo: compare h < m, h = m, h > m")
+    print("=" * 50)
+
+    hidden_dims = [5, vec_dim, 20]
+    print(f"Model dimension m = {vec_dim}; "
+          f"comparing hidden_dim = {hidden_dims}")
+    print("  - h < m: P is m×h, B is h×m, P@B has rank ≤ h < m (bottleneck)")
+    print("  - h = m: P and B are both m×m (original Dual Descriptor)")
+    print("  - h > m: P is m×h, B is h×m, P@B has rank ≤ m (over-parameterized)")
+
+    # Shared dataset for all three runs so the comparison is fair
+    seqs_h, t_list_h = [], []
+    for _ in range(100):
+        L = random.randint(200, 300)
+        seqs_h.append(''.join(random.choices(charset, k=L)))
+        t_list_h.append([random.uniform(-1.0, 1.0) for _ in range(vec_dim)])
+
+    # Explicit target used for every t_generate call
+    my_target_h = [random.uniform(-1.0, 1.0) for _ in range(vec_dim)]
+    hidden_results = {}
+
+    for h in hidden_dims:
+        rel = "h < m" if h < vec_dim else ("h = m" if h == vec_dim else "h > m")
+        print("\n" + "-" * 50)
+        print(f"hidden_dim = {h}  ({rel})")
+        print("-" * 50)
+
+        dd_h = DualDescriptorPB(
+            charset,
+            rank=rank,
+            vec_dim=vec_dim,
+            hidden_dim=h,
+            mode='nonlinear',
+            user_step=user_step,
+            trainable_B=True,   # enable B so P@B makes full use of the hidden dim
+            device='cuda' if torch.cuda.is_available() else 'cpu'
+        )
+        print(f"P shape = {tuple(dd_h.P.shape)}, B shape = {tuple(dd_h.B.shape)}, "
+              f"P@B shape = {tuple((dd_h.P @ dd_h.B).shape)}")
+
+        hist_h = dd_h.grad_train(seqs_h, t_list_h, max_iters=100, tol=1e-9,
+                                 learning_rate=0.1, decay_rate=0.99,
+                                 batch_size=2048, print_every=20)
+
+        pred_t_list_h = [dd_h.predict_t(seq) for seq in seqs_h]
+        corr_sum_h = 0.0
+        for i in range(dd_h.m):
+            actu_t = [t_vec[i] for t_vec in t_list_h]
+            pred_t = [t_vec[i] for t_vec in pred_t_list_h]
+            corr_sum_h += correlation(actu_t, pred_t)
+        corr_avg_h = corr_sum_h / dd_h.m
+        hidden_results[h] = {
+            'shape_P': tuple(dd_h.P.shape),
+            'shape_B': tuple(dd_h.B.shape),
+            'final_loss': hist_h[-1],
+            'corr': corr_avg_h,
+        }
+        print(f"Final training loss (hidden_dim={h}): {hist_h[-1]:.6e}")
+        print(f"Average prediction correlation (hidden_dim={h}): {corr_avg_h:.4f}")
+
+        # t_generate with the shared explicit target
+        seq_gen_h = dd_h.t_generate(L=100, tau=0.0, t=my_target_h)
+        print(f"t_generate with shared target (h={h}, tau=0): ",
+              seq_gen_h[:50] + "...")
+
+    # Side-by-side summary
+    print("\n" + "=" * 50)
+    print("Side-by-side summary of hidden_dim comparison")
+    print("=" * 50)
+    print(f"{'hidden_dim':>10} | {'relation':>8} | {'P shape':>10} | "
+          f"{'B shape':>10} | {'final loss':>12} | {'avg corr':>10}")
+    print("-" * 78)
+    for h in hidden_dims:
+        rel = "h < m" if h < vec_dim else ("h = m" if h == vec_dim else "h > m")
+        r = hidden_results[h]
+        print(f"{h:>10d} | {rel:>8} | "
+              f"{str(r['shape_P']):>10} | {str(r['shape_B']):>10} | "
+              f"{r['final_loss']:>12.4e} | {r['corr']:>10.4f}")
 
     print("\nAll tests completed successfully!")
